@@ -1,0 +1,591 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# cmux-dash — ダッシュボードサーバーを cmux ペイン内で起動し、ダッシュボードを開く。
+#   使い方:  ./cmux-dash server     # 推奨: サーバーのみ（フォアグラウンド）
+#            ./cmux-dash            # cmux 内の専用 server workspace で起動 + ダッシュボードを開く
+#            ./cmux-dash stop       # サーバー停止
+#            ./cmux-dash restart    # サーバー再起動
+#            ./cmux-dash open       # 既存サーバーに対してダッシュボードを開くだけ
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PORT="${CMUX_DASH_PORT:-7799}"
+HOST="${CMUX_DASH_HOST:-127.0.0.1}"
+URL="http://${HOST}:${PORT}"
+PIDFILE="${CMUX_DASH_SERVER_PIDFILE:-$DIR/.server.pid}"
+LOG="${CMUX_DASH_SERVER_LOG:-$DIR/.server.log}"
+SERVER_LABEL="${CMUX_DASH_SERVER_LABEL:-com.cmux-dashboard.server}"
+PLIST_PATH="${CMUX_DASH_SERVER_PLIST_PATH:-$HOME/Library/LaunchAgents/$SERVER_LABEL.plist}"
+LAUNCHCTL_BIN="${CMUX_DASH_LAUNCHCTL_BIN:-launchctl}"
+LAUNCHD_DOMAIN="${CMUX_DASH_LAUNCHD_DOMAIN:-gui/$(id -u)}"
+WATCHDOG_BIN="${CMUX_DASH_WATCHDOG_BIN:-$DIR/bin/health-watchdog.sh}"
+WATCHDOG_PIDFILE="${CMUX_DASH_WATCHDOG_PIDFILE:-$DIR/.server.watchdog.pid}"
+WATCHDOG_LOG="${CMUX_DASH_WATCHDOG_LOG:-$DIR/.server.watchdog.log}"
+STATE_CURL_TIMEOUT="${CMUX_DASH_STATE_CURL_TIMEOUT:-3}"
+SERVER_REACHABLE_TIMEOUT_MS="${CMUX_DASH_SERVER_REACHABLE_TIMEOUT_MS:-15000}"
+SERVER_REACHABLE_INTERVAL_MS="${CMUX_DASH_SERVER_REACHABLE_INTERVAL_MS:-200}"
+SERVER_HEALTH_TIMEOUT_MS="${CMUX_DASH_SERVER_HEALTH_TIMEOUT_MS:-15000}"
+SERVER_HEALTH_INTERVAL_MS="${CMUX_DASH_SERVER_HEALTH_INTERVAL_MS:-300}"
+SERVER_PORT_RELEASE_TIMEOUT_MS="${CMUX_DASH_SERVER_PORT_RELEASE_TIMEOUT_MS:-15000}"
+SERVER_PORT_RELEASE_INTERVAL_MS="${CMUX_DASH_SERVER_PORT_RELEASE_INTERVAL_MS:-200}"
+SERVER_SURFACE_READY_TIMEOUT_MS="${CMUX_DASH_SERVER_SURFACE_READY_TIMEOUT_MS:-3000}"
+SERVER_SURFACE_READY_INTERVAL_MS="${CMUX_DASH_SERVER_SURFACE_READY_INTERVAL_MS:-100}"
+SERVER_SURFACE_READY_DELAY_MS="${CMUX_DASH_SERVER_SURFACE_READY_DELAY_MS:-700}"
+SERVER_WORKSPACE_DESC="${CMUX_DASH_SERVER_WORKSPACE_DESC:-cmuxdash:__server__}"
+SERVER_WORKSPACE_NAME="${CMUX_DASH_SERVER_WORKSPACE_NAME:-cmux dashboard server}"
+DASHBOARD_WORKSPACE_DESC="${CMUX_DASH_DASHBOARD_WORKSPACE_DESC:-cmuxdash:__dashboard__}"
+DASHBOARD_WORKSPACE_NAME="${CMUX_DASH_DASHBOARD_WORKSPACE_NAME:-📊 cmux dashboard}"
+
+CMUX_BIN="${CMUX_BIN:-}"
+if [ -z "$CMUX_BIN" ]; then
+  for c in /Applications/cmux.app/Contents/Resources/bin/cmux /usr/local/bin/cmux /opt/homebrew/bin/cmux; do
+    [ -x "$c" ] && CMUX_BIN="$c" && break
+  done
+fi
+[ -z "$CMUX_BIN" ] && CMUX_BIN="cmux"
+
+# node を絶対パスで解決（.app や最小PATH環境でも動くように）
+NODE_BIN="${NODE_BIN:-}"
+if [ -z "$NODE_BIN" ]; then
+  for n in "$(command -v node 2>/dev/null)" /opt/homebrew/bin/node /opt/homebrew/opt/node@22/bin/node /usr/local/bin/node; do
+    [ -n "$n" ] && [ -x "$n" ] && NODE_BIN="$n" && break
+  done
+fi
+[ -z "$NODE_BIN" ] && NODE_BIN="node"
+
+print_usage(){
+  cat <<EOF
+usage: cmux-dash [up|server|open|stop|restart|help]
+
+Stable in-pane mode:
+  ./cmux-dash
+  ./cmux-dash up
+    Create or reuse the cmuxdash:__server__ workspace and run server.js inside
+    its terminal surface, then open the dashboard.
+
+Foreground server:
+  ./cmux-dash server
+    Run server.js in the current terminal with exec node server.js. Keep this
+    only for manual diagnosis or when you intentionally own the cmux pane.
+EOF
+}
+
+is_up(){ curl -fsS --max-time "$STATE_CURL_TIMEOUT" "$URL/api/state" >/dev/null 2>&1; }
+launchctl_available(){ command -v "$LAUNCHCTL_BIN" >/dev/null 2>&1 || [ -x "$LAUNCHCTL_BIN" ]; }
+cmux_available(){ CMUX_QUIET=1 "$CMUX_BIN" ping >/dev/null 2>&1; }
+
+shell_quote(){
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+normalize_ms(){
+  local ms="${1:-0}"
+  case "$ms" in ''|*[!0-9]*) ms=0 ;; esac
+  printf '%s\n' "$ms"
+}
+
+sleep_ms(){
+  local ms seconds rest
+  ms="$(normalize_ms "${1:-0}")"
+  [ "$ms" -le 0 ] && return 0
+  seconds=$((ms / 1000))
+  rest=$((ms % 1000))
+  sleep "${seconds}.$(printf '%03d' "$rest")"
+}
+
+attempt_count(){
+  local timeout interval attempts
+  timeout="$(normalize_ms "${1:-0}")"
+  interval="$(normalize_ms "${2:-100}")"
+  [ "$interval" -le 0 ] && interval=100
+  attempts=$(((timeout + interval - 1) / interval))
+  [ "$attempts" -lt 1 ] && attempts=1
+  printf '%s\n' "$attempts"
+}
+
+json_first_ref_by_description(){
+  "$NODE_BIN" -e '
+const desc = process.argv[1];
+let body = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { body += chunk; });
+process.stdin.on("end", () => {
+  try {
+    const start = body.indexOf("{");
+    const parsed = JSON.parse(start >= 0 ? body.slice(start) : body);
+    const ws = (parsed.workspaces || []).find((item) => item && item.description === desc);
+    process.stdout.write(ws && ws.ref ? ws.ref : "");
+  } catch (_) {
+    process.stdout.write("");
+  }
+});
+' "$SERVER_WORKSPACE_DESC"
+}
+
+json_first_ref(){
+  local key="$1"
+  "$NODE_BIN" -e '
+const key = process.argv[1];
+let body = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { body += chunk; });
+process.stdin.on("end", () => {
+  try {
+    const start = body.indexOf("{");
+    const parsed = JSON.parse(start >= 0 ? body.slice(start) : body);
+    const rows = parsed[key] || [];
+    const row = rows.find((item) => item && item.ref) || null;
+    process.stdout.write(row && row.ref ? row.ref : "");
+  } catch (_) {
+    process.stdout.write("");
+  }
+});
+' "$key"
+}
+
+json_has_ref(){
+  local key="$1" ref="$2"
+  "$NODE_BIN" -e '
+const key = process.argv[1];
+const ref = process.argv[2];
+let body = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { body += chunk; });
+process.stdin.on("end", () => {
+  try {
+    const start = body.indexOf("{");
+    const parsed = JSON.parse(start >= 0 ? body.slice(start) : body);
+    const rows = parsed[key] || [];
+    process.exit(rows.some((item) => item && item.ref === ref) ? 0 : 1);
+  } catch (_) {
+    process.exit(1);
+  }
+});
+' "$key" "$ref"
+}
+
+json_first_terminal_surface_ref(){
+  "$NODE_BIN" -e '
+let body = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { body += chunk; });
+process.stdin.on("end", () => {
+  try {
+    const start = body.indexOf("{");
+    const parsed = JSON.parse(start >= 0 ? body.slice(start) : body);
+    const rows = parsed.surfaces || [];
+    const row = rows.find((item) => item && item.type === "terminal" && item.ref)
+      || rows.find((item) => item && item.ref)
+      || null;
+    process.stdout.write(row && row.ref ? row.ref : "");
+  } catch (_) {
+    process.stdout.write("");
+  }
+});
+'
+}
+
+server_workspace_ref(){
+  local out
+  out="$(CMUX_QUIET=1 "$CMUX_BIN" list-workspaces --json 2>/dev/null || true)"
+  [ -n "$out" ] || return 0
+  printf '%s' "$out" | json_first_ref_by_description
+}
+
+dashboard_workspace_ref(){
+  local out
+  out="$(CMUX_QUIET=1 "$CMUX_BIN" list-workspaces --json 2>/dev/null || true)"
+  [ -n "$out" ] || return 0
+  printf '%s' "$out" | "$NODE_BIN" -e '
+const desc = process.argv[1];
+const name = process.argv[2];
+let body = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { body += chunk; });
+process.stdin.on("end", () => {
+  try {
+    const start = body.indexOf("{");
+    const parsed = JSON.parse(start >= 0 ? body.slice(start) : body);
+    const ws = (parsed.workspaces || []).find((item) => item && (
+      item.description === desc ||
+      item.name === name ||
+      item.name === "cmux dashboard" ||
+      item.description === "cmux dashboard"
+    ));
+    process.stdout.write(ws && ws.ref ? ws.ref : "");
+  } catch (_) {
+    process.stdout.write("");
+  }
+});
+' "$DASHBOARD_WORKSPACE_DESC" "$DASHBOARD_WORKSPACE_NAME"
+}
+
+ensure_server_workspace(){
+  local ws out
+  ws="$(server_workspace_ref || true)"
+  if [ -n "$ws" ]; then
+    printf '%s\n' "$ws"
+    return 0
+  fi
+
+  echo "→ creating cmux server workspace ($SERVER_WORKSPACE_DESC)…" >&2
+  out="$(CMUX_QUIET=1 "$CMUX_BIN" new-workspace \
+    --name "$SERVER_WORKSPACE_NAME" \
+    --description "$SERVER_WORKSPACE_DESC" \
+    --cwd "$DIR" \
+    --focus false 2>/dev/null || true)"
+  ws="$(printf '%s' "$out" | grep -o 'workspace:[0-9][0-9]*' | head -n 1 || true)"
+  if [ -z "$ws" ]; then
+    ws="$(server_workspace_ref || true)"
+  fi
+  if [ -z "$ws" ]; then
+    echo "✗ failed to create cmux server workspace" >&2
+    exit 1
+  fi
+  printf '%s\n' "$ws"
+}
+
+ensure_server_surface(){
+  local ws="$1" out surf pane args
+  out="$(CMUX_QUIET=1 "$CMUX_BIN" list-pane-surfaces --workspace "$ws" --json 2>/dev/null || true)"
+  surf="$(printf '%s' "$out" | json_first_terminal_surface_ref || true)"
+  if [ -n "$surf" ]; then
+    printf '%s\n' "$surf"
+    return 0
+  fi
+
+  out="$(CMUX_QUIET=1 "$CMUX_BIN" list-panes --workspace "$ws" --json 2>/dev/null || true)"
+  pane="$(printf '%s' "$out" | json_first_ref panes || true)"
+  args=(new-surface --type terminal --workspace "$ws" --focus false)
+  if [ -n "$pane" ]; then args+=(--pane "$pane"); fi
+  out="$(CMUX_QUIET=1 "$CMUX_BIN" "${args[@]}" 2>/dev/null || true)"
+  surf="$(printf '%s' "$out" | grep -o 'surface:[0-9][0-9]*' | head -n 1 || true)"
+  if [ -z "$surf" ]; then
+    out="$(CMUX_QUIET=1 "$CMUX_BIN" list-pane-surfaces --workspace "$ws" --json 2>/dev/null || true)"
+    surf="$(printf '%s' "$out" | json_first_terminal_surface_ref || true)"
+  fi
+  if [ -z "$surf" ]; then
+    echo "✗ failed to create cmux server terminal surface in $ws" >&2
+    exit 1
+  fi
+  printf '%s\n' "$surf"
+}
+
+wait_for_server_surface_ready(){
+  local ws="$1" surf="$2" attempts out
+  attempts="$(attempt_count "$SERVER_SURFACE_READY_TIMEOUT_MS" "$SERVER_SURFACE_READY_INTERVAL_MS")"
+  for _ in $(seq 1 "$attempts"); do
+    out="$(CMUX_QUIET=1 "$CMUX_BIN" list-pane-surfaces --workspace "$ws" --json 2>/dev/null || true)"
+    if [ -n "$out" ] && printf '%s' "$out" | json_has_ref surfaces "$surf"; then
+      sleep_ms "$SERVER_SURFACE_READY_DELAY_MS"
+      return 0
+    fi
+    sleep_ms "$SERVER_SURFACE_READY_INTERVAL_MS"
+  done
+  echo "! server surface $surf did not reappear during ready wait; delaying before send anyway" >&2
+  sleep_ms "$SERVER_SURFACE_READY_DELAY_MS"
+}
+
+server_exec_command(){
+  local qdir qnode qhost
+  qdir="$(shell_quote "$DIR")"
+  qnode="$(shell_quote "$NODE_BIN")"
+  qhost="$(shell_quote "$HOST")"
+  # End with a literal backslash-n: cmux `send` interprets the two-character
+  # escape \n as Enter. A real newline would (a) be stripped by $(...) command
+  # substitution and (b) not be treated as Enter by send, so the command would
+  # be typed but never executed (the pane just sits at an idle shell).
+  printf 'cd %s && CMUX_DASH_PORT=%s CMUX_DASH_HOST=%s %s server.js\\n' "$qdir" "$PORT" "$qhost" "$qnode"
+}
+
+cmux_health_ok_from_json(){
+  "$NODE_BIN" -e '
+let body = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { body += chunk; });
+process.stdin.on("end", () => {
+  try {
+    const state = JSON.parse(body);
+    const cmux = state && state.health && state.health.cmux;
+    if (cmux && cmux.ok === true && cmux.unhealthy !== true) process.exit(0);
+    const parts = [];
+    if (!cmux) parts.push("missing health.cmux");
+    else {
+      if (cmux.ok !== undefined) parts.push(`ok=${cmux.ok}`);
+      if (cmux.unhealthy !== undefined) parts.push(`unhealthy=${cmux.unhealthy}`);
+      if (cmux.consecutiveFailures !== undefined) parts.push(`fails=${cmux.consecutiveFailures}`);
+      if (cmux.lastError) parts.push(`lastError=${String(cmux.lastError).slice(0, 120)}`);
+    }
+    console.error(parts.join(" ") || "health.cmux not ok");
+    process.exit(1);
+  } catch (e) {
+    console.error("invalid /api/state json");
+    process.exit(1);
+  }
+});
+'
+}
+
+wait_for_server(){
+  local attempts
+  attempts="$(attempt_count "$SERVER_REACHABLE_TIMEOUT_MS" "$SERVER_REACHABLE_INTERVAL_MS")"
+  for _ in $(seq 1 "$attempts"); do is_up && return 0; sleep_ms "$SERVER_REACHABLE_INTERVAL_MS"; done
+  return 1
+}
+
+wait_for_cmux_health_ok(){
+  local body detail attempts
+  attempts="$(attempt_count "$SERVER_HEALTH_TIMEOUT_MS" "$SERVER_HEALTH_INTERVAL_MS")"
+  for _ in $(seq 1 "$attempts"); do
+    body="$(curl -fsS --max-time "$STATE_CURL_TIMEOUT" "$URL/api/state" 2>/dev/null || true)"
+    if [ -n "$body" ] && printf '%s' "$body" | cmux_health_ok_from_json >/dev/null 2>&1; then
+      echo "✓ /api/state health.cmux ok"
+      return 0
+    fi
+    sleep_ms "$SERVER_HEALTH_INTERVAL_MS"
+  done
+  body="$(curl -fsS --max-time "$STATE_CURL_TIMEOUT" "$URL/api/state" 2>/dev/null || true)"
+  detail="$(printf '%s' "$body" | cmux_health_ok_from_json 2>&1 >/dev/null || true)"
+  echo "✗ server reachable but /api/state health.cmux is not ok${detail:+: $detail}" >&2
+  return 1
+}
+
+port_listener_pids(){
+  command -v lsof >/dev/null 2>&1 || return 0
+  { lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true; } | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+}
+
+wait_for_port_released(){
+  local attempts pids
+  attempts="$(attempt_count "$SERVER_PORT_RELEASE_TIMEOUT_MS" "$SERVER_PORT_RELEASE_INTERVAL_MS")"
+  for _ in $(seq 1 "$attempts"); do
+    pids="$(port_listener_pids)"
+    if [ -z "$pids" ]; then
+      if command -v lsof >/dev/null 2>&1; then
+        return 0
+      fi
+      is_up || return 0
+    fi
+    sleep_ms "$SERVER_PORT_RELEASE_INTERVAL_MS"
+  done
+  pids="$(port_listener_pids)"
+  echo "✗ port $PORT is still listening${pids:+ (pid $pids)}; not starting another server" >&2
+  return 1
+}
+
+print_server_start_diagnostics(){
+  local ws="${1:-}" surf="${2:-}" pids top_out surfaces_out
+  echo "! startup diagnostics for $SERVER_WORKSPACE_DESC${ws:+ workspace=$ws}${surf:+ surface=$surf}" >&2
+  pids="$(port_listener_pids)"
+  [ -z "$pids" ] || echo "! port $PORT listeners: $pids" >&2
+  if [ -f "$LOG" ]; then
+    echo "! tail $LOG:" >&2
+    tail -n 20 "$LOG" 2>/dev/null | sed 's/^/! log: /' >&2 || true
+  fi
+  if [ -n "$ws" ]; then
+    surfaces_out="$(CMUX_QUIET=1 "$CMUX_BIN" list-pane-surfaces --workspace "$ws" --json 2>/dev/null || true)"
+    [ -z "$surfaces_out" ] || printf '%s\n' "$surfaces_out" | head -c 2000 | sed 's/^/! surfaces: /' >&2 || true
+    top_out="$(CMUX_QUIET=1 "$CMUX_BIN" top --workspace "$ws" --processes --format tsv 2>/dev/null || true)"
+    [ -z "$top_out" ] || printf '%s\n' "$top_out" | tail -n 20 | sed 's/^/! cmux top: /' >&2 || true
+  fi
+}
+
+background_health_warning_from_json(){
+  "$NODE_BIN" -e '
+let body = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { body += chunk; });
+process.stdin.on("end", () => {
+  try {
+    const state = JSON.parse(body);
+    const cmux = state && state.health && state.health.cmux;
+    if (!cmux || (cmux.ok !== false && cmux.unhealthy !== true)) return;
+    const parts = [];
+    if (cmux.ok === false) parts.push("ok=false");
+    if (cmux.unhealthy === true) parts.push("unhealthy=true");
+    if (cmux.consecutiveFailures !== undefined) parts.push(`fails=${cmux.consecutiveFailures}`);
+    if (cmux.lastError) parts.push(`lastError=${String(cmux.lastError).slice(0, 120)}`);
+    console.log(`! background server cannot reliably reach cmux (${parts.join(" ")}).`);
+    console.log("! Recommended stable mode: run ./cmux-dash server in a dedicated cmux pane and keep it open.");
+  } catch (_) {}
+});
+'
+}
+
+warn_background_cmux_health(){
+  local body warning
+  body="$(curl -fsS --max-time "$STATE_CURL_TIMEOUT" "$URL/api/state" 2>/dev/null || true)"
+  [ -n "$body" ] || return 0
+  warning="$(printf '%s' "$body" | background_health_warning_from_json 2>/dev/null || true)"
+  [ -z "$warning" ] || printf '%s\n' "$warning" >&2
+}
+
+watchdog_enabled(){ [ "${CMUX_DASH_START_WATCHDOG:-1}" = "1" ]; }
+
+watchdog_running(){
+  local pid=""
+  [ -f "$WATCHDOG_PIDFILE" ] || return 1
+  pid="$(cat "$WATCHDOG_PIDFILE" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+start_watchdog(){
+  watchdog_enabled || return 0
+  if watchdog_running; then
+    echo "✓ watchdog already running"
+    return 0
+  fi
+  if [ ! -x "$WATCHDOG_BIN" ]; then
+    echo "✗ watchdog script not executable: $WATCHDOG_BIN" >&2
+    exit 1
+  fi
+  rm -f "$WATCHDOG_PIDFILE"
+  echo "→ starting in-session watchdog…"
+  echo "! watchdog is best-effort for background mode; if cmux health is ok=false, use './cmux-dash server' in a foreground cmux pane."
+  (
+    cd "$DIR"
+    CMUX_DASH_DIR="$DIR" \
+    CMUX_DASH_PORT="$PORT" \
+    CMUX_DASH_HOST="$HOST" \
+    CMUX_DASH_SERVER_PIDFILE="$PIDFILE" \
+    CMUX_DASH_SERVER_LOG="$LOG" \
+    NODE_BIN="$NODE_BIN" \
+    nohup "$WATCHDOG_BIN" loop >"$WATCHDOG_LOG" 2>&1 < /dev/null &
+    echo $! >"$WATCHDOG_PIDFILE"
+  )
+}
+
+stop_watchdog(){
+  local pid=""
+  [ -f "$WATCHDOG_PIDFILE" ] && pid="$(cat "$WATCHDOG_PIDFILE" 2>/dev/null || true)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -9 "$pid" 2>/dev/null || true
+    echo "✓ stopped watchdog"
+  fi
+  rm -f "$WATCHDOG_PIDFILE"
+}
+
+start_server(){
+  local ws surf cmd
+  if ! cmux_available; then
+    echo "✗ cmux is not reachable; run './cmux-dash server' from a live cmux pane for manual foreground mode." >&2
+    exit 1
+  fi
+
+  ws="$(server_workspace_ref || true)"
+  if [ -n "$ws" ] && is_up; then
+    echo "✓ server already running in cmux workspace $ws at $URL"
+    wait_for_cmux_health_ok
+    return
+  fi
+
+  if [ -z "$ws" ] && is_up; then
+    echo "→ server responds without $SERVER_WORKSPACE_DESC; restarting inside cmux pane…"
+    stop_server
+  fi
+
+  if ! wait_for_port_released; then
+    exit 1
+  fi
+
+  ws="$(ensure_server_workspace)"
+  surf="$(ensure_server_surface "$ws")"
+  wait_for_server_surface_ready "$ws" "$surf"
+  cmd="$(server_exec_command)"
+  echo "→ starting server in cmux pane ($ws / $surf)…"
+  CMUX_QUIET=1 "$CMUX_BIN" send --surface "$surf" --workspace "$ws" "$cmd" >/dev/null
+  if wait_for_server; then
+    echo "✓ server reachable → $URL"
+    wait_for_cmux_health_ok
+  else
+    echo "✗ server failed to become reachable from cmux pane after ${SERVER_REACHABLE_TIMEOUT_MS}ms" >&2
+    print_server_start_diagnostics "$ws" "$surf"
+    echo "  see $LOG or the $SERVER_WORKSPACE_DESC workspace" >&2
+    exit 1
+  fi
+}
+
+open_dashboard(){
+  # cmux 内なら専用 workspace にブラウザペインで開く。cmux 外ならデフォルトブラウザで開く。
+  if "$CMUX_BIN" ping >/dev/null 2>&1; then
+    if [ -n "$(dashboard_workspace_ref || true)" ]; then
+      echo "✓ dashboard workspace already open"
+    else
+      echo "→ opening dashboard in cmux…"
+      WS=$("$CMUX_BIN" new-workspace --name "$DASHBOARD_WORKSPACE_NAME" --description "$DASHBOARD_WORKSPACE_DESC" --focus true 2>/dev/null | grep -o 'workspace:[0-9]*' || true)
+      if [ -n "${WS:-}" ]; then
+        # new-workspace が作るデフォルト端末 surface を控えておく
+        TERM_SURF=$(CMUX_QUIET=1 "$CMUX_BIN" list-pane-surfaces --workspace "$WS" --json 2>/dev/null \
+          | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s.slice(s.indexOf("{")));process.stdout.write((j.surfaces&&j.surfaces[0]&&j.surfaces[0].ref)||"")}catch(_){process.stdout.write("")}})' 2>/dev/null || true)
+        if "$CMUX_BIN" new-pane --type browser --url "$URL" --workspace "$WS" --focus true >/dev/null 2>&1; then
+          # 端末ペインを閉じてブラウザのみのクリーンな全画面ダッシュボードにする
+          [ -n "${TERM_SURF:-}" ] && "$CMUX_BIN" close-surface --surface "$TERM_SURF" --workspace "$WS" >/dev/null 2>&1 || true
+        else
+          "$CMUX_BIN" open "$URL" >/dev/null 2>&1 || open "$URL"
+        fi
+      else
+        "$CMUX_BIN" open "$URL" >/dev/null 2>&1 || open "$URL"
+      fi
+    fi
+  else
+    open "$URL" 2>/dev/null || echo "open $URL in your browser"
+  fi
+}
+
+stop_server(){
+  stop_watchdog
+  local pid=""
+  if [ -f "$PIDFILE" ]; then
+    pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+  elif is_up && command -v lsof >/dev/null 2>&1; then
+    pid="$(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
+  fi
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null || true
+    if ! wait_for_port_released; then
+      kill -9 "$pid" 2>/dev/null || true
+      wait_for_port_released || return 1
+    fi
+    rm -f "$PIDFILE"
+    echo "✓ stopped"
+  else
+    rm -f "$PIDFILE"
+    echo "no running server"
+  fi
+}
+
+restart_server(){
+  stop_server
+  start_server
+}
+
+install_server(){
+  echo "install-server is disabled: launchd-managed dashboard servers cannot reliably reach cmux from the required session context." >&2
+  echo "Use './cmux-dash server' in a dedicated foreground cmux pane and keep it open." >&2
+  exit 64
+}
+
+uninstall_server(){
+  # Legacy cleanup only. The server is no longer installed or managed by launchd.
+  if launchctl_available; then
+    "$LAUNCHCTL_BIN" bootout "$LAUNCHD_DOMAIN" "$PLIST_PATH" >/dev/null 2>&1 || true
+  fi
+  rm -f "$PLIST_PATH"
+  echo "removed legacy launchd server plist if present: $PLIST_PATH"
+}
+
+case "${1:-up}" in
+  up)     start_server; open_dashboard ;;
+  server) if is_up; then echo "✓ server already running at $URL"; exit 0; fi; cd "$DIR" && exec env CMUX_DASH_PORT="$PORT" CMUX_DASH_HOST="$HOST" "$NODE_BIN" server.js ;;
+  open)   start_server; open_dashboard ;;
+  stop)   stop_server ;;
+  restart) restart_server ;;
+  help|--help|-h) print_usage ;;
+  install-server) install_server ;;
+  uninstall-server) uninstall_server ;;
+  *) print_usage >&2; exit 1 ;;
+esac

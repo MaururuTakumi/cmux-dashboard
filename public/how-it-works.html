@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cmux dashboard — 仕組み図解</title>
+<style>
+  :root{
+    --bg:#0b0e14; --bg2:#11151f; --panel:#151a26; --panel2:#1b2231;
+    --line:#232c3d; --ink:#e6edf6; --dim:#8a97ad; --faint:#5b6677;
+    --claude:#d97757; --codex:#10a37f; --ok:#3ddc97; --warn:#f4bf4f;
+    --accent:#6ea8fe; --sqlite:#a78bfa; --radius:16px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:radial-gradient(1100px 560px at 85% -8%,#16203a 0,transparent 60%),var(--bg);
+    color:var(--ink);font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Noto Sans JP",sans-serif;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:920px;margin:0 auto;padding:46px 22px 90px}
+  header.hero{text-align:center;margin-bottom:14px}
+  .hero .logo{width:64px;height:64px;border-radius:16px;margin:0 auto 14px;display:grid;place-items:center;font-size:30px;
+    background:linear-gradient(135deg,var(--claude),var(--codex));box-shadow:0 12px 36px rgba(0,0,0,.5)}
+  .hero h1{font-size:30px;margin:0 0 6px;letter-spacing:.3px}
+  .hero p{color:var(--dim);margin:0;font-size:16px}
+  .tldr{background:linear-gradient(180deg,var(--panel),var(--bg2));border:1px solid var(--line);border-radius:var(--radius);
+    padding:20px 22px;margin:26px 0 8px}
+  .tldr b{color:var(--accent)}
+  .toc{display:flex;flex-wrap:wrap;gap:8px;margin:22px 0 8px;justify-content:center}
+  .toc a{font-size:13px;color:var(--dim);text-decoration:none;border:1px solid var(--line);padding:6px 12px;border-radius:999px;transition:.15s}
+  .toc a:hover{color:var(--ink);border-color:var(--accent);background:var(--panel)}
+  section{margin:48px 0}
+  .sec-h{display:flex;align-items:center;gap:12px;margin:0 0 6px}
+  .sec-h .n{width:30px;height:30px;border-radius:9px;background:var(--panel2);border:1px solid var(--line);display:grid;place-items:center;font-size:14px;font-weight:700;color:var(--accent);flex:none}
+  .sec-h h2{font-size:21px;margin:0}
+  .lead{color:var(--dim);margin:0 0 18px;padding-left:42px}
+  .fig{background:linear-gradient(180deg,var(--panel),var(--bg2));border:1px solid var(--line);border-radius:var(--radius);padding:24px;overflow:hidden}
+  .cap{color:var(--faint);font-size:12.5px;text-align:center;margin-top:14px}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#0d1320;border:1px solid var(--line);padding:1.5px 6px;border-radius:5px;font-size:.86em}
+  .tag{font-weight:700;font-size:11px;letter-spacing:.04em;padding:2px 9px;border-radius:6px;display:inline-block}
+  .tag.claude{color:#1a0d06;background:var(--claude)} .tag.codex{color:#03140e;background:var(--codex)}
+  .tag.agmsg{color:#1a1330;background:var(--sqlite)} .tag.you{color:#04140d;background:var(--ok)}
+
+  /* ---- diagram primitives ---- */
+  .box{border:1px solid var(--line);border-radius:11px;background:var(--bg);padding:13px 15px}
+  .stack{display:flex;flex-direction:column;gap:0;border:1px solid var(--line);border-radius:13px;overflow:hidden;background:var(--bg)}
+  .lane{padding:14px 16px;display:flex;align-items:center;gap:12px}
+  .lane+.lane{border-top:2px dashed var(--line)}
+  .lane.claude{background:linear-gradient(90deg,color-mix(in srgb,var(--claude) 14%,transparent),transparent)}
+  .lane.codex{background:linear-gradient(90deg,color-mix(in srgb,var(--codex) 14%,transparent),transparent)}
+  .lane .who{font-weight:700;font-size:15px;min-width:74px}
+  .lane .desc{color:var(--dim);font-size:13.5px}
+  .lane .role{margin-left:auto;font-size:11.5px;color:var(--faint);text-align:right}
+  .arrowv{height:30px;display:grid;place-items:center;color:var(--sqlite);font-size:13px;font-weight:600}
+
+  /* overview split */
+  .overview{display:grid;grid-template-columns:200px 1fr;gap:16px}
+  .ov-side{border:1px solid var(--line);border-radius:11px;background:var(--bg);padding:12px}
+  .ov-side .t{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px}
+  .ov-item{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:8px;font-size:13px}
+  .ov-item.on{background:color-mix(in srgb,var(--ok) 12%,transparent)}
+  .ov-item .d{width:8px;height:8px;border-radius:50%;background:var(--faint)}
+  .ov-item.on .d{background:var(--ok)}
+  .ov-main{display:flex;flex-direction:column;gap:10px}
+  .card-mini{border:1px solid var(--line);border-radius:11px;background:var(--bg);padding:12px 14px;display:flex;align-items:center;gap:10px}
+  .card-mini .em{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;background:var(--panel2);border:1px solid var(--line)}
+  .card-mini.live{border-color:color-mix(in srgb,var(--ok) 40%,var(--line))}
+  .pulse{margin-left:auto;font-size:10.5px;font-weight:700;color:#04140d;background:var(--ok);padding:2px 8px;border-radius:999px}
+
+  /* flow / sequence */
+  .flow{display:grid;grid-template-columns:repeat(5,1fr);gap:0;align-items:stretch;text-align:center}
+  .node{position:relative;padding:14px 8px;border:1px solid var(--line);border-radius:11px;background:var(--bg);margin:0 6px}
+  .node .ic{font-size:20px}
+  .node .nm{font-size:12.5px;font-weight:650;margin-top:5px}
+  .node .sub{font-size:10.5px;color:var(--faint);margin-top:2px}
+  .flow .step{display:flex;flex-direction:column;justify-content:flex-start}
+  .conn{display:grid;place-items:center;color:var(--accent);font-size:18px;font-weight:700}
+  .flowgrid{display:grid;grid-template-columns:1fr 26px 1fr 26px 1fr;align-items:center;gap:0}
+  @media(max-width:680px){
+    .overview{grid-template-columns:1fr}
+    .flowgrid{grid-template-columns:1fr;gap:6px}
+    .flowgrid .conn{transform:rotate(90deg)}
+  }
+  /* files table */
+  .files{display:grid;gap:8px}
+  .file{display:grid;grid-template-columns:170px 1fr;gap:12px;align-items:baseline;padding:10px 12px;border:1px solid var(--line);border-radius:9px;background:var(--bg)}
+  .file .fn{color:var(--accent);font-size:13px}
+  .file .fd{color:var(--dim);font-size:13px}
+  @media(max-width:560px){.file{grid-template-columns:1fr}}
+  .pill-row{display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+  .pill{border:1px solid var(--line);background:var(--bg);border-radius:999px;padding:7px 14px;font-size:13px;display:flex;align-items:center;gap:7px}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;justify-content:center;margin:14px 0 0;font-size:12.5px;color:var(--dim)}
+  .legend span{display:flex;align-items:center;gap:6px}
+  .sw{width:11px;height:11px;border-radius:3px}
+  .note{border-left:3px solid var(--warn);background:color-mix(in srgb,var(--warn) 8%,transparent);padding:10px 14px;border-radius:0 9px 9px 0;color:var(--dim);font-size:13.5px;margin-top:14px}
+  footer{margin-top:60px;text-align:center;color:var(--faint);font-size:12.5px}
+  .kbd{border:1px solid var(--line);background:var(--panel2);border-radius:6px;padding:1px 7px;font-family:ui-monospace,monospace;font-size:.85em}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <div class="logo">⌘</div>
+    <h1>cmux dashboard の仕組み</h1>
+    <p>claude が計画し、codex が実装する — それを1ボタンで立ち上げる装置</p>
+  </header>
+
+  <div class="tldr">
+    <b>ひとことで:</b> このダッシュボードは「<b>ローカルのNodeサーバー</b>が配信するWebページ」です。ボタンを押すと、サーバーが裏で <code>cmux</code> コマンドを叩いて、プロジェクトごとに <span class="tag claude">claude</span>（上＝計画）と <span class="tag codex">codex</span>（下＝実装）の上下分割を立ち上げ、同時に <span class="tag agmsg">agmsg</span> で2つのAIを同じチームに参加させます。だから人間がコピペで往復しなくても、AI同士が直接やり取りして開発が進みます。
+  </div>
+
+  <nav class="toc">
+    <a href="#overview">① 全体像</a>
+    <a href="#project">② 1プロジェクトの形</a>
+    <a href="#flow">③ ボタンを押すと何が起きる</a>
+    <a href="#agmsg">④ agmsg = AI同士の連絡</a>
+    <a href="#parts">⑤ 部品とファイル</a>
+    <a href="#where">⑥ どこで見る/アプリ化</a>
+  </nav>
+
+  <!-- 1 -->
+  <section id="overview">
+    <div class="sec-h"><div class="n">1</div><h2>全体像</h2></div>
+    <p class="lead">左が「監視サイドバー」、右が「プロジェクトのボタン群」。1枚のカード＝1プロジェクトです。</p>
+    <div class="fig">
+      <div class="overview">
+        <div class="ov-side">
+          <div class="t">監視（常時更新）</div>
+          <div class="ov-item on"><span class="d"></span>🚀 sample-app</div>
+          <div class="ov-item on"><span class="d"></span>🛠️ cmux-dashboard</div>
+          <div class="ov-item"><span class="d"></span>📄 docs-site</div>
+          <div class="ov-item"><span class="d"></span>📝 notes-app</div>
+        </div>
+        <div class="ov-main">
+          <div class="card-mini live"><div class="em">🚀</div><div><b>sample-app</b><div style="font-size:11.5px;color:var(--faint)">~/projects/sample-app</div></div><span class="pulse">LIVE</span></div>
+          <div class="card-mini"><div class="em">📄</div><div><b>docs-site</b><div style="font-size:11.5px;color:var(--faint)">~/projects/docs-site</div></div><span style="margin-left:auto;font-size:11px;color:var(--faint);border:1px solid var(--line);padding:2px 9px;border-radius:999px">起動</span></div>
+          <div class="card-mini"><div class="em">📝</div><div><b>notes-app</b><div style="font-size:11.5px;color:var(--faint)">~/projects/notes-app</div></div><span style="margin-left:auto;font-size:11px;color:var(--faint);border:1px solid var(--line);padding:2px 9px;border-radius:999px">起動</span></div>
+        </div>
+      </div>
+      <div class="cap">緑のドット＝起動中。カードをクリックで起動 / もう一度で前面へ / ✕ で終了。</div>
+    </div>
+  </section>
+
+  <!-- 2 -->
+  <section id="project">
+    <div class="sec-h"><div class="n">2</div><h2>1プロジェクト＝上下2段の「役割分担」</h2></div>
+    <p class="lead">cmux の中で、1プロジェクトは1つの「ワークスペース（タブ）」になり、上下2つのペインに分かれます。</p>
+    <div class="fig">
+      <div class="stack">
+        <div class="lane claude">
+          <span class="tag claude">CLAUDE</span>
+          <div><div class="who">上ペイン</div></div>
+          <div class="desc">計画・設計・指示出し・レビュー。<br>実装は自分で書かず codex に投げる。</div>
+          <div class="role"><code>claude --enable-auto-mode</code></div>
+        </div>
+        <div class="arrowv">↑ 指示を送る ／ 結果を受け取る ↓　<span style="color:var(--sqlite)">（agmsg 経由）</span></div>
+        <div class="lane codex">
+          <span class="tag codex">CODEX</span>
+          <div><div class="who">下ペイン</div></div>
+          <div class="desc">実際のコードを書く・テストまで実行する。<br>難所の「正しさ」担当。</div>
+          <div class="role"><code>codex</code></div>
+        </div>
+      </div>
+      <div class="cap">この上下＝1ワークスペース。cmux内部では <span class="mono">window → workspace → pane → surface</span> という入れ子です。</div>
+    </div>
+  </section>
+
+  <!-- 3 -->
+  <section id="flow">
+    <div class="sec-h"><div class="n">3</div><h2>ボタンを押すと何が起きるか</h2></div>
+    <p class="lead">クリック1回が、裏でこの連鎖を起こします。ダッシュボード自身は何も「実行」せず、ローカルサーバーに頼むだけです。</p>
+    <div class="fig">
+      <div class="flowgrid">
+        <div class="step"><div class="node"><div class="ic">🖱️</div><div class="nm">あなたがクリック</div><div class="sub">ダッシュボード(Web)</div></div></div>
+        <div class="conn">→</div>
+        <div class="step"><div class="node"><div class="ic">🟢</div><div class="nm">Node サーバー</div><div class="sub">server.js : 7799</div></div></div>
+        <div class="conn">→</div>
+        <div class="step"><div class="node"><div class="ic">⌘</div><div class="nm">cmux コマンド</div><div class="sub">cmuxctl.js が実行</div></div></div>
+      </div>
+      <div style="height:18px"></div>
+      <div class="flowgrid">
+        <div class="step"><div class="node" style="border-color:color-mix(in srgb,var(--sqlite) 45%,var(--line))"><div class="ic">🤝</div><div class="nm">agmsg チーム編成</div><div class="sub">claude と codex を join</div></div></div>
+        <div class="conn">＋</div>
+        <div class="step"><div class="node" style="border-color:color-mix(in srgb,var(--claude) 40%,var(--line))"><div class="ic">🪟</div><div class="nm">ワークスペース生成</div><div class="sub">上下分割レイアウト</div></div></div>
+        <div class="conn">→</div>
+        <div class="step"><div class="node" style="border-color:color-mix(in srgb,var(--ok) 40%,var(--line))"><div class="ic">⚡️</div><div class="nm">claude↑ / codex↓ 起動</div><div class="sub">同時に立ち上がる</div></div></div>
+      </div>
+      <div class="note">なぜサーバーを挟む？ ブラウザは安全のため直接 <code>cmux</code> コマンドを実行できません。そこで「ボタン→ローカルサーバー→コマンド実行」という橋渡し役（server.js）を置いています。依存ライブラリはゼロ、Node標準機能だけで動きます。</div>
+    </div>
+  </section>
+
+  <!-- 4 -->
+  <section id="agmsg">
+    <div class="sec-h"><div class="n">4</div><h2>agmsg ＝ AI同士の連絡網</h2></div>
+    <p class="lead">claude と codex は、共有された <b>SQLite ファイル</b> を介してメッセージを送り合います。サーバーもネットワークも不要。人間は伝書鳩から解放されます。</p>
+    <div class="fig">
+      <div style="display:grid;grid-template-columns:1fr 64px 1fr;align-items:center;gap:0">
+        <div class="box" style="border-color:color-mix(in srgb,var(--claude) 40%,var(--line))">
+          <span class="tag claude">CLAUDE</span>
+          <div style="margin-top:8px;font-size:13.5px;color:var(--dim)">「この実装やっといて」<br>を送信 →</div>
+          <div style="margin-top:8px;font-size:11.5px;color:var(--faint)">受信方式: <b style="color:var(--ok)">monitor</b><br>（リアルタイムで割り込み受信）</div>
+        </div>
+        <div style="text-align:center;color:var(--sqlite);font-size:13px">
+          <div style="font-size:24px">⇄</div>
+        </div>
+        <div class="box" style="border-color:color-mix(in srgb,var(--codex) 40%,var(--line))">
+          <span class="tag codex">CODEX</span>
+          <div style="margin-top:8px;font-size:13.5px;color:var(--dim)">← 実装＋テストして<br>「終わったよ」を返信</div>
+          <div style="margin-top:8px;font-size:11.5px;color:var(--faint)">受信方式: <b style="color:var(--warn)">turn</b><br>（応答の合間にチェック）</div>
+        </div>
+      </div>
+      <div class="arrowv" style="height:44px">▼</div>
+      <div class="box" style="border-color:color-mix(in srgb,var(--sqlite) 45%,var(--line));text-align:center;background:color-mix(in srgb,var(--sqlite) 8%,var(--bg))">
+        <span class="tag agmsg">共有 SQLite</span>　<span class="mono" style="font-size:12.5px;color:var(--dim)">~/.agents/skills/agmsg/db/messages.db</span>
+        <div style="font-size:12px;color:var(--faint);margin-top:6px">WALモードで複数リーダー＋1ライター。チーム＝プロジェクト名で仕分け。依存は bash と sqlite3 だけ。</div>
+      </div>
+      <div class="cap">同じ「チーム」に入った2つのAIは、自然言語で「codex にレビュー頼んで」「メッセージ来てる？」と言うだけで連携します。</div>
+    </div>
+  </section>
+
+  <!-- 5 -->
+  <section id="parts">
+    <div class="sec-h"><div class="n">5</div><h2>部品とファイル</h2></div>
+    <p class="lead">中身は <code>~/cmux-dashboard/</code> の数ファイルだけ。すべてローカルにあります。</p>
+    <div class="fig">
+      <div class="files">
+        <div class="file"><span class="fn">projects.json</span><span class="fd">プロジェクト定義（名前・パス・色・起動コマンド・agmsg設定）。「追加」で書き換わる。</span></div>
+        <div class="file"><span class="fn">server.js</span><span class="fd">ブラウザからの操作を受けるローカルHTTPサーバー（ポート7799・依存ゼロ）。</span></div>
+        <div class="file"><span class="fn">cmuxctl.js</span><span class="fd">実際に <code>cmux</code> と <code>agmsg</code> を叩く頭脳。起動・終了・チーム編成を担当。</span></div>
+        <div class="file"><span class="fn">public/index.html</span><span class="fd">ダッシュボード画面そのもの（このページの隣にある本体）。</span></div>
+        <div class="file"><span class="fn">cmux-dash</span><span class="fd">起動スクリプト。サーバーを立てて画面を開く。</span></div>
+      </div>
+      <div class="legend">
+        <span><span class="sw" style="background:var(--claude)"></span>claude＝計画</span>
+        <span><span class="sw" style="background:var(--codex)"></span>codex＝実装</span>
+        <span><span class="sw" style="background:var(--sqlite)"></span>agmsg＝連絡(SQLite)</span>
+        <span><span class="sw" style="background:var(--ok)"></span>Node＝橋渡し</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 6 -->
+  <section id="where">
+    <div class="sec-h"><div class="n">6</div><h2>どこで見る？ ローカルアプリ化</h2></div>
+    <p class="lead">中身はただのWebページなので、3通りで開けます。</p>
+    <div class="fig">
+      <div class="pill-row">
+        <div class="pill">① cmux のブラウザペイン<span style="color:var(--faint)">（今ここ）</span></div>
+        <div class="pill">② 普通のブラウザ <code>http://localhost:7799</code></div>
+        <div class="pill">③ <b style="color:var(--ok)">Mac のアプリとして</b> 🚀</div>
+      </div>
+      <div class="note" style="border-left-color:var(--ok);background:color-mix(in srgb,var(--ok) 8%,transparent)">
+        <b>③ アプリ化:</b> <span class="mono">cmux Dashboard.app</span> をダブルクリックすると、サーバーを起動して「タブもアドレスバーも無い専用ウィンドウ」で開きます。Dock に置けば完全にローカルアプリの感覚です。<br>
+        <span style="font-size:12.5px;color:var(--faint)">（Chromeの <code>--app</code> モードを使った“ネイティブ風”ウィンドウ。詳しい使い方は <span class="mono">~/cmux-dashboard/README.md</span> 参照）</span>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    cmux dashboard · claude × codex orchestrator · <span class="mono">~/cmux-dashboard</span><br>
+    <span style="opacity:.7">このページは <span class="mono">public/how-it-works.html</span> ／ <span class="kbd">esc</span> でダッシュボードへ戻る</span>
+  </footer>
+</div>
+<script>
+  // esc でダッシュボードへ
+  document.addEventListener('keydown',e=>{ if(e.key==='Escape') location.href='/'; });
+</script>
+</body>
+</html>

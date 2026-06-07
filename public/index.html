@@ -1,0 +1,944 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cmux dashboard</title>
+<style>
+  :root{
+    --bg:#0b0e14; --bg2:#11151f; --panel:#151a26; --panel2:#1b2231;
+    --line:#232c3d; --ink:#e6edf6; --dim:#8a97ad; --faint:#5b6677;
+    --claude:#d97757; --codex:#10a37f; --ok:#3ddc97; --warn:#f4bf4f;
+    --accent:#6ea8fe; --radius:8px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:var(--bg);
+    color:var(--ink);font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Hiragino Sans","Noto Sans JP",sans-serif;
+    display:flex;height:100vh;overflow:hidden;-webkit-font-smoothing:antialiased;
+  }
+  /* ---- sidebar (monitor) ---- */
+  aside{
+    width:268px;flex:none;background:linear-gradient(180deg,var(--bg2),var(--bg));
+    border-right:1px solid var(--line);display:flex;flex-direction:column;
+  }
+  .brand{padding:18px 18px 12px;display:flex;align-items:center;gap:10px}
+  .brand .logo{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,var(--claude),var(--codex));
+    display:grid;place-items:center;font-size:15px;box-shadow:0 4px 14px rgba(0,0,0,.4)}
+  .brand h1{font-size:15px;margin:0;font-weight:650;letter-spacing:.2px}
+  .brand small{display:block;color:var(--faint);font-size:11px;font-weight:500}
+  .mon-head{padding:6px 18px;color:var(--faint);font-size:11px;text-transform:uppercase;letter-spacing:.12em;display:flex;justify-content:space-between}
+  .mon{flex:1;overflow:auto;padding:4px 10px}
+  .mon-item{display:flex;gap:10px;align-items:flex-start;padding:9px 10px;border-radius:10px;cursor:pointer;transition:.12s}
+  .mon-item:hover{background:var(--panel)}
+  .dot{width:9px;height:9px;border-radius:50%;flex:none;margin-top:5px;background:var(--faint)}
+  .mon-item.open .dot{background:var(--ok);box-shadow:0 0 0 0 rgba(61,220,151,.6);animation:pulse 2s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(61,220,151,.5)}70%{box-shadow:0 0 0 7px rgba(61,220,151,0)}100%{box-shadow:0 0 0 0 rgba(61,220,151,0)}}
+  .mon-item .mi-main{min-width:0;flex:1}
+  .mon-item .mi-name{font-weight:600;font-size:13px;display:flex;gap:6px;align-items:center}
+  .mon-item .mi-msg{color:var(--dim);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+  .mon-item .mi-time{color:var(--faint);font-size:10.5px;margin-top:1px}
+  .side-foot{padding:12px 16px;border-top:1px solid var(--line);font-size:11px;color:var(--faint);display:flex;flex-direction:column;gap:6px}
+  .pill{display:inline-flex;gap:6px;align-items:center;padding:3px 9px;border-radius:999px;background:var(--panel);border:1px solid var(--line);font-size:11px}
+  .pill b{color:var(--ink)}
+  .pill .g{width:7px;height:7px;border-radius:50%}
+  /* ---- main ---- */
+  main{flex:1;display:flex;flex-direction:column;min-width:0}
+  header{padding:12px 18px;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--line);background:#0d1119}
+  header .title{font-size:15px;font-weight:700;flex:1}
+  header .title span{color:var(--faint);font-weight:500;font-size:12px;margin-left:8px}
+  .btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:6px 10px;border-radius:8px;
+    font-size:12px;font-weight:700;cursor:pointer;transition:.12s;display:inline-flex;gap:6px;align-items:center;min-height:30px}
+  .btn:hover{background:var(--panel2);border-color:#2e3a52}
+  .btn.primary{background:linear-gradient(135deg,var(--claude),#c25f3f);border:none;color:#fff}
+  .btn.ghost{background:transparent}
+  .btn.danger:hover{border-color:#5b2330;color:#ff8a9b}
+  .grid{flex:1;overflow:auto;padding:12px 18px;display:flex;flex-direction:column;gap:8px}
+  .state-line{color:var(--dim);font-size:12px;display:flex;gap:12px;align-items:center;white-space:nowrap}
+  .state-chip{display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border:1px solid var(--line);border-radius:999px;background:var(--panel);font-size:11px}
+  .state-chip.ok{color:var(--ok)}
+  .state-chip.bad{color:#ff9aaa;border-color:#66303a;background:#25151b}
+  .state-chip.warn{color:var(--warn);border-color:#5a4220;background:#241b10}
+  .metrics-grid{display:grid;grid-template-columns:minmax(260px,1fr) minmax(260px,1fr);gap:8px;margin-top:6px}
+  .metrics-panel{background:linear-gradient(180deg,var(--panel),var(--bg2));border:1px solid var(--line);border-radius:8px;padding:12px;min-width:0}
+  .metrics-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}
+  .metrics-title{font-size:12px;font-weight:800;color:var(--ink)}
+  .metrics-stamp{font-size:10.5px;color:var(--faint);white-space:nowrap}
+  .metrics-kpis{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
+  .kpi{border:1px solid var(--line);border-radius:7px;background:#0f131c;padding:8px;min-width:0}
+  .kpi-label{font-size:10.5px;color:var(--faint)}
+  .kpi-value{font:700 14px/1.25 ui-monospace,SFMono-Regular,Menlo,monospace;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .bar-list{display:flex;flex-direction:column;gap:7px}
+  .bar-row{display:grid;grid-template-columns:minmax(82px,1fr) minmax(120px,2fr) 76px;gap:8px;align-items:center;font-size:11px;color:var(--dim);min-width:0}
+  .bar-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink);font-weight:650}
+  .bar-track{height:7px;border-radius:999px;background:#0c1018;border:1px solid var(--line);overflow:hidden}
+  .bar-fill{height:100%;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--ok));width:0}
+  .bar-value{text-align:right;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dim);white-space:nowrap}
+  .agent-list{display:flex;flex-direction:column;gap:8px}
+  .agent-row{display:grid;grid-template-columns:52px minmax(120px,1fr) auto;gap:8px;align-items:center;font-size:11px}
+  .agent-label{font-weight:800}
+  .agent-label.cc{color:var(--claude)} .agent-label.cdx{color:var(--codex)}
+  .agent-label.yazi{color:var(--accent)} .agent-label.term{color:var(--warn)}
+  .type-chips{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}
+  .type-chip{display:inline-flex;gap:3px;align-items:center;border:1px solid var(--line);border-radius:999px;padding:2px 6px;color:var(--dim);font:700 10.5px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace}
+  .legend{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;color:var(--faint);font-size:10.5px}
+  .metrics-error{color:#ffb1bd;font-size:11px;margin-top:8px}
+  .projects-list{display:flex;flex-direction:column;gap:6px}
+  .project-row{display:grid;grid-template-columns:38px 44px minmax(160px,1fr) auto auto;gap:8px;align-items:center;
+    background:linear-gradient(180deg,#131824,#0f131c);border:1px solid var(--line);border-left:3px solid var(--c,#888);
+    border-radius:8px;padding:7px 8px;transition:.12s;min-height:44px;cursor:pointer}
+  .project-row:hover{border-color:#33415c;border-left-color:var(--c,#888);background:#151b29}
+  .project-row.open{border-left-color:var(--ok)}
+  .project-row.fail{border-color:#7a2c38;border-left-color:#ff7f91}
+  .project-row.dragging{opacity:.55;border-style:dashed}
+  .project-row.drag-over{outline:1px solid var(--accent);outline-offset:1px}
+  .project-row.global-row{border-left-style:double;background:linear-gradient(180deg,#151724,#10131b)}
+  .project-row.global-row .row-origin{background:#a78bfa;color:#100b1f}
+  .project-separator{display:flex;align-items:center;gap:10px;color:var(--faint);font-size:10.5px;font-weight:800;
+    letter-spacing:.12em;text-transform:uppercase;margin:5px 0 1px}
+  .project-separator::before,.project-separator::after{content:"";height:1px;background:var(--line);flex:1}
+  #globalRows{display:flex;flex-direction:column;gap:6px}
+  .project-main{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:8px;min-width:0}
+  .row-index{color:var(--faint);font:800 11px/1 ui-monospace,SFMono-Regular,Menlo,monospace;min-width:30px;cursor:grab;user-select:none}
+  .row-origin{justify-self:start;color:#0a1119;background:#9ca3af;border:1px solid transparent;border-radius:5px;
+    padding:2px 6px;font:800 10px/1 ui-monospace,SFMono-Regular,Menlo,monospace;text-transform:uppercase}
+  .project-meta{min-width:0}
+  .project-name{display:flex;align-items:center;gap:7px;font-weight:800;font-size:13px;min-width:0}
+  .project-name .label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .project-sub{color:var(--faint);font-size:10.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+  .row-status{grid-column:1 / -1;display:flex;gap:10px;min-width:0;color:var(--dim);font-size:10.5px;flex-wrap:wrap;padding-left:82px}
+  .row-status b{color:var(--ink);font-weight:650}
+  .row-status .err{color:#ff9aaa}
+  .slotbar{display:flex;align-items:center;gap:4px}
+  .slot-btn{border:1px solid var(--line);background:#0c111a;color:var(--dim);height:28px;min-width:44px;border-radius:7px;
+    padding:0 8px;font-size:11px;font-weight:800;cursor:pointer;transition:.12s}
+  .slot-btn:hover{background:#202a3e;color:var(--ink)}
+  .slot-btn.on{color:#05120d;background:var(--ok);border-color:transparent}
+  .slot-btn.pending{opacity:.58;cursor:progress}
+  .slot-btn.cc.on{background:var(--claude);color:#190a04}
+  .slot-btn.cdx.on{background:var(--codex);color:#03140e}
+  .slot-btn.yazi.on{background:var(--accent);color:#041126}
+  .slot-btn.term.on{background:var(--warn);color:#170f03}
+  .row-actions{display:flex;align-items:center;gap:4px}
+  .card{position:relative;background:linear-gradient(180deg,var(--panel),var(--bg2));border:1px solid var(--line);
+    border-radius:var(--radius);padding:16px;cursor:pointer;transition:.15s;overflow:hidden}
+  .card::before{content:"";position:absolute;inset:0 auto 0 0;width:3px;background:var(--c,#888);opacity:.85}
+  .card:hover{transform:translateY(-2px);border-color:#33415c;box-shadow:0 12px 30px rgba(0,0,0,.35)}
+  .card.open{border-color:color-mix(in srgb,var(--c) 45%,var(--line))}
+  .card.fail{border-color:#7a2c38}
+  .card-top{display:flex;align-items:center;gap:11px}
+  .emoji{width:38px;height:38px;border-radius:10px;display:grid;place-items:center;font-size:19px;
+    background:color-mix(in srgb,var(--c) 18%,transparent);border:1px solid color-mix(in srgb,var(--c) 30%,transparent)}
+  .card h3{margin:0;font-size:15px;font-weight:650}
+  .card .path{color:var(--faint);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+  .status{margin-left:auto;font-size:11px;font-weight:600;padding:3px 9px;border-radius:999px;border:1px solid var(--line);color:var(--dim)}
+  .card.open .status{color:#04140d;background:var(--ok);border-color:transparent}
+  .card.fail .status{color:#ffd2d8;background:#4d1822;border-color:#7a2c38}
+  /* split diagram */
+  .split{margin:14px 0 4px;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:var(--bg)}
+  .lane{display:flex;align-items:center;gap:8px;padding:7px 10px;font-size:11.5px}
+  .lane+ .lane{border-top:1px solid var(--line)}
+  .lane .tag{font-weight:700;font-size:10px;letter-spacing:.04em;padding:1px 7px;border-radius:5px}
+  .lane.claude .tag{color:#1a0d06;background:var(--claude)}
+  .lane.codex .tag{color:#03140e;background:var(--codex)}
+  .lane .role{color:var(--dim)}
+  .lane .cmd{margin-left:auto;color:var(--faint);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px}
+  .card-foot{display:flex;align-items:center;gap:8px;margin-top:12px}
+  .team{font-size:11px;color:var(--faint);display:flex;align-items:center;gap:5px}
+  .team code{color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent);padding:1px 6px;border-radius:5px;font-size:11px}
+  .spacer{flex:1}
+  .mini{border:1px solid var(--line);background:var(--panel2);color:var(--ink);width:28px;height:28px;border-radius:7px;
+    display:grid;place-items:center;cursor:pointer;font-size:13px;transition:.12s}
+  .mini:hover{background:#243049}
+  .mini.conv{width:auto;padding:0 9px;font-size:12px;font-weight:650}
+  .mini.conv.active{background:color-mix(in srgb,var(--accent) 24%,var(--panel2));border-color:color-mix(in srgb,var(--accent) 60%,var(--line))}
+  .mini.drop{width:auto;padding:0 9px;font-size:11px;font-weight:800}
+  .mini.collab-btn{width:auto;padding:0 8px;font-size:11px;font-weight:800}
+  .mini.collab-btn.on{background:color-mix(in srgb,var(--codex) 20%,var(--panel2));border-color:color-mix(in srgb,var(--codex) 55%,var(--line));color:var(--ok)}
+  .mini.collab-btn.running{box-shadow:inset 0 -2px 0 var(--ok)}
+  .mini:disabled{opacity:.42;cursor:not-allowed}
+  .mini.x:hover{color:#ff8a9b;border-color:#5b2330}
+  .last{margin-top:10px;font-size:11.5px;color:var(--dim);border-top:1px dashed var(--line);padding-top:9px;display:none}
+  .card.open .last{display:block}
+  .last b{color:var(--faint);font-weight:600}
+  .thread{margin-top:12px;border-top:1px solid var(--line);padding-top:12px;display:flex;flex-direction:column;gap:8px;cursor:default}
+  .thread-head{display:flex;align-items:center;justify-content:space-between;color:var(--faint);font-size:11px}
+  .thread-list{display:flex;flex-direction:column;gap:8px;max-height:330px;overflow:auto;padding-right:2px}
+  .thread-msg{display:flex;flex-direction:column;gap:3px;max-width:86%}
+  .thread-msg.to-codex{align-self:flex-end;align-items:flex-end}
+  .thread-msg.to-claude{align-self:flex-start;align-items:flex-start}
+  .thread-meta{color:var(--faint);font-size:10.5px}
+  .bubble{border:1px solid var(--line);border-radius:8px;padding:8px 9px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;background:var(--bg)}
+  .thread-msg.to-codex .bubble{background:color-mix(in srgb,var(--claude) 18%,var(--bg));border-color:color-mix(in srgb,var(--claude) 34%,var(--line))}
+  .thread-msg.to-claude .bubble{background:color-mix(in srgb,var(--codex) 14%,var(--bg));border-color:color-mix(in srgb,var(--codex) 30%,var(--line))}
+  .thread-more{border:0;background:transparent;color:var(--accent);padding:0;margin-top:2px;font-size:11px;cursor:pointer}
+  .thread-empty{color:var(--faint);font-size:12px;text-align:center;padding:12px 0}
+  .thread-error{color:#ffb1bd;font-size:11.5px}
+  .empty{color:var(--faint);text-align:center;margin:60px auto;max-width:360px}
+  /* add modal */
+  .modal-bg{position:fixed;inset:0;background:rgba(3,6,12,.66);backdrop-filter:blur(3px);display:none;place-items:center;z-index:30}
+  .modal-bg.show{display:grid}
+  .modal{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:22px;width:420px;max-width:92vw}
+  .modal h2{margin:0 0 14px;font-size:16px}
+  .workspace-yaml-modal{width:760px;max-width:94vw;max-height:88vh;display:flex;flex-direction:column}
+  .workspace-yaml-body{margin:0;background:#080b11;border:1px solid var(--line);border-radius:10px;padding:12px;
+    color:var(--ink);font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;overflow:auto;min-height:360px}
+  .setup-modal{width:680px;max-width:94vw;max-height:90vh;overflow:auto}
+  .setup-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:14px}
+  .setup-title h2{margin:0 0 4px;font-size:17px}
+  .setup-title p{margin:0;color:var(--dim);font-size:12.5px}
+  .setup-steps{display:flex;gap:6px;margin:4px 0 18px}
+  .setup-dot{height:6px;flex:1;border-radius:999px;background:var(--line)}
+  .setup-dot.active{background:var(--accent)}
+  .setup-body{min-height:300px}
+  .doctor-list{display:flex;flex-direction:column;gap:9px}
+  .doctor-row{display:grid;grid-template-columns:28px 92px 1fr;gap:10px;align-items:start;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--bg)}
+  .doctor-mark{width:22px;height:22px;border-radius:50%;display:grid;place-items:center;font-weight:800;font-size:12px;background:#2b1f24;color:#ff9aaa}
+  .doctor-row.ok .doctor-mark{background:#0d2b20;color:var(--ok)}
+  .doctor-name{font-weight:700}
+  .doctor-detail{color:var(--dim);overflow-wrap:anywhere}
+  .fix-hint{margin-top:5px;font-size:12px}
+  .fix-hint a{color:var(--accent)}
+  .copy{display:inline-block;max-width:100%;white-space:normal;overflow-wrap:anywhere;background:#0f131c;border:1px solid var(--line);border-radius:7px;padding:5px 7px;color:var(--ink);cursor:pointer}
+  .setup-note{border:1px solid #5a4220;background:#241b10;color:#f4bf4f;border-radius:10px;padding:10px 12px;margin-bottom:12px;font-size:12.5px}
+  .setup-diagram{border:1px solid var(--line);border-radius:10px;overflow:hidden;margin-top:12px;background:var(--bg)}
+  .setup-line{display:grid;grid-template-columns:108px 1fr;gap:10px;padding:11px 12px}
+  .setup-line+.setup-line{border-top:1px solid var(--line)}
+  .setup-line b{color:var(--ink)}
+  .setup-copy{color:var(--dim);margin:0 0 8px}
+  .setup-actions{display:flex;justify-content:space-between;gap:10px;margin-top:18px}
+  .field{margin-bottom:12px}
+  .field label{display:block;font-size:12px;color:var(--dim);margin-bottom:5px}
+  .field input{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:9px;color:var(--ink);padding:9px 11px;font-size:13px}
+  .field input:focus{outline:none;border-color:var(--accent)}
+  .row{display:flex;gap:10px}
+  .modal-foot{display:flex;justify-content:flex-end;gap:10px;margin-top:8px}
+  .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);
+    padding:10px 16px;border-radius:10px;font-size:13px;opacity:0;transition:.25s;pointer-events:none;z-index:40}
+  .toast.show{opacity:1}
+  .warnbar{background:#2a1f12;border-bottom:1px solid #5a4220;color:#f4bf4f;padding:8px 26px;font-size:12.5px;display:none}
+  .warnbar.show{display:block}
+  .warnbar .inline-btn{margin-left:10px;border:1px solid #7a5a2a;background:#3a2a16;color:#ffe0a3;border-radius:7px;padding:4px 8px;font-size:12px;font-weight:700;cursor:pointer}
+  .warnbar .copy{margin-left:8px;padding:3px 6px}
+  ::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:#222b3c;border-radius:9px}
+  @media (max-width:760px){
+    body{display:block;overflow:auto}
+    aside{display:none}
+    main{min-height:100vh}
+    header{padding:14px;flex-wrap:wrap}
+    .grid{padding:14px}
+    .metrics-grid{grid-template-columns:1fr}
+    .bar-row{grid-template-columns:1fr 1.5fr 70px}
+    .project-row{grid-template-columns:34px 42px minmax(0,1fr);align-items:start}
+    .slotbar,.row-actions{grid-column:1 / -1}
+    .slotbar,.row-actions{flex-wrap:wrap}
+    .row-status{min-width:0;gap:6px;padding-left:0}
+    .state-line{width:100%;flex-wrap:wrap}
+  }
+</style>
+</head>
+<body>
+  <aside>
+    <div class="brand">
+      <div class="logo">⌘</div>
+      <div><h1>cmux dashboard</h1><small>claude × codex orchestrator</small></div>
+    </div>
+    <div class="mon-head"><span>Projects</span><span id="monCount">—</span></div>
+    <div class="mon" id="mon"></div>
+    <div class="side-foot">
+      <div class="pill"><span class="g" id="agDot"></span>agmsg <b id="agState">…</b></div>
+      <div>各プロジェクト=1チーム。上=claude が plan、下=codex が実行。</div>
+    </div>
+  </aside>
+
+  <main>
+    <header>
+      <div class="title">プロジェクト <span id="sub"></span></div>
+      <div class="state-line" id="stateLine"></div>
+      <button class="btn ghost" onclick="openOnboarding(true)" title="セットアップ">？ セットアップ</button>
+      <a class="btn ghost" href="/how-it-works.html" title="仕組みの図解" style="text-decoration:none">？ 仕組み</a>
+      <button class="btn ghost" id="workspaceYamlOpen" onclick="openWorkspaceYaml()">Open workspace.yaml</button>
+      <button class="btn ghost" onclick="openModal()">＋ 追加</button>
+      <button class="btn ghost" onclick="act('/api/close-all','すべて閉じました')">全部閉じる</button>
+      <button class="btn primary" onclick="act('/api/open-all','すべて起動しました')">⌁ 全部起動</button>
+    </header>
+    <div class="warnbar" id="warn">⚠ agmsg が未インストールです。<code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/fujibee/agmsg/main/setup.sh) --cmd agmsg</code> を実行してください（エージェント間メッセージングが無効のまま起動します）。</div>
+    <div class="grid" id="grid"></div>
+  </main>
+
+  <div class="modal-bg" id="modal">
+    <div class="modal">
+      <h2>新しいプロジェクト</h2>
+      <div class="field"><label>プロジェクト名</label><input id="f_name" placeholder="例: ホームページ改修 / youtube-script"></div>
+      <div class="field"><label>パス（空欄なら <code>~/projects/&lt;名前&gt;</code>）</label><input id="f_path" placeholder="~/projects/…"></div>
+      <div class="row">
+        <div class="field" style="flex:1"><label>絵文字</label><input id="f_emoji" placeholder="🆕" maxlength="4"></div>
+        <div class="field" style="flex:1"><label>カラー</label><input id="f_color" placeholder="自動"></div>
+      </div>
+      <label style="display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--dim);margin-bottom:14px;cursor:pointer">
+        <input type="checkbox" id="f_create" checked> フォルダが無ければ作成する（git init も）
+      </label>
+      <div class="modal-foot">
+        <button class="btn ghost" onclick="closeModal()">キャンセル</button>
+        <button class="btn" onclick="addProject(false)">追加だけ</button>
+        <button class="btn primary" onclick="addProject(true)">作成して起動 ⌁</button>
+      </div>
+    </div>
+  </div>
+  <div class="modal-bg" id="onboarding">
+    <div class="modal setup-modal">
+      <div class="setup-head">
+        <div class="setup-title">
+          <h2>セットアップ</h2>
+          <p>依存確認から最初のプロジェクト作成まで</p>
+        </div>
+        <button class="mini x" title="閉じる" onclick="closeOnboarding()">✕</button>
+      </div>
+      <div class="setup-steps" id="setupSteps"></div>
+      <div class="setup-body" id="setupBody"></div>
+      <div class="setup-actions">
+        <button class="btn ghost" id="setupBack" onclick="setOnboardingStep(onboardingStep-1)">戻る</button>
+        <div style="display:flex;gap:10px">
+          <button class="btn ghost" id="setupRetry" onclick="checkDoctor()">再チェック</button>
+          <button class="btn primary" id="setupNext" onclick="setOnboardingStep(onboardingStep+1)">次へ</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="modal-bg" id="workspaceYamlModal">
+    <div class="modal workspace-yaml-modal">
+      <div class="setup-head">
+        <div class="setup-title">
+          <h2>workspace.yaml</h2>
+        </div>
+        <button class="mini x" title="閉じる" onclick="closeWorkspaceYaml()">✕</button>
+      </div>
+      <pre class="workspace-yaml-body" id="workspaceYamlBody"></pre>
+    </div>
+  </div>
+  <div class="toast" id="toast"></div>
+
+<script>
+const $ = (s)=>document.querySelector(s);
+let busy = new Set();
+let threads = new Map();
+let draggingId = null;
+let suppressRowClickUntil = 0;
+let onboardingStep = 0;
+let onboardingSeen = false;
+let onboardingDismissed = false;
+let doctorState = { loading:false, data:null, error:'' };
+const ONBOARDING_STEPS = ['依存', 'モデル', '作成', '完了'];
+
+function toast(msg){const t=$('#toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),2200);}
+function rel(iso){ if(!iso) return ''; const d=(Date.now()-new Date(iso))/1000;
+  if(d<60) return Math.max(0,Math.floor(d))+'秒前'; if(d<3600) return Math.floor(d/60)+'分前';
+  if(d<86400) return Math.floor(d/3600)+'時間前'; return Math.floor(d/86400)+'日前'; }
+function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function isUrl(s){return /^https?:\/\//.test(String(s||''));}
+function copyText(text){ if(navigator.clipboard) navigator.clipboard.writeText(text).catch(()=>{}); toast('コピーしました'); }
+function copyFrom(el){ copyText((el && el.dataset && el.dataset.copy) || (el && el.textContent) || ''); }
+
+async function jget(u){return (await fetch(u)).json();}
+async function jpost(u,b){return (await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:b?JSON.stringify(b):null})).json();}
+async function restartServer(){
+  if(!confirm('cmux-dashboard サーバーを再起動しますか？')) return;
+  try{ await jpost('/api/restart'); toast('サーバー再起動を要求しました'); }
+  catch(e){ toast('再起動要求を送れませんでした'); }
+}
+
+let lastState=null;
+let lastMetrics=null;
+let pollTimer=null;
+let metricsTimer=null;
+let actionInFlight=0;   // アクション実行中はポーリングを止める（cmuxアプリのsocket競合を避ける）
+let lastToastError='';
+function startPoll(){ stopPoll(); pollTimer=setInterval(()=>{ if(!actionInFlight) refresh(); }, 4000); }
+function stopPoll(){ if(pollTimer){ clearInterval(pollTimer); pollTimer=null; } }
+function startMetricsPoll(){ stopMetricsPoll(); metricsTimer=setInterval(()=>{ if(!actionInFlight && document.visibilityState!=='hidden') refreshMetrics(); }, 5000); }
+function stopMetricsPoll(){ if(metricsTimer){ clearInterval(metricsTimer); metricsTimer=null; } }
+async function refresh(){
+  if(actionInFlight) return;
+  let s; try{ s=await jget('/api/state'); }catch(e){ return; }
+  lastState=s; render(s);
+}
+async function refreshMetrics(){
+  if(actionInFlight || document.visibilityState==='hidden') return;
+  try{ lastMetrics=await jget('/api/metrics'); if(lastState) render(lastState); }catch(e){}
+}
+// アクション中はポーリングを完全停止 → cmux が空いた状態で workspace 操作が通る。
+// サーバーは即 {queued:true} を返し、実際の cmux 操作（agmsg join + new-workspace +
+// briefing 送信）はその後 ~数秒かけて走る。その間も webview を静かに保つため、
+// fetch 解決後さらに QUIET_MS だけポーリングを止めてから再開する。
+const QUIET_MS = 5500;
+async function withQuiet(fn){
+  actionInFlight++; stopPoll(); stopMetricsPoll();
+  try{ return await fn(); }
+  finally{
+    setTimeout(async()=>{ actionInFlight--; if(actionInFlight===0){ try{await refresh();await refreshMetrics();}catch(_){} startPoll(); startMetricsPoll(); } }, QUIET_MS);
+  }
+}
+function openOnboarding(resetStep){
+  if(resetStep) onboardingStep = 0;
+  onboardingSeen = true;
+  onboardingDismissed = false;
+  $('#onboarding').classList.add('show');
+  renderOnboarding();
+  if(onboardingStep===0 && !doctorState.data && !doctorState.loading) checkDoctor();
+}
+function closeOnboarding(){
+  onboardingDismissed = true;
+  $('#onboarding').classList.remove('show');
+}
+function maybeOpenOnboarding(s){
+  if(s && stateRows(s).length===0 && !onboardingSeen && !onboardingDismissed) openOnboarding(true);
+}
+function setOnboardingStep(step){
+  onboardingStep = Math.max(0, Math.min(ONBOARDING_STEPS.length-1, step));
+  renderOnboarding();
+  if(onboardingStep===0 && !doctorState.data && !doctorState.loading) checkDoctor();
+}
+async function checkDoctor(){
+  doctorState.loading = true;
+  doctorState.error = '';
+  renderOnboarding();
+  try{ doctorState.data = await jget('/api/doctor'); }
+  catch(e){ doctorState.error = String(e && e.message ? e.message : e); }
+  finally{ doctorState.loading = false; renderOnboarding(); }
+}
+async function openWorkspaceYaml(){
+  const modal = $('#workspaceYamlModal');
+  const body = $('#workspaceYamlBody');
+  body.textContent = 'loading...';
+  modal.classList.add('show');
+  try{
+    const res = await fetch('/api/workspace-yaml', { headers:{Accept:'text/yaml'} });
+    const text = await res.text();
+    body.textContent = res.ok ? text : `error: ${text || res.status}`;
+  }catch(e){
+    body.textContent = `error: ${e && e.message ? e.message : e}`;
+  }
+}
+function closeWorkspaceYaml(){ $('#workspaceYamlModal').classList.remove('show'); }
+function fixHintHtml(hint){
+  if(!hint) return '';
+  if(isUrl(hint)) return `<div class="fix-hint"><a href="${esc(hint)}" target="_blank" rel="noreferrer">${esc(hint)}</a></div>`;
+  return `<div class="fix-hint"><code class="copy" data-copy="${esc(hint)}" onclick="event.stopPropagation();copyFrom(this)">${esc(hint)}</code></div>`;
+}
+function renderDoctorChecks(){
+  if(doctorState.loading) return '<div class="empty" style="margin:38px auto">依存を確認中...</div>';
+  if(doctorState.error) return `<div class="setup-note">確認できませんでした: ${esc(doctorState.error)}</div>`;
+  const data = doctorState.data || {};
+  const checks = Array.isArray(data.checks) ? data.checks : [];
+  const warn = data.allOk === false ? '<div class="setup-note">未設定の項目があります。後から直せるので、このまま進めます。</div>' : '';
+  return `${warn}<div class="doctor-list">${checks.map(c=>`
+    <div class="doctor-row ${c.ok?'ok':'bad'}">
+      <div class="doctor-mark">${c.ok?'✓':'✗'}</div>
+      <div class="doctor-name">${esc(c.name)}</div>
+      <div>
+        <div class="doctor-detail">${esc(c.detail)}</div>
+        ${c.ok?'':fixHintHtml(c.fixHint)}
+      </div>
+    </div>`).join('')}</div>`;
+}
+function renderOnboarding(){
+  const root = $('#onboarding');
+  if(!root) return;
+  $('#setupSteps').innerHTML = ONBOARDING_STEPS.map((_,i)=>`<div class="setup-dot ${i<=onboardingStep?'active':''}"></div>`).join('');
+  let body = '';
+  if(onboardingStep===0){
+    body = `<p class="setup-copy">cmux-dashboard が使うローカル依存を read-only で確認します。</p>${renderDoctorChecks()}`;
+  }else if(onboardingStep===1){
+    body = `<p class="setup-copy">人間は claude に話し、claude が計画とレビューを担当します。codex は実装とテストを担当し、agmsg が両者の連絡路になります。</p>
+      <div class="setup-diagram">
+        <div class="setup-line"><b>claude</b><span>plan / 指示 / レビュー</span></div>
+        <div class="setup-line"><b>agmsg</b><span>ローカル SQLite で claude ↔ codex を接続</span></div>
+        <div class="setup-line"><b>codex</b><span>コード / DB / API / CLI / テスト</span></div>
+      </div>`;
+  }else if(onboardingStep===2){
+    body = `<p class="setup-copy">最初のプロジェクトを登録します。パスを空欄にすると <code>~/projects/&lt;名前&gt;</code> に作ります。</p>
+      <div class="field"><label>プロジェクト名</label><input id="onb_name" placeholder="例: my-app"></div>
+      <div class="field"><label>パス</label><input id="onb_path" placeholder="~/projects/…"></div>
+      <div class="row">
+        <div class="field" style="flex:1"><label>絵文字</label><input id="onb_emoji" placeholder="🆕" maxlength="4"></div>
+        <div class="field" style="flex:1"><label>カラー</label><input id="onb_color" placeholder="自動"></div>
+      </div>
+      <label style="display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--dim);cursor:pointer">
+        <input type="checkbox" id="onb_create" checked> フォルダが無ければ作成する
+      </label>`;
+  }else{
+    body = `<div class="empty" style="margin:44px auto 18px">準備できました。作ったプロジェクトの「起動」を押してください。</div>`;
+  }
+  $('#setupBody').innerHTML = body;
+  $('#setupBack').style.visibility = onboardingStep===0 ? 'hidden' : 'visible';
+  $('#setupRetry').style.display = onboardingStep===0 ? 'inline-flex' : 'none';
+  $('#setupNext').textContent = onboardingStep===2 ? '作成' : (onboardingStep===3 ? '閉じる' : '次へ');
+  $('#setupNext').onclick = onboardingStep===2 ? onboardAddProject : (onboardingStep===3 ? closeOnboarding : ()=>setOnboardingStep(onboardingStep+1));
+}
+const SLOT_DEFS = [
+  { key:'cc', label:'CC' },
+  { key:'cdx', label:'Cdx' },
+  { key:'yazi', label:'Yazi' },
+  { key:'term', label:'Term' },
+];
+function jsArg(s){ return JSON.stringify(String(s || '')).replace(/"/g,'&quot;'); }
+function slotValue(p, slot){
+  const slots = p && p.slots ? p.slots : {};
+  const raw = slots[slot];
+  if(raw && typeof raw === 'object') return !!(raw.on || raw.open || raw.enabled || raw.ref);
+  return !!raw;
+}
+function collabState(p){
+  const c = p && p.collab ? p.collab : {};
+  return { enabled: !!c.enabled, running: !!c.running, error: c.error || '' };
+}
+function projectAction(p){
+  const a = (p && p.action) || {};
+  if(a.status) return `${a.label || 'action'}: ${a.status}`;
+  if(p && p.pending) return 'action: pending';
+  return p && p.open ? 'workspace: open' : 'workspace: closed';
+}
+function projectError(p){
+  const a = (p && p.action) || {};
+  if(a.status === 'failed' && a.message) return a.message;
+  if(p && p.lastError) return typeof p.lastError === 'string' ? p.lastError : (p.lastError.message || JSON.stringify(p.lastError));
+  if(p && p.error) return typeof p.error === 'string' ? p.error : (p.error.message || JSON.stringify(p.error));
+  return '';
+}
+function projectHealth(p){
+  const h = p && p.health;
+  if(!h) return p && p.open ? 'health: live' : 'health: idle';
+  if(typeof h === 'string') return `health: ${h}`;
+  if(h.unhealthy || h.ok === false) return `health: bad${h.lastError ? ' - ' + h.lastError : ''}`;
+  if(h.ok === true) return 'health: ok';
+  return 'health: unknown';
+}
+function renderStateLine(s, actionError, cmuxHealth){
+  const cmuxBad = cmuxHealth && (cmuxHealth.unhealthy || cmuxHealth.ok === false);
+  const cmuxText = cmuxHealth ? `cmux ${cmuxBad ? 'bad' : 'ok'}${cmuxHealth.consecutiveFailures ? ' +' + cmuxHealth.consecutiveFailures : ''}` : 'cmux unknown';
+  const actionText = actionError ? `${actionError.label || 'action'} failed` : 'actions ready';
+  $('#stateLine').innerHTML = [
+    `<span class="state-chip ${cmuxBad?'bad':'ok'}">${esc(cmuxText)}</span>`,
+    `<span class="state-chip ${actionError?'bad':'ok'}">${esc(actionText)}</span>`,
+    `<span class="state-chip ${s.agmsgInstalled?'ok':'warn'}">agmsg ${s.agmsgInstalled?'ready':'none'}</span>`,
+  ].join('');
+}
+function fmtBytes(n){
+  n = Number(n);
+  if(!Number.isFinite(n) || n<=0) return '0 B';
+  const units=['B','KB','MB','GB','TB'];
+  let i=0; while(n>=1024 && i<units.length-1){ n/=1024; i++; }
+  const digits = i<2 ? 0 : 1;
+  return `${n.toFixed(digits)} ${units[i]}`;
+}
+function barWidth(value,max){ if(!max) return 0; return Math.max(value>0?3:0, Math.min(100, Math.round((value/max)*100))); }
+function metricProjects(){
+  const m = lastMetrics || {};
+  return Array.isArray(m.projects) ? m.projects : [];
+}
+function typeTotals(projects){
+  const totals = { C:{rssBytes:0,procCount:0}, M:{rssBytes:0,procCount:0}, X:{rssBytes:0,procCount:0}, O:{rssBytes:0,procCount:0} };
+  for(const p of projects){
+    const byType = p.byType || {};
+    for(const key of Object.keys(totals)){
+      const item = byType[key] || {};
+      totals[key].rssBytes += Number(item.rssBytes)||0;
+      totals[key].procCount += Number(item.procCount)||0;
+    }
+  }
+  return totals;
+}
+function typeChips(byType){
+  const defs = [
+    ['C','C'], ['M','M'], ['X','X'], ['O','O'],
+  ];
+  return `<div class="type-chips">${defs.map(([key,label])=>{
+    const item = (byType || {})[key] || {};
+    return `<span class="type-chip">${label} ${fmtBytes(item.rssBytes||0)} · ${Number(item.procCount)||0}</span>`;
+  }).join('')}</div>`;
+}
+function renderMetricsPanels(){
+  const m = lastMetrics || {};
+  const projects = metricProjects();
+  const app = m.app || {};
+  const maxProject = Math.max(1, ...projects.map(p=>Number(p.rssBytes)||0));
+  const projectRows = projects.filter(p=>Number(p.rssBytes)||0).slice().sort((a,b)=>(b.rssBytes||0)-(a.rssBytes||0)).slice(0,8);
+  const slots = [];
+  for(const p of projects){
+    for(const [slot,item] of Object.entries(p.bySlot || {})){
+      const rss = Number(item && item.rssBytes)||0;
+      if(rss>0 || Number(item && item.surfaceCount)>0) slots.push({ project:p, slot, rss, procCount:Number(item.procCount)||0 });
+    }
+  }
+  slots.sort((a,b)=>b.rss-a.rss);
+  const maxSlot = Math.max(1, ...slots.map(s=>s.rss));
+  const totals = typeTotals(projects);
+  const stamp = m.updatedAt ? rel(m.updatedAt) : 'waiting';
+  return `<div class="metrics-grid" id="metricsPanels">
+    <section class="metrics-panel">
+      <div class="metrics-head"><div class="metrics-title">Memory</div><div class="metrics-stamp">${esc(stamp)}</div></div>
+      <div class="metrics-kpis">
+        <div class="kpi"><div class="kpi-label">App footprint</div><div class="kpi-value">${fmtBytes(app.footprint)}</div></div>
+        <div class="kpi"><div class="kpi-label">Child RSS</div><div class="kpi-value">${fmtBytes(app.childRss)}</div></div>
+      </div>
+      <div class="bar-list">${projectRows.length ? projectRows.map(p=>`
+        <div class="bar-row">
+          <div class="bar-name">${esc(p.name || p.id)}</div>
+          <div class="bar-track"><div class="bar-fill" style="width:${barWidth(p.rssBytes,maxProject)}%"></div></div>
+          <div class="bar-value">${fmtBytes(p.rssBytes)}</div>
+        </div>`).join('') : '<div class="thread-empty">計測待ち</div>'}</div>
+      ${m.error?`<div class="metrics-error">${esc(m.error)}</div>`:''}
+    </section>
+    <section class="metrics-panel">
+      <div class="metrics-head"><div class="metrics-title">CC &amp; Codex</div>${typeChips(totals)}</div>
+      <div class="agent-list">${slots.length ? slots.slice(0,10).map(s=>`
+        <div class="agent-row">
+          <div class="agent-label ${esc(s.slot)}">${esc((SLOT_DEFS.find(x=>x.key===s.slot)||{label:s.slot}).label)}</div>
+          <div class="bar-row" style="grid-template-columns:minmax(86px,1fr) minmax(100px,2fr) 70px">
+            <div class="bar-name">${esc(s.project.name || s.project.id)}</div>
+            <div class="bar-track"><div class="bar-fill" style="width:${barWidth(s.rss,maxSlot)}%"></div></div>
+            <div class="bar-value">${fmtBytes(s.rss)}</div>
+          </div>
+          <div class="bar-value">${s.procCount} proc</div>
+        </div>`).join('') : '<div class="thread-empty">計測待ち</div>'}</div>
+      <div class="legend"><span>C=Claude/CC</span><span>M=MCP</span><span>X=Codex</span><span>O=Other</span></div>
+    </section>
+  </div>`;
+}
+function renderSlotButtons(p){
+  return SLOT_DEFS.map(({key,label})=>{
+    const on = slotValue(p, key);
+    const pending = busy.has(`${p.id}:${key}`);
+    return `<button class="slot-btn ${key} ${on?'on':''} ${pending?'pending':''}" data-slot="${esc(key)}" title="${esc(label)} ${on?'OFF':'ON'}" onclick="event.stopPropagation();toggleSlot(${jsArg(p.id)},${jsArg(key)},${on?'false':'true'})">${label}</button>`;
+  }).join('');
+}
+function projectKind(p){ return p && p.kind === 'global' ? 'global' : 'project'; }
+function stateRows(s){
+  return [
+    ...(Array.isArray(s && s.projects) ? s.projects : []),
+    ...(Array.isArray(s && s.globalRows) ? s.globalRows : []),
+  ];
+}
+function renderProjectRow(p, index){
+  const isGlobal = projectKind(p) === 'global';
+  const collab = collabState(p);
+  const action = projectAction(p);
+  const err = projectError(p) || collab.error;
+  const health = projectHealth(p);
+  const failed = !!err || ((p.action || {}).status === 'failed');
+  const openCount = SLOT_DEFS.filter(({key})=>slotValue(p,key)).length;
+  const status = p.open ? `open/${openCount}` : `${openCount}`;
+  const collabBusy = busy.has(`${p.id}:collab`);
+  const collabLabel = collab.enabled ? (collab.running ? '協業ON' : '協業待') : '協業OFF';
+  const collabTitle = collab.enabled ? '協業をOFFにする' : '協業をONにする';
+  const dragAttrs = isGlobal ? '' : `draggable="true" ondragstart="dragStart(event,${jsArg(p.id)})" ondragover="dragOver(event)" ondragleave="dragLeave(event)" ondrop="dropProject(event,${jsArg(p.id)})" ondragend="dragEnd(event)"`;
+  return `<div class="project-row ${isGlobal?'global-row':''} ${p.open?'open':''} ${failed?'fail':''}" data-project-id="${esc(p.id)}" data-row-kind="${projectKind(p)}" data-project-index="${index}" ${dragAttrs} onclick="cardClick(event,${jsArg(p.id)},${p.open?'true':'false'})" style="--c:${esc(p.color || '#888')}">
+    <div class="row-index" title="${isGlobal?'グローバル行':'ドラッグで並び替え'}">${isGlobal?'G':'#'}${index + 1}</div>
+    <div class="row-origin">${isGlobal?'gbl':'lcl'}</div>
+    <div class="project-main">
+      <div class="emoji">${esc(p.emoji || '□')}</div>
+      <div class="project-meta">
+        <div class="project-name"><span class="label">${esc(p.name)}</span><span class="status">${esc(status)}</span></div>
+        <div class="project-sub">${esc(isGlobal ? `global / ${p.path || p.cwd || '~'}` : (p.path || p.cwd || ''))}</div>
+      </div>
+    </div>
+    <div class="slotbar">${renderSlotButtons(p)}</div>
+    <div class="row-actions">
+      ${isGlobal ? '' : `<button class="mini collab-btn ${collab.enabled?'on':''} ${collab.running?'running':''}" data-action="collab" title="${esc(collabTitle)}" onclick="event.stopPropagation();toggleCollab(${jsArg(p.id)},${collab.enabled?'false':'true'})">${collabBusy?'協業…':collabLabel}</button>`}
+      ${p.open
+        ? `<button class="mini drop" data-action="drop" title="workspaceを閉じる" onclick="event.stopPropagation();close_(${jsArg(p.id)})">Drop</button>`
+        : `<button class="mini drop" data-action="add" title="workspaceを起動" onclick="event.stopPropagation();open_(${jsArg(p.id)})">Add</button>`}
+      ${isGlobal ? '' : `<button class="mini x" data-action="delete" title="一覧から削除" onclick="event.stopPropagation();del(${jsArg(p.id)},${jsArg(p.name)})">✕</button>`}
+    </div>
+    <div class="row-status">
+      <span><b>action</b> ${esc(action)}</span>
+      <span><b>health</b> ${esc(health)}</span>
+      <span><b>collab</b> ${esc(collab.enabled ? (collab.running ? 'enabled/running' : 'enabled/stopped') : (collab.running ? 'disabled/running' : 'disabled'))}</span>
+      ${err?`<span class="err"><b>lastError</b> ${esc(err)}</span>`:`<span><b>lastError</b> none</span>`}
+    </div>
+  </div>`;
+}
+function renderProjectRows(s){
+  const projects = Array.isArray(s.projects) ? s.projects : [];
+  const globalRows = Array.isArray(s.globalRows) ? s.globalRows : [];
+  const normalHtml = projects.map((p,i)=>renderProjectRow(p,i)).join('');
+  const globalHtml = globalRows.length ? [
+    '<div class="project-separator" id="globalRowsSeparator">Global</div>',
+    '<div id="globalRows">',
+    globalRows.map((p,i)=>renderProjectRow(p,i)).join(''),
+    '</div>',
+  ].join('') : '';
+  return `<div class="projects-list" id="projectRows">${normalHtml}${globalHtml}</div>`;
+}
+function render(s){
+  if(!s || !Array.isArray(s.projects)) return;
+  const rows = stateRows(s);
+  const globals = Array.isArray(s.globalRows) ? s.globalRows : [];
+  const projectIds = new Set(rows.map(p=>p.id));
+  for(const id of Array.from(threads.keys())) if(!projectIds.has(id)) closeThread(id);
+  const openCount = Number.isFinite(Number(s.openCount)) ? Number(s.openCount) : s.projects.filter((p)=>p.open).length;
+  const globalOpenCount = Number.isFinite(Number(s.globalOpenCount)) ? Number(s.globalOpenCount) : globals.filter((p)=>p.open).length;
+  $('#sub').textContent = `${openCount}/${s.projects.length} 起動中${globals.length ? ` · global ${globalOpenCount}/${globals.length}` : ''}`;
+  $('#monCount').textContent = globals.length ? `${openCount}/${s.projects.length} +G${globalOpenCount}/${globals.length}` : `${openCount}/${s.projects.length}`;
+  $('#agState').textContent = s.agmsgInstalled ? 'ready' : 'なし';
+  $('#agDot').style.background = s.agmsgInstalled ? 'var(--ok)' : 'var(--warn)';
+  const actionError = s.lastActionError && s.lastActionError.message ? s.lastActionError : null;
+  const cmuxHealth = s.health && s.health.cmux ? s.health.cmux : null;
+  renderStateLine(s, actionError, cmuxHealth);
+  if(cmuxHealth && (cmuxHealth.unhealthy || cmuxHealth.ok === false)){
+    $('#warn').innerHTML = `⚠ cmux応答不良: サーバー再起動が必要 <button class="inline-btn" onclick="restartServer()">サーバー再起動</button><code class="copy" data-copy="./cmux-dash restart" onclick="event.stopPropagation();copyFrom(this)">./cmux-dash restart</code>`;
+    $('#warn').classList.add('show');
+  }else if(!s.agmsgInstalled){
+    $('#warn').innerHTML = '⚠ agmsg が未インストールです。<code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/fujibee/agmsg/main/setup.sh) --cmd agmsg</code> を実行してください（エージェント間メッセージングが無効のまま起動します）。';
+    $('#warn').classList.add('show');
+  }else if(actionError){
+    $('#warn').textContent = `⚠ ${actionError.label || 'action'} failed: ${actionError.message}`;
+    $('#warn').classList.add('show');
+    const key = `${actionError.label}:${actionError.message}:${actionError.at || ''}`;
+    if(key !== lastToastError){ lastToastError = key; toast('失敗: '+actionError.message); }
+  }else{
+    $('#warn').classList.remove('show');
+  }
+
+  // sidebar monitor
+  $('#mon').innerHTML = rows.map(p=>`
+    <div class="mon-item ${p.open?'open':''}" onclick="${p.open?`focus('${p.id}')`:`open('${p.id}')`}">
+      <span class="dot"></span>
+      <div class="mi-main">
+        <div class="mi-name">${p.emoji} ${esc(p.name)}${projectKind(p)==='global'?' · G':''}</div>
+        ${p.open && p.lastMessage ? `<div class="mi-msg">${esc(p.lastMessage)}</div>`:''}
+        <div class="mi-time">${p.open ? (p.lastAt?rel(p.lastAt):'起動中') : 'stopped'}</div>
+      </div>
+    </div>`).join('');
+
+  // main grid
+  if(!rows.length){
+    $('#grid').innerHTML=renderMetricsPanels() + '<div class="empty">プロジェクトがありません。<br>「？ セットアップ」から最初のプロジェクトを登録してください。</div>';
+    maybeOpenOnboarding(s);
+    return;
+  }
+  maybeOpenOnboarding(s);
+  $('#grid').innerHTML = renderProjectRows(s) + renderMetricsPanels();
+}
+
+function threadFor(id){
+  if(!threads.has(id)) threads.set(id,{open:false,messages:[],lastId:0,timer:null,loading:false,error:'',expanded:new Set()});
+  return threads.get(id);
+}
+function direction(m){
+  if(m.from==='claude' && m.to==='codex') return {cls:'to-codex', label:'claude → codex'};
+  if(m.from==='codex' && m.to==='claude') return {cls:'to-claude', label:'codex → claude'};
+  return {cls:'to-claude', label:`${m.from || '?'} → ${m.to || '?'}`};
+}
+function threadPanel(id){
+  const st = threadFor(id);
+  const body = st.messages.length ? st.messages.map(m=>{
+    const dir = direction(m);
+    const txt = String(m.body || '');
+    const long = m.truncated || txt.length > 700;
+    const expanded = st.expanded.has(m.id);
+    const shown = long && !expanded ? txt.slice(0,700) + '...' : txt + (m.truncated ? '...' : '');
+    return `<div class="thread-msg ${dir.cls}">
+      <div class="thread-meta">${esc(dir.label)} · ${esc(rel(m.at) || m.at || '')}</div>
+      <div class="bubble">${esc(shown)}</div>
+      ${long?`<button class="thread-more" onclick="event.stopPropagation();toggleMessage('${id}',${m.id})">${expanded?'折りたたむ':'もっと見る'}</button>`:''}
+    </div>`;
+  }).join('') : `<div class="thread-empty">${st.loading?'読み込み中...':'会話はまだありません'}</div>`;
+  return `<div class="thread" onclick="event.stopPropagation()">
+    <div class="thread-head"><span>claude↔codex</span><span>${st.loading?'更新中':(st.lastId?`#${st.lastId}`:'read-only')}</span></div>
+    ${st.error?`<div class="thread-error">${esc(st.error)}</div>`:''}
+    <div class="thread-list">${body}</div>
+  </div>`;
+}
+function toggleMessage(id,msgId){
+  const st = threadFor(id);
+  if(st.expanded.has(msgId)) st.expanded.delete(msgId); else st.expanded.add(msgId);
+  if(lastState) render(lastState);
+}
+function toggleThread(id){
+  const st = threadFor(id);
+  if(st.open) return closeThread(id);
+  st.open = true;
+  st.error = '';
+  fetchThread(id,true);
+  st.timer = setInterval(()=>fetchThread(id,false),3000);
+  if(lastState) render(lastState);
+}
+function closeThread(id){
+  const st = threads.get(id);
+  if(!st) return;
+  if(st.timer) clearInterval(st.timer);
+  st.timer = null;
+  st.open = false;
+  threads.delete(id);
+  if(lastState) render(lastState);
+}
+async function fetchThread(id,initial){
+  const st = threadFor(id);
+  if(!st.open || st.loading) return;
+  st.loading = true;
+  const qs = initial || !st.lastId ? 'limit=50' : `since=${encodeURIComponent(st.lastId)}&limit=50`;
+  try{
+    const data = await jget(`/api/agmsg/${encodeURIComponent(id)}?${qs}`);
+    st.error = data.error || '';
+    if(initial){
+      st.messages = [];
+      st.lastId = 0;
+    }
+    const seen = new Set(st.messages.map(m=>m.id));
+    for(const m of (Array.isArray(data.messages)?data.messages:[])){
+      if(!seen.has(m.id)){ st.messages.push(m); seen.add(m.id); }
+    }
+    st.messages.sort((a,b)=>(a.id||0)-(b.id||0));
+    st.lastId = Math.max(st.lastId, Number(data.lastId)||0, ...st.messages.map(m=>Number(m.id)||0));
+  }catch(e){
+    st.error = String(e && e.message ? e.message : e);
+  }finally{
+    st.loading = false;
+    if(lastState) render(lastState);
+  }
+}
+
+function cardClick(e,id,open){ if(Date.now()<suppressRowClickUntil)return; console.log('[dash] cardClick',id,'open=',open); if(open) focus(id); else open_(id); }
+async function open_(id){ console.log('[dash] open_ enter',id,'busy=',busy.has(id)); if(busy.has(id))return; busy.add(id); toast('起動中…（claude↑ / codex↓）'); try{render(lastState);}catch(_){}
+  await withQuiet(async()=>{ try{ console.log('[dash] POST /api/open/'+id); const r=await jpost('/api/open/'+id); console.log('[dash] open resp',JSON.stringify(r)); }catch(e){ console.log('[dash] open err',''+e); toast('失敗: '+e); } });
+  busy.delete(id); }
+async function close_(id){ if(busy.has(id))return; busy.add(id); render(lastState);
+  await withQuiet(async()=>{ try{ await jpost('/api/close/'+id); toast('閉じました'); }catch(e){} });
+  busy.delete(id); }
+async function focus(id){ await withQuiet(async()=>{ try{ await jpost('/api/focus/'+id); toast('フォーカスしました'); }catch(e){} }); }
+async function toggleSlot(id, slot, on){
+  const key = `${id}:${slot}`;
+  if(busy.has(key)) return;
+  busy.add(key);
+  try{ render(lastState); }catch(_){}
+  await withQuiet(async()=>{
+    try{
+      await jpost(`/api/project/${encodeURIComponent(id)}/slot/${encodeURIComponent(slot)}`, { on: !!on });
+      toast(`${slot} ${on ? 'ON' : 'OFF'} を要求しました`);
+    }catch(e){
+      toast('失敗: '+(e && e.message ? e.message : e));
+    }
+  });
+  busy.delete(key);
+}
+async function toggleCollab(id, on){
+  const key = `${id}:collab`;
+  if(busy.has(key)) return;
+  busy.add(key);
+  try{ render(lastState); }catch(_){}
+  await withQuiet(async()=>{
+    try{
+      await jpost(`/api/project/${encodeURIComponent(id)}/collab`, { on: !!on });
+      toast(`協業 ${on ? 'ON' : 'OFF'} を要求しました`);
+    }catch(e){
+      toast('失敗: '+(e && e.message ? e.message : e));
+    }
+  });
+  busy.delete(key);
+}
+window.open=open_; window.close_=close_; window.focus=focus; // expose
+
+async function act(u,msg){ toast(msg+'…'); await withQuiet(async()=>{ await jpost(u); }); }
+async function del(id,name){ if(!confirm(`「${name}」を一覧から削除しますか？（フォルダは消えません）`))return;
+  await withQuiet(async()=>{
+    const r = await fetch('/api/projects/'+encodeURIComponent(id),{method:'DELETE'});
+    if(!r.ok) throw new Error('DELETE failed');
+    toast('削除しました');
+  });
+  await refresh();
+}
+
+function currentOrder(){
+  return lastState && Array.isArray(lastState.projects) ? lastState.projects.map(p=>p.id) : [];
+}
+function clearDragMarks(){
+  document.querySelectorAll('.project-row.dragging,.project-row.drag-over').forEach(el=>el.classList.remove('dragging','drag-over'));
+}
+function dragStart(ev,id){
+  draggingId = id;
+  suppressRowClickUntil = Date.now() + 500;
+  if(ev.dataTransfer){
+    ev.dataTransfer.effectAllowed = 'move';
+    ev.dataTransfer.setData('text/plain', id);
+  }
+  ev.currentTarget.classList.add('dragging');
+}
+function dragOver(ev){
+  if(!draggingId) return;
+  ev.preventDefault();
+  ev.currentTarget.classList.add('drag-over');
+}
+function dragLeave(ev){ ev.currentTarget.classList.remove('drag-over'); }
+function dragEnd(){ draggingId = null; suppressRowClickUntil = Date.now() + 350; clearDragMarks(); }
+async function dropProject(ev,targetId){
+  ev.preventDefault();
+  ev.stopPropagation();
+  const sourceId = (ev.dataTransfer && ev.dataTransfer.getData('text/plain')) || draggingId;
+  dragEnd();
+  if(!sourceId || sourceId===targetId) return;
+  const order = currentOrder();
+  const from = order.indexOf(sourceId);
+  const to = order.indexOf(targetId);
+  if(from < 0 || to < 0) return;
+  order.splice(from,1);
+  order.splice(to,0,sourceId);
+  await reorderProjects(order);
+}
+async function reorderProjects(order){
+  const previous = lastState && Array.isArray(lastState.projects) ? lastState.projects.slice() : [];
+  if(lastState && previous.length){
+    const byId = new Map(previous.map(p=>[p.id,p]));
+    lastState.projects = order.map(id=>byId.get(id)).filter(Boolean);
+    render(lastState);
+  }
+  await withQuiet(async()=>{
+    try{
+      await jpost('/api/reorder',{order});
+      toast('並び替えました');
+    }catch(e){
+      toast('並び替え失敗: '+(e && e.message ? e.message : e));
+      if(lastState && previous.length){ lastState.projects = previous; render(lastState); }
+    }
+  });
+}
+
+function openModal(){ $('#modal').classList.add('show'); $('#f_name').focus(); }
+function closeModal(){ $('#modal').classList.remove('show'); }
+function projectBodyFrom(prefix){
+  const name=$(`#${prefix}_name`).value.trim(); const path=$(`#${prefix}_path`).value.trim();
+  if(!name && !path){ toast('プロジェクト名かパスを入れてください'); return null; }
+  return { name:name||undefined, path:path||undefined, emoji:$(`#${prefix}_emoji`).value.trim()||undefined,
+    color:$(`#${prefix}_color`).value.trim()||undefined, create:$(`#${prefix}_create`).checked };
+}
+function clearProjectFields(prefix){
+  [`${prefix}_name`,`${prefix}_path`,`${prefix}_emoji`,`${prefix}_color`].forEach(i=>$('#'+i).value='');
+  $(`#${prefix}_create`).checked=true;
+}
+async function submitProject(body, autostart){
+  let ok=false;
+  await withQuiet(async()=>{ try{ await jpost('/api/projects',{...body, autostart:!!autostart}); ok=true; }catch(e){ toast('失敗: '+e); } });
+  return ok;
+}
+async function addProject(autostart){
+  const body=projectBodyFrom('f'); if(!body) return;
+  closeModal(); clearProjectFields('f');
+  toast(autostart?'作成して起動中…（claude↑ / codex↓）':'追加しました');
+  await submitProject(body, autostart);
+}
+async function onboardAddProject(){
+  const body=projectBodyFrom('onb'); if(!body) return;
+  toast('追加しました');
+  if(await submitProject(body, false)) setOnboardingStep(3);
+}
+document.addEventListener('keydown',e=>{ if(e.key==='Escape'){ closeModal(); closeOnboarding(); closeWorkspaceYaml(); } });
+$('#modal').addEventListener('click',e=>{ if(e.target.id==='modal') closeModal(); });
+$('#onboarding').addEventListener('click',e=>{ if(e.target.id==='onboarding') closeOnboarding(); });
+$('#workspaceYamlModal').addEventListener('click',e=>{ if(e.target.id==='workspaceYamlModal') closeWorkspaceYaml(); });
+
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden') stopMetricsPoll(); else { refreshMetrics(); startMetricsPoll(); } });
+refresh(); refreshMetrics(); startPoll(); startMetricsPoll();
+</script>
+</body>
+</html>

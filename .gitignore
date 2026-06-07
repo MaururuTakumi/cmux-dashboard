@@ -1,0 +1,14 @@
+node_modules/
+projects.json
+.codex/
+.claude-codex-collab/
+build/
+cmux Dashboard.app/
+.server.log
+.server.pid
+.server.watchdog.*
+bin/.bridge-codex.*
+.chrome-app/
+*.launchd.*.log
+docs/screenshot.png
+bin/

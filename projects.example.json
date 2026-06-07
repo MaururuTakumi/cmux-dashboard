@@ -1,0 +1,63 @@
+{
+  "_comment": "Each project becomes one cmux workspace. Copy this file to projects.json, then replace the placeholder paths with local project paths.",
+  "defaults": {
+    "topCmd": "claude --enable-auto-mode",
+    "bottomCmd": "codex",
+    "slotCommands": {
+      "cc": "claude --enable-auto-mode",
+      "cdx": "codex",
+      "yazi": "yazi",
+      "term": ""
+    },
+    "agmsg": {
+      "enabled": true,
+      "claudeName": "claude",
+      "codexName": "codex",
+      "claudeMode": "monitor",
+      "codexMode": "turn",
+      "brief": false
+    },
+    "claudeMd": {
+      "mode": "managed-block",
+      "templatePath": "templates/CLAUDE.md"
+    },
+    "collab": false,
+    "briefing": "You are the planning/review agent. Delegate implementation and tests to codex through agmsg, then review the result before continuing."
+  },
+  "projects": [
+    {
+      "id": "sample-app",
+      "name": "Sample App",
+      "path": "~/projects/sample-app",
+      "color": "#6ee7b7",
+      "emoji": "🚀"
+    },
+    {
+      "id": "docs-site",
+      "name": "Docs Site",
+      "path": "~/projects/docs-site",
+      "color": "#93c5fd",
+      "emoji": "📘"
+    },
+    {
+      "id": "cc-general",
+      "kind": "global",
+      "name": "cc-general",
+      "path": "~",
+      "color": "#8b5cf6",
+      "emoji": "⌘",
+      "agmsg": {
+        "enabled": false
+      },
+      "claudeMd": {
+        "mode": "off"
+      },
+      "slotCommands": {
+        "cc": "claude --enable-auto-mode",
+        "cdx": "codex",
+        "yazi": "yazi",
+        "term": ""
+      }
+    }
+  ]
+}
