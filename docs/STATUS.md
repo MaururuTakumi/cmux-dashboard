@@ -53,8 +53,17 @@
   - サーバーの delivery loop 経由 → claude→codex の agmsg を送ると **30秒で read_at が立つ**（=codex が起きて `agmsg inbox` を実行・消費した）。**配送機構は実機で動作**。
 - 単体テスト: `R6b`(2段階send契約) + 既存`R6`(配送ロジック)すべて PASS。
 
-## 既知の未解決（次に codex へ plan-gate で依頼）
-- **slot-toggle のサーバー経路バグ**: `assert_cc_slot_toggle`(実cmux・**APIサーバー経由**)が `CC ON で surface数 1→1`（増えない）で **決定的に FAIL**。
-  - 切り分け済み: 生の `cmux new-pane --direction down` は 1→2 で正常。`ensureSlot` 直叩きの node テスト(`exerciseSlotCycle`)も PASS。**サーバー経路/状態検出だけ**が surface を増やさず cc=on と判定している疑い（stale slotRefs か初期terminalの誤検出）。
-  - 役割分担に従い、claudeが仕様＋受入(=このテストをgreen)を定義し **codex が実装+テスト** する。
-- 残: 上記 slot バグ修正、collab follow-through（codex が inbox読了後に実装+返信まで完走するかの実機確認）、Phase2(複数列+側パネル)。
+## ★解決：slot-toggle バグ（Generator/Evaluator ループで完了, 2026-06-09）
+**claude(Generator)→codex(Evaluator/実装)→claude(独立検証) のループが実機で完走。**
+- claude が plan-gate(`docs/PLAN_SLOT_TOGGLE_FIX.md`)を agmsg で codex に提示 → codex が**実装+テスト+証跡返信** → claude が `./test.sh` を独立再実行して確認。
+- **codex が特定した2つの原因**:
+  1. **slot 誤検出（cmuxctl）**: 初期 terminal(=workspace の最初の pane)や marker無し surface が、title/process フォールバックで cc/cdx slot と誤判定され得た。→ `isInitialPaneRef` / `explicitOnly` 判定を追加し、**初期pane・marker無しを slot ref として採用/復元しない**よう厳格化（明示marker・記録refの正規経路は維持）。
+  2. **テストの surface 計数バグ（test.sh）**: `surface_count_for_workspace` が pane を巡回せず**過少カウント**していた（これが `1→1` の主因）。→ pane ごとに list-pane-surfaces して合算するよう修正。
+- **独立検証(✅)**: `./test.sh` = **FINAL: PASS (253 checks)**、exit 0、FAIL 0。`CC slot ON increased surface count (1 -> 2)` / `dedicated split (1 -> 2)` / `OFF decreased (2 -> 1)` / `slot detection ignores unmarked default terminal` / R6b 全 PASS。
+- **collab follow-through も実機で確認**: codex は wake→`agmsg inbox`→実装→`./test.sh`→`agmsg send` で完走（返信に数分かかるだけで、最初の「120秒無返信」は作業中だった）。
+
+## 現状サマリー（2026-06-09）
+- ✅ codex pane の確実な起こし方（2段階submit）解決・実機検証・commit/push 済み。
+- ✅ slot-toggle バグ解決（Generator/Evaluator ループ）・`./test.sh` 253 PASS・独立検証済み。
+- ✅ 自動collab（claude×codex の見える2ペイン交渉）が実機で機能。
+- 残（将来の機能拡張）: Phase2（複数プロジェクトを1画面で横並び列＋小さい側パネル切替）。

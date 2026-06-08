@@ -1091,7 +1091,10 @@ function validateRecordedSlots(projectId, wsRef, panes, surfaces) {
     const livePaneRef = surface && cleanRef(surface.paneRef);
     const wsOk = !record.wsRef || record.wsRef === wsRef;
     const paneOk = !record.paneRef || (livePaneRef ? livePaneRef === record.paneRef : paneRefs.has(record.paneRef));
-    if (surface && wsOk && paneOk) {
+    const explicitSlot = surface ? detectSlot(surface, {}, { explicitOnly: true }) : null;
+    const markerOk = !explicitSlot || explicitSlot === slot;
+    const initialPaneOk = !isInitialPaneRef(livePaneRef || record.paneRef, panes) || explicitSlot === slot;
+    if (surface && wsOk && paneOk && markerOk && initialPaneOk) {
       if ((!record.paneRef && livePaneRef) || record.wsRef !== wsRef) {
         recordSlotRef(projectId, slot, { surfaceRef: record.surfaceRef, paneRef: livePaneRef || record.paneRef, wsRef });
       }
@@ -1569,8 +1572,20 @@ function surfaceMatchesProjectCwd(surface, project) {
   return !!(cwd && expected && cwd === expected);
 }
 
-function recoverableSlotForSurface(surface, project) {
+function firstPaneRef(panes) {
+  const pane = (Array.isArray(panes) ? panes : []).find((item) => item && item.ref);
+  return pane ? pane.ref : null;
+}
+
+function isInitialPaneRef(paneRef, panes) {
+  const ref = cleanRef(paneRef);
+  const initial = firstPaneRef(panes);
+  return !!(ref && initial && ref === initial);
+}
+
+function recoverableSlotForSurface(surface, project, opts = {}) {
   if (!surface || !surface.ref || !surfaceMatchesProjectCwd(surface, project)) return null;
+  if (isInitialPaneRef(surface.paneRef, opts.panes)) return null;
   const processMap = {};
   processMap[surface.ref] = Array.isArray(surface.processes) ? surface.processes : [];
   const slot = detectSlot(surface, processMap);
@@ -1666,7 +1681,7 @@ async function getProjectState(projectId) {
   }, {});
   for (const surface of base.surfaces) {
     if (!surface || !surface.ref || claimedRefs.has(surface.ref)) continue;
-    const slot = recoverableSlotForSurface(surface, project);
+    const slot = recoverableSlotForSurface(surface, project, { panes: base.panes });
     if (slot && !base.slotRefs[slot]) recoveryCandidates[slot].push(surface);
   }
   for (const slot of SLOT_ORDER) {
@@ -1679,6 +1694,7 @@ async function getProjectState(projectId) {
     base.slotPaneRefs[slot] = surface.paneRef || null;
     recordSlotRef(projectId, slot, { surfaceRef: surface.ref, paneRef: surface.paneRef, wsRef: ws.ref });
   }
+
   return base;
 }
 

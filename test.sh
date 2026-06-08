@@ -1054,22 +1054,29 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       const ws = workspaceFor("alpha");
       const pane = panesFor("alpha")[0] || { ref: "pane:marker", workspace: ws && ws.ref };
       if (!panesFor("alpha").length && ws) raw.panes.push(pane);
-      const unmarkedRef = "surface:marker-unmarked";
+      const unmarkedCcRef = "surface:marker-unmarked-cc";
+      const unmarkedCdxRef = "surface:marker-unmarked-cdx";
       const markedRef = "surface:marker-cdx";
-      raw.surfaces = (raw.surfaces || []).filter((surface) => ![unmarkedRef, markedRef].includes(surface && surface.ref));
-      raw.surfaces.push({ ref: unmarkedRef, workspace: ws.ref, pane: pane.ref, title: "codex", type: "terminal", process: "codex" });
+      raw.surfaces = (raw.surfaces || []).filter((surface) => ![unmarkedCcRef, unmarkedCdxRef, markedRef].includes(surface && surface.ref));
+      raw.surfaces.push({ ref: unmarkedCcRef, workspace: ws.ref, pane: pane.ref, title: "Claude Code", type: "terminal", process: "claude", cwd: alphaDir, initial: true });
+      raw.surfaces.push({ ref: unmarkedCdxRef, workspace: ws.ref, pane: pane.ref, title: "codex", type: "terminal", process: "codex", cwd: alphaDir, initial: true });
       raw.surfaces.push({ ref: markedRef, workspace: ws.ref, pane: pane.ref, title: "cmuxdash:slot:cdx", type: "terminal", process: "zsh" });
       fs.writeFileSync(stateFile, JSON.stringify(raw) + "\n");
       const markerState = await ctl.getProjectState("alpha");
-      const unmarked = markerState.surfaces.find((surface) => surface.ref === unmarkedRef);
-      check("slot detection uses marker before process fallback", (
+      const unmarkedCc = markerState.surfaces.find((surface) => surface.ref === unmarkedCcRef);
+      const unmarkedCdx = markerState.surfaces.find((surface) => surface.ref === unmarkedCdxRef);
+      check("slot detection ignores unmarked default terminal title/process fallback", (
         markerState.slots.cdx === true &&
         markerState.slotRefs.cdx === markedRef &&
-        unmarked &&
-        unmarked.slot === null
+        markerState.slots.cc === false &&
+        !markerState.slotRefs.cc &&
+        unmarkedCc &&
+        unmarkedCc.slot === null &&
+        unmarkedCdx &&
+        unmarkedCdx.slot === null
       ));
       const cleaned = rawCmuxState();
-      cleaned.surfaces = (cleaned.surfaces || []).filter((surface) => ![unmarkedRef, markedRef].includes(surface && surface.ref));
+      cleaned.surfaces = (cleaned.surfaces || []).filter((surface) => ![unmarkedCcRef, unmarkedCdxRef, markedRef].includes(surface && surface.ref));
       fs.writeFileSync(stateFile, JSON.stringify(cleaned) + "\n");
     }
 
@@ -4289,13 +4296,41 @@ process.stdout.write(String(surfaces[0].ref));
 
 surface_count_for_workspace() {
   local workspace_ref="$1"
-  CMUX_QUIET=1 "$CMUX_BIN" list-pane-surfaces --workspace "$workspace_ref" --json 2>/dev/null | "$NODE_BIN" -e '
+  local pane_refs
+  local total=0
+  local count
+  local pane_ref
+  pane_refs="$(CMUX_QUIET=1 "$CMUX_BIN" list-panes --workspace "$workspace_ref" --json 2>/dev/null | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+const panes = Array.isArray(obj.panes) ? obj.panes : [];
+process.stdout.write(panes.map((pane) => pane && pane.ref).filter(Boolean).join("\n"));
+' 2>/dev/null)" || return 2
+  if [ -z "$pane_refs" ]; then
+    CMUX_QUIET=1 "$CMUX_BIN" list-pane-surfaces --workspace "$workspace_ref" --json 2>/dev/null | "$NODE_BIN" -e '
 const fs = require("fs");
 let obj;
 try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
 const surfaces = Array.isArray(obj.surfaces) ? obj.surfaces : [];
 process.stdout.write(String(surfaces.length));
 '
+    return $?
+  fi
+  while IFS= read -r pane_ref; do
+    [ -n "$pane_ref" ] || continue
+    count="$(CMUX_QUIET=1 "$CMUX_BIN" list-pane-surfaces --workspace "$workspace_ref" --pane "$pane_ref" --json 2>/dev/null | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+const surfaces = Array.isArray(obj.surfaces) ? obj.surfaces : [];
+process.stdout.write(String(surfaces.length));
+' 2>/dev/null)" || return 2
+    total=$((total + count))
+  done <<EOF
+$pane_refs
+EOF
+  printf '%s' "$total"
 }
 
 pane_count_for_workspace() {
