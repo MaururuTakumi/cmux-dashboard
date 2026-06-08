@@ -10,6 +10,9 @@ const os = require('os');
 const path = require('path');
 
 const TAG = 'cmuxdash:';
+const GRID_ID = '__grid__';
+const GRID_TAG = TAG + GRID_ID;
+const GRID_MARK_PREFIX = `${TAG}grid:`;
 const PROJECTS_FILE = process.env.CMUX_DASH_PROJECTS_FILE || path.join(__dirname, 'projects.json');
 const PROJECTS_EXAMPLE_FILE = process.env.CMUX_DASH_PROJECTS_EXAMPLE_FILE || path.join(__dirname, 'projects.example.json');
 const AGMSG_DIR = path.join(os.homedir(), '.agents', 'skills', 'agmsg');
@@ -967,6 +970,10 @@ function emptySlotRefs() {
 }
 
 const slotRefState = new Map();
+const gridRuntimeState = {
+  wsRef: null,
+  columns: [],
+};
 
 function cleanRef(value) {
   const text = String(value || '').trim();
@@ -1524,6 +1531,14 @@ function titleCommand(slot) {
   return `printf '\\033]0;${slotMarker(slot)}\\007'`;
 }
 
+function gridSlotMarker(columnId, slot) {
+  return `${GRID_MARK_PREFIX}${GRID_ID}:column:${columnId}:slot:${slot}`;
+}
+
+function gridTitleCommand(columnId, slot) {
+  return `printf '\\033]0;${gridSlotMarker(columnId, slot)}\\007'`;
+}
+
 function shellQuote(value) {
   return `'${String(value || '').replace(/'/g, "'\\''")}'`;
 }
@@ -1534,6 +1549,12 @@ function slotLaunchText(project, cfg, slot) {
   const prefix = titleCommand(slot);
   if (slot === 'term' && !cmd) return `${prefix}; cd ${cwd}\\n`;
   return `${prefix}; cd ${cwd} && exec ${cmd || SLOT_DEFS[slot].defaultCommand}\\n`;
+}
+
+function gridLaunchText(project, cfg, columnId, slot) {
+  const cmd = configuredSlotCommand(project, cfg, slot);
+  const cwd = shellQuote(rowCwd(project));
+  return `${gridTitleCommand(columnId, slot)}; cd ${cwd} && exec ${cmd || SLOT_DEFS[slot].defaultCommand}\\n`;
 }
 
 function slotMarkerSearchText(surface) {
@@ -1969,6 +1990,230 @@ function ensureClaudeMd(project, cfg = {}) {
   }
 }
 
+function gridColumnId(projectId) {
+  return String(projectId || '').trim();
+}
+
+function gridColumnSnapshot(column, order = column && column.order) {
+  if (!column) return null;
+  return {
+    columnId: column.columnId,
+    projectId: column.projectId,
+    order,
+    topSurfaceRef: column.cc && column.cc.surfaceRef || null,
+    bottomSurfaceRef: column.cdx && column.cdx.surfaceRef || null,
+    paneRefs: [
+      column.cc && column.cc.paneRef,
+      column.cdx && column.cdx.paneRef,
+    ].filter(Boolean),
+    cc: {
+      paneRef: column.cc && column.cc.paneRef || null,
+      surfaceRef: column.cc && column.cc.surfaceRef || null,
+      marker: column.cc && column.cc.marker || null,
+    },
+    cdx: {
+      paneRef: column.cdx && column.cdx.paneRef || null,
+      surfaceRef: column.cdx && column.cdx.surfaceRef || null,
+      marker: column.cdx && column.cdx.marker || null,
+    },
+    createdAt: column.createdAt || null,
+    updatedAt: column.updatedAt || null,
+  };
+}
+
+function reindexGridColumns() {
+  gridRuntimeState.columns.forEach((column, idx) => {
+    column.order = idx;
+  });
+}
+
+async function findGridWorkspace(opts = {}) {
+  return findWorkspaceByTag(GRID_ID, opts);
+}
+
+async function ensureGridWorkspace() {
+  const existing = await findGridWorkspace({ attempts: 1, allowStale: true, quick: true });
+  if (existing && existing.ref) {
+    gridRuntimeState.wsRef = existing.ref;
+    return existing.ref;
+  }
+
+  const out = await cmux([
+    'new-workspace',
+    '--name', 'cmux-dashboard grid',
+    '--description', GRID_TAG,
+    '--cwd', __dirname,
+    '--focus', 'false',
+  ]);
+  const ref = (out.match(/workspace:\d+/) || [])[0] || null;
+  if (!ref) throw new Error('grid workspace was not resolved');
+  await settle();
+  gridRuntimeState.wsRef = ref;
+  gridRuntimeState.columns = [];
+  return ref;
+}
+
+async function ensureGridAnchorSurface(wsRef) {
+  const surfaces = await listWorkspaceSurfaces(wsRef);
+  const existing = surfaces.find((surface) => surface && surface.ref);
+  if (existing) {
+    return { surfaceRef: existing.ref, paneRef: existing.paneRef || null, existing: true };
+  }
+
+  const paneRef = await getDefaultPaneRef(wsRef);
+  const args = ['new-surface', '--type', 'terminal', '--workspace', wsRef, '--focus', 'false'];
+  if (paneRef) args.push('--pane', paneRef);
+  const out = await cmux(args);
+  const surfaceRef = surfaceRefFromText(out);
+  await settle(Math.min(CMUX_SETTLE_MS, 500));
+  const nextSurfaces = await listWorkspaceSurfaces(wsRef);
+  const created = surfaceRef ? surfaceByRef(nextSurfaces, surfaceRef) : nextSurfaces.find((surface) => surface && surface.ref);
+  if (!created || !created.ref) throw new Error(`grid anchor surface was not resolved in ${wsRef}`);
+  return { surfaceRef: created.ref, paneRef: created.paneRef || paneRef || null, existing: false };
+}
+
+async function createGridSplitSurface(wsRef, anchorSurfaceRef, direction) {
+  if (!wsRef) throw new Error('grid workspace ref is required');
+  if (!anchorSurfaceRef) throw new Error('grid split anchor surface is required');
+  if (!['left', 'right', 'up', 'down'].includes(direction)) throw new Error('invalid grid split direction: ' + direction);
+
+  const beforePanes = await listWorkspacePanes(wsRef);
+  const beforeSurfaces = await listWorkspaceSurfaces(wsRef);
+  const beforePaneRefs = new Set(beforePanes.map((pane) => pane && pane.ref).filter(Boolean));
+  const beforeSurfaceRefs = new Set(beforeSurfaces.map((surface) => surface && surface.ref).filter(Boolean));
+
+  const out = await cmux([
+    'new-split',
+    direction,
+    '--workspace', wsRef,
+    '--surface', anchorSurfaceRef,
+    '--focus', 'false',
+  ]);
+  const outputSurfaceRef = surfaceRefFromText(out);
+  await settle(Math.min(CMUX_SETTLE_MS, 500));
+
+  const afterPanes = await listWorkspacePanes(wsRef);
+  const afterSurfaces = await listWorkspaceSurfaces(wsRef);
+  const createdPanes = afterPanes.filter((pane) => pane && pane.ref && !beforePaneRefs.has(pane.ref));
+  const createdSurfaces = afterSurfaces.filter((surface) => surface && surface.ref && !beforeSurfaceRefs.has(surface.ref));
+
+  let surface = outputSurfaceRef ? surfaceByRef(afterSurfaces, outputSurfaceRef) : null;
+  if (!surface && createdPanes.length) {
+    const paneRefs = new Set(createdPanes.map((pane) => pane.ref));
+    surface = createdSurfaces.find((item) => paneRefs.has(item.paneRef)) || null;
+  }
+  if (!surface && createdSurfaces.length) surface = createdSurfaces[createdSurfaces.length - 1];
+  if (!surface && outputSurfaceRef) surface = { ref: outputSurfaceRef, paneRef: null };
+  if (!surface || !surface.ref) {
+    throw new Error(`new-split did not create a grid surface in ${wsRef}`);
+  }
+  return { surfaceRef: surface.ref, paneRef: surface.paneRef || null, direction, splitFrom: anchorSurfaceRef };
+}
+
+function liveSurfaceIndex(surfaces) {
+  const byRef = new Map();
+  for (const surface of Array.isArray(surfaces) ? surfaces : []) {
+    if (surface && surface.ref) byRef.set(surface.ref, surface);
+  }
+  return byRef;
+}
+
+async function validateGridRuntimeState() {
+  const ws = await findGridWorkspace({ attempts: 1, allowStale: true, quick: true });
+  if (!ws || !ws.ref) {
+    gridRuntimeState.wsRef = null;
+    gridRuntimeState.columns = [];
+    return { wsRef: null, columns: [] };
+  }
+
+  gridRuntimeState.wsRef = ws.ref;
+  const surfaces = await listWorkspaceSurfaces(ws.ref);
+  const byRef = liveSurfaceIndex(surfaces);
+  gridRuntimeState.columns = gridRuntimeState.columns.filter((column) => (
+    column &&
+    column.cc &&
+    column.cdx &&
+    byRef.has(column.cc.surfaceRef) &&
+    byRef.has(column.cdx.surfaceRef)
+  )).map((column) => {
+    const cc = byRef.get(column.cc.surfaceRef);
+    const cdx = byRef.get(column.cdx.surfaceRef);
+    return {
+      ...column,
+      wsRef: ws.ref,
+      cc: { ...column.cc, paneRef: cc && cc.paneRef || column.cc.paneRef || null },
+      cdx: { ...column.cdx, paneRef: cdx && cdx.paneRef || column.cdx.paneRef || null },
+    };
+  });
+  reindexGridColumns();
+  return { wsRef: ws.ref, columns: gridRuntimeState.columns.map((column, idx) => gridColumnSnapshot(column, idx)) };
+}
+
+async function getGridState() {
+  return validateGridRuntimeState();
+}
+
+async function addProjectColumn(projectId) {
+  const cfg = loadConfig();
+  const project = findConfiguredRow(cfg, projectId);
+  if (!project) throw new Error('unknown project: ' + projectId);
+  const columnId = gridColumnId(projectId);
+  if (!columnId) throw new Error('grid project id is required');
+
+  await validateGridRuntimeState();
+  const existing = gridRuntimeState.columns.find((column) => column.projectId === projectId);
+  if (existing) return { ...gridColumnSnapshot(existing, existing.order), already: true, added: false };
+
+  const wsRef = await ensureGridWorkspace();
+  await validateGridRuntimeState();
+  const anchor = gridRuntimeState.columns.length
+    ? { surfaceRef: gridRuntimeState.columns[gridRuntimeState.columns.length - 1].cc.surfaceRef }
+    : await ensureGridAnchorSurface(wsRef);
+  const cc = await createGridSplitSurface(wsRef, anchor.surfaceRef, 'right');
+  const cdx = await createGridSplitSurface(wsRef, cc.surfaceRef, 'down');
+
+  await cmux(['send', '--workspace', wsRef, '--surface', cc.surfaceRef, gridLaunchText(project, cfg, columnId, 'cc')]);
+  await cmux(['send', '--workspace', wsRef, '--surface', cdx.surfaceRef, gridLaunchText(project, cfg, columnId, 'cdx')]);
+  await settle();
+
+  const now = new Date().toISOString();
+  const column = {
+    columnId,
+    projectId,
+    wsRef,
+    order: gridRuntimeState.columns.length,
+    cc: { surfaceRef: cc.surfaceRef, paneRef: cc.paneRef || null, marker: gridSlotMarker(columnId, 'cc') },
+    cdx: { surfaceRef: cdx.surfaceRef, paneRef: cdx.paneRef || null, marker: gridSlotMarker(columnId, 'cdx') },
+    createdAt: now,
+    updatedAt: now,
+  };
+  gridRuntimeState.columns.push(column);
+  return { ...gridColumnSnapshot(column, column.order), added: true, already: false };
+}
+
+async function removeProjectColumn(projectId) {
+  await validateGridRuntimeState();
+  const idx = gridRuntimeState.columns.findIndex((column) => column.projectId === projectId);
+  if (idx < 0) {
+    return { projectId, removed: false, already: true, ...(await getGridState()) };
+  }
+  const column = gridRuntimeState.columns[idx];
+  const wsRef = gridRuntimeState.wsRef || column.wsRef;
+  const refs = [column.cdx && column.cdx.surfaceRef, column.cc && column.cc.surfaceRef].filter(Boolean);
+  let closed = 0;
+  for (const ref of refs) {
+    try {
+      await cmux(['close-surface', '--workspace', wsRef, '--surface', ref]);
+      closed += 1;
+    } catch (_) {}
+  }
+  gridRuntimeState.columns.splice(idx, 1);
+  reindexGridColumns();
+  await settle(Math.min(CMUX_SETTLE_MS, 500));
+  const state = await getGridState();
+  return { projectId, removed: true, closed, ...state };
+}
+
 async function openProject(id, { focus = true } = {}) {
   const cfg = loadConfig();
   const p = findConfiguredRow(cfg, id);
@@ -2265,6 +2510,7 @@ module.exports = {
   agmsgDbPath, getTeamMessages,
   createCmuxHealthTracker, getCmuxHealth, pingCmuxForRecovery,
   getState, getWorkspaceYaml, getProjectState, ensureSlot, ensureCollabSlots, sendToSurface, submitToSurface, loadConfig, saveConfig, openProject, closeProject, focusProject,
+  ensureGridWorkspace, addProjectColumn, removeProjectColumn, getGridState,
   openAll, closeAll, reorderProjects, addProject, removeProject, expandHome,
   projectKind, isGlobalProject, configuredRows, configuredProjectRows, configuredGlobalRows,
 };

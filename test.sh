@@ -696,6 +696,47 @@ fs.writeFileSync(file, JSON.stringify(s) + "\n");
 process.stdout.write(surfaceRef + "\n");
 NODE
     ;;
+  new-split)
+    direction="\${1:-right}"
+    if [ "\$#" -gt 0 ]; then shift; fi
+    workspace=""
+    surface=""
+    while [ "\$#" -gt 0 ]; do
+      case "\$1" in
+        --workspace) workspace="\${2:-}"; shift 2 ;;
+        --surface|--panel) surface="\${2:-}"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    "\$NODE_BIN" - "\$STATE" "\$workspace" "\$surface" "\$direction" <<'NODE'
+const fs = require("fs");
+const file = process.argv[2];
+const workspace = process.argv[3] || "";
+const anchorSurface = process.argv[4] || "";
+const direction = process.argv[5] || "right";
+let s = { panes: [], surfaces: [], nextPane: 1, nextSurface: 1 };
+try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
+s.panes = Array.isArray(s.panes) ? s.panes : [];
+s.surfaces = Array.isArray(s.surfaces) ? s.surfaces : [];
+const anchor = s.surfaces.find((item) => item && item.ref === anchorSurface && (!workspace || item.workspace === workspace));
+const anchorPaneRef = anchor && anchor.pane || "";
+const anchorPane = s.panes.find((pane) => pane && pane.ref === anchorPaneRef && (!workspace || pane.workspace === workspace));
+const paneRef = "pane:" + (s.nextPane || 1);
+const surfaceRef = "surface:" + (s.nextSurface || 1);
+s.nextPane = (s.nextPane || 1) + 1;
+s.nextSurface = (s.nextSurface || 1) + 1;
+const insertAt = anchorPane && Number.isFinite(anchorPane.index) ? anchorPane.index + 1 : s.panes.filter((p) => !workspace || p.workspace === workspace).length;
+for (const pane of s.panes) {
+  if (pane && (!workspace || pane.workspace === workspace) && Number.isFinite(pane.index) && pane.index >= insertAt) {
+    pane.index += 1;
+  }
+}
+s.panes.push({ ref: paneRef, workspace, index: insertAt, direction, splitFrom: anchorSurface, parentPane: anchorPaneRef });
+s.surfaces.push({ ref: surfaceRef, workspace, pane: paneRef, title: "terminal", type: "terminal", process: "zsh", cwd: anchor && anchor.cwd || null, sendText: null, splitFrom: anchorSurface, direction });
+fs.writeFileSync(file, JSON.stringify(s) + "\n");
+process.stdout.write("OK " + surfaceRef + " " + paneRef + " " + workspace + "\n");
+NODE
+    ;;
   new-surface)
     workspace=""
     pane=""
@@ -746,7 +787,9 @@ const text = process.argv[5] || "";
 let s = { surfaces: [] };
 try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
 const match = text.match(/cmuxdash:slot:(cc|cdx|yazi|term)/);
-const slot = match && match[1];
+const gridMatch = text.match(/(cmuxdash:grid:[^\s']+:slot:(cc|cdx))/);
+const slot = gridMatch && gridMatch[2] || match && match[1];
+const title = gridMatch && gridMatch[1] || (slot ? "cmuxdash:slot:" + slot : null);
 const processBySlot = { cc: "claude", cdx: "codex", yazi: "yazi", term: "zsh" };
 const cdMarker = "cd " + String.fromCharCode(39);
 const cdStart = text.indexOf(cdMarker);
@@ -773,7 +816,7 @@ for (const item of (s.surfaces || [])) {
   if (item && item.ref === surface && slot) {
     item.title = process.env.CMUX_FAKE_OVERWRITE_SLOT_TITLE === "1" && slot === "cc"
       ? "✳ Claude Code"
-      : "cmuxdash:slot:" + slot;
+      : title;
     item.process = processBySlot[slot] || "zsh";
     item.workspace = item.workspace || workspace;
     item.cwd = cwd;
@@ -918,6 +961,12 @@ function paneForRef(ref) {
 }
 function surfaceForSlot(id, slot) {
   return surfacesFor(id).find((s) => s && s.title === "cmuxdash:slot:" + slot) || null;
+}
+function rawSurface(ref) {
+  return (rawCmuxState().surfaces || []).find((s) => s && s.ref === ref) || null;
+}
+function surfaceCountFor(id) {
+  return surfacesFor(id).length;
 }
 function stateHasSlotMarker(state, slot) {
   const marker = "cmuxdash:slot:" + slot;
@@ -1172,6 +1221,90 @@ async function exerciseAllSlots(id, expectedCwd, label) {
     await ctl.ensureSlot("cc-general", "cc", true);
     const yaml = await ctl.getWorkspaceYaml();
     check("workspace YAML is parseable and contains global CC slot state", yamlHasGlobalCcOn(yaml));
+
+    {
+      const gridRef = await ctl.ensureGridWorkspace();
+      const gridWs = workspaceFor("__grid__");
+      const gridInitial = surfacesFor("__grid__").find((surface) => surface && surface.initial) || surfacesFor("__grid__")[0];
+      const alphaStateBeforeGrid = await ctl.getProjectState("alpha");
+      const alphaColumn = await ctl.addProjectColumn("alpha");
+      const afterAlphaCount = surfaceCountFor("__grid__");
+      const repeatAlpha = await ctl.addProjectColumn("alpha");
+      const afterRepeatCount = surfaceCountFor("__grid__");
+      const generalColumn = await ctl.addProjectColumn("cc-general");
+      const gridState = await ctl.getGridState();
+      const alphaCc = rawSurface(alphaColumn.cc.surfaceRef);
+      const alphaCdx = rawSurface(alphaColumn.cdx.surfaceRef);
+      const generalCc = rawSurface(generalColumn.cc.surfaceRef);
+      const generalCdx = rawSurface(generalColumn.cdx.surfaceRef);
+      const alphaStateAfterGrid = await ctl.getProjectState("alpha");
+
+      check("grid C1: ensureGridWorkspace uses dedicated tag and stays out of project state", (
+        gridRef &&
+        gridWs &&
+        gridWs.ref === gridRef &&
+        gridWs.description === "cmuxdash:__grid__" &&
+        alphaStateBeforeGrid.wsRef !== gridRef &&
+        alphaStateAfterGrid.wsRef !== gridRef &&
+        alphaStateAfterGrid.surfaces.every((surface) => !String(surface.title || "").includes("cmuxdash:grid:"))
+      ));
+      check("grid C1: addProjectColumn creates ordered scoped cc/cdx columns", (
+        gridState.wsRef === gridRef &&
+        gridState.columns.length === 2 &&
+        gridState.columns.map((column) => column.projectId).join(",") === "alpha,cc-general" &&
+        alphaColumn.added === true &&
+        generalColumn.added === true &&
+        alphaCc &&
+        alphaCdx &&
+        generalCc &&
+        generalCdx &&
+        alphaCc.title === alphaColumn.cc.marker &&
+        alphaCdx.title === alphaColumn.cdx.marker &&
+        generalCc.title === generalColumn.cc.marker &&
+        generalCdx.title === generalColumn.cdx.marker &&
+        !alphaCc.title.includes("cmuxdash:slot:") &&
+        !generalCdx.title.includes("cmuxdash:slot:")
+      ));
+      check("grid C1: columns split from explicit surface anchors in order", (
+        gridInitial &&
+        alphaCc.splitFrom === gridInitial.ref &&
+        alphaCc.direction === "right" &&
+        alphaCdx.splitFrom === alphaCc.ref &&
+        alphaCdx.direction === "down" &&
+        generalCc.splitFrom === alphaCc.ref &&
+        generalCc.direction === "right" &&
+        generalCdx.splitFrom === generalCc.ref &&
+        generalCdx.direction === "down"
+      ));
+      check("grid C1: duplicate addProjectColumn is idempotent", (
+        repeatAlpha &&
+        repeatAlpha.already === true &&
+        repeatAlpha.added === false &&
+        repeatAlpha.cc.surfaceRef === alphaColumn.cc.surfaceRef &&
+        afterRepeatCount === afterAlphaCount
+      ));
+
+      const removedAlpha = await ctl.removeProjectColumn("alpha");
+      const afterRemove = await ctl.getGridState();
+      const afterRemoveCount = surfaceCountFor("__grid__");
+      const repeatRemove = await ctl.removeProjectColumn("alpha");
+      check("grid C1: removeProjectColumn closes only tracked column surfaces", (
+        removedAlpha.removed === true &&
+        removedAlpha.closed >= 2 &&
+        afterRemove.columns.length === 1 &&
+        afterRemove.columns[0].projectId === "cc-general" &&
+        !rawSurface(alphaColumn.cc.surfaceRef) &&
+        !rawSurface(alphaColumn.cdx.surfaceRef) &&
+        !!rawSurface(generalColumn.cc.surfaceRef) &&
+        !!rawSurface(generalColumn.cdx.surfaceRef)
+      ));
+      check("grid C1: repeated removeProjectColumn is idempotent", (
+        repeatRemove &&
+        repeatRemove.already === true &&
+        repeatRemove.removed === false &&
+        surfaceCountFor("__grid__") === afterRemoveCount
+      ));
+    }
   } catch (err) {
     failed += 1;
     console.log("FAIL\tR4 runner exception: " + (err && err.message ? err.message : err));
