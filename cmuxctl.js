@@ -529,7 +529,11 @@ const DEFAULT_BRIEFING =
 const SLOT_ORDER = ['cc', 'cdx', 'yazi', 'term'];
 const SLOT_DEFS = {
   cc: { label: 'CC', role: 'claude', defaultCommand: 'claude --enable-auto-mode', processRe: /\bclaude\b/i },
-  cdx: { label: 'Cdx', role: 'codex', defaultCommand: 'codex', processRe: /\bcodex\b/i },
+  // User-authorized (2026-06-08): codex launches in auto-approve mode so the
+  // collab delivery can wake it to read agmsg inbox, implement, and reply
+  // without per-command approval. Same trust level as the headless collab path.
+  // Override per-project via projects.json bottomCmd / slotCommands.cdx.
+  cdx: { label: 'Cdx', role: 'codex', defaultCommand: 'codex --dangerously-bypass-approvals-and-sandbox', processRe: /\bcodex\b/i },
   yazi: { label: 'Yazi', role: 'yazi', defaultCommand: 'yazi', processRe: /\byazi\b/i },
   term: { label: 'Term', role: 'shell', defaultCommand: '', processRe: /\b(zsh|bash|fish|sh|nu)\b/i },
 };
@@ -1102,18 +1106,6 @@ function validateRecordedSlots(projectId, wsRef, panes, surfaces) {
 function slotSurfacesInPane(state, paneRef) {
   if (!paneRef) return [];
   return (state.surfaces || []).filter((surface) => surface && surface.paneRef === paneRef && surface.slot);
-}
-
-function reusableInitialSurface(state) {
-  const surfaces = Array.isArray(state && state.surfaces) ? state.surfaces : [];
-  if (surfaces.some((surface) => surface && surface.slot)) return null;
-  const terminalSurfaces = surfaces.filter((surface) => (
-    surface &&
-    surface.ref &&
-    !surface.slot &&
-    (!surface.type || surface.type === 'terminal')
-  ));
-  return terminalSurfaces.length === 1 ? terminalSurfaces[0] : null;
 }
 
 async function closeSlotSurfaceRefs(state, refs) {
@@ -2046,10 +2038,7 @@ async function ensureSlot(id, slot, on) {
       await settle(Math.min(CMUX_SETTLE_MS, 500));
       state = await getProjectState(id);
     }
-    const reusable = reusableInitialSurface(state);
-    const created = reusable
-      ? { surfaceRef: reusable.ref, paneRef: reusable.paneRef || null, split: false, reused: true }
-      : await createSplitPaneSurface(state.wsRef);
+    const created = await createSplitPaneSurface(state.wsRef);
     const surfaceRef = created.surfaceRef;
     if (!surfaceRef) throw new Error(`slot surface was not resolved for ${id}/${slot}`);
     await cmux(['send', '--workspace', state.wsRef, '--surface', surfaceRef, slotLaunchText(p, cfg, slot)]);
@@ -2104,6 +2093,30 @@ async function sendToSurface(wsRef, surfaceRef, text) {
   if (!wsRef) throw new Error('workspace ref is required for cmux send');
   if (!surfaceRef) throw new Error('surface ref is required for cmux send');
   return cmux(['send', '--workspace', wsRef, '--surface', surfaceRef, String(text || '')]);
+}
+
+// Submit a line of input to a running TUI agent (claude/codex) pane.
+//
+// `cmux send "text\r"` does NOT work for these TUIs: the agent has bracketed
+// paste enabled, so the whole payload (including a trailing \r) is delivered as
+// a single paste and the Enter is swallowed into the input box rather than
+// submitting. Empirically verified against codex: a one-shot send leaves the
+// prompt unsent. The fix is two separate sends — the text as a paste, then a
+// LONE carriage return as its own keystroke — with a short settle in between so
+// the paste lands before Enter. Verified: codex runs the injected task.
+const TUI_SUBMIT_GAP_MS = (() => {
+  const n = parseInt(process.env.CMUX_DASH_TUI_SUBMIT_GAP_MS || '', 10);
+  return Number.isFinite(n) && n >= 0 ? n : 250;
+})();
+async function submitToSurface(wsRef, surfaceRef, text) {
+  if (!wsRef) throw new Error('workspace ref is required for cmux send');
+  if (!surfaceRef) throw new Error('surface ref is required for cmux send');
+  // Strip any trailing newline/Enter escapes the caller may have appended; the
+  // separate \r below is what actually submits.
+  const body = String(text || '').replace(/(\\[rn]|[\r\n])+$/g, '');
+  await cmux(['send', '--workspace', wsRef, '--surface', surfaceRef, body]);
+  await settle(TUI_SUBMIT_GAP_MS);
+  return cmux(['send', '--workspace', wsRef, '--surface', surfaceRef, '\\r']);
 }
 
 async function openAll() {
@@ -2235,7 +2248,7 @@ module.exports = {
   ensureCollab, ensureProjectCollab, ensureCollabPair, isCollabRunning, projectCollabEnabled, projectCollabEnabledById,
   agmsgDbPath, getTeamMessages,
   createCmuxHealthTracker, getCmuxHealth, pingCmuxForRecovery,
-  getState, getWorkspaceYaml, getProjectState, ensureSlot, ensureCollabSlots, sendToSurface, loadConfig, saveConfig, openProject, closeProject, focusProject,
+  getState, getWorkspaceYaml, getProjectState, ensureSlot, ensureCollabSlots, sendToSurface, submitToSurface, loadConfig, saveConfig, openProject, closeProject, focusProject,
   openAll, closeAll, reorderProjects, addProject, removeProject, expandHome,
   projectKind, isGlobalProject, configuredRows, configuredProjectRows, configuredGlobalRows,
 };

@@ -4,7 +4,12 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const ctl = require('./cmuxctl');
 
-const DEFAULT_WAKE_TEXT = '[cmux-dashboard] New message from claude. Run agmsg inbox once for this project, implement, run tests, and reply to claude.\n';
+// Wake text injected into the codex TUI pane. Delivery uses ctl.submitToSurface,
+// which sends the text as a paste and then a SEPARATE lone carriage return to
+// actually submit it (codex has bracketed paste enabled, so a trailing \r in
+// the same send is swallowed into the input box rather than submitting). Do NOT
+// append \n / \r here — submitToSurface adds the submitting Enter itself.
+const DEFAULT_WAKE_TEXT = '[cmux-dashboard] New message from claude in this project. In this same turn, do not stop after only reading: (1) run `agmsg inbox` to read it, (2) follow the collab protocol in CLAUDE.md — if it is a plan-agreed task, implement it and run the tests; if anything is ambiguous, unapproved, or irreversible, do NOT guess, (3) ALWAYS reply to claude with `agmsg send` — either a success report with the test evidence, or a concrete blocker/question.';
 
 function intEnv(name, fallback) {
   const n = parseInt(process.env[name] || '', 10);
@@ -130,7 +135,7 @@ class CollabDelivery {
     this.logger = opts.logger || console;
     this.readUnread = opts.readUnreadWakeMessages || ((team) => readUnreadWakeMessages(team, opts));
     this.readStatus = opts.readDeliveryStatus || ((team, id) => readDeliveryStatus(team, id, opts));
-    this.sendWake = opts.sendWake || ((row, text) => this.ctl.sendToSurface(row.wsRef, row.slotRefs.cdx, text));
+    this.sendWake = opts.sendWake || ((row, text) => this.ctl.submitToSurface(row.wsRef, row.slotRefs.cdx, text));
     this.states = new Map();
     this.inFlight = false;
     this.timer = null;

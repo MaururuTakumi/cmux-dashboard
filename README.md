@@ -81,7 +81,7 @@ dashboard server.
 ### Slotトグル
 
 各行の `CC`、`Cdx`、`Yazi`、`Term` をON/OFFできます。slotは同一pane内のタブではなく、縦分割paneとして上から順に表示されます。未起動の行でslotをONにすると、そのプロジェクトの
-cmux workspace が自動で開きます。cmuxが初期terminalを1つ作る場合、最初のslotはそのpaneを再利用し、以降のslotは下方向のsplitとして追加します。slotごとの起動コマンドは `defaults.slotCommands` またはプロジェクト単位の
+cmux workspace が自動で開きます。cmuxが初期terminalを1つ作る場合も、各slotは専用の下方向split paneとして追加され、初期terminalはslotとして再利用しません。slotごとの起動コマンドは `defaults.slotCommands` またはプロジェクト単位の
 `slotCommands` で上書きできます。
 
 ### 監視パネル

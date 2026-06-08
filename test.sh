@@ -612,10 +612,13 @@ s.panes = Array.isArray(s.panes) ? s.panes : [];
 s.surfaces = Array.isArray(s.surfaces) ? s.surfaces : [];
 const wsRef = "workspace:" + (s.nextWorkspace || 1);
 const paneRef = "pane:" + (s.nextPane || 1);
+const surfaceRef = "surface:" + (s.nextSurface || 1);
 s.nextWorkspace = (s.nextWorkspace || 1) + 1;
 s.nextPane = (s.nextPane || 1) + 1;
+s.nextSurface = (s.nextSurface || 1) + 1;
 s.workspaces.push({ ref: wsRef, description: desc, name, cwd, selected: false, latest_conversation_message: null, latest_submitted_at: null });
 s.panes.push({ ref: paneRef, workspace: wsRef, index: 0 });
+s.surfaces.push({ ref: surfaceRef, workspace: wsRef, pane: paneRef, title: "terminal", type: "terminal", process: "zsh", cwd, sendText: null, initial: true });
 fs.writeFileSync(file, JSON.stringify(s) + "\n");
 process.stdout.write(wsRef + "\n");
 NODE
@@ -798,10 +801,22 @@ const surface = process.argv[4] || "";
 let s = { panes: [], surfaces: [] };
 try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
 if (surface.startsWith("pane:")) {
+  const blocked = (Array.isArray(s.surfaces) ? s.surfaces : [])
+    .some((item) => item && item.pane === surface && item.initial && (!workspace || item.workspace === workspace));
+  if (blocked) {
+    fs.writeFileSync(file, JSON.stringify(s) + "\n");
+    process.exit(0);
+  }
   s.panes = (Array.isArray(s.panes) ? s.panes : [])
     .filter((pane) => !(pane && pane.ref === surface && (!workspace || pane.workspace === workspace)));
   s.surfaces = (Array.isArray(s.surfaces) ? s.surfaces : [])
     .filter((item) => !(item && item.pane === surface && (!workspace || item.workspace === workspace)));
+  fs.writeFileSync(file, JSON.stringify(s) + "\n");
+  process.exit(0);
+}
+const initialTarget = (Array.isArray(s.surfaces) ? s.surfaces : [])
+  .find((item) => item && item.ref === surface && item.initial && (!workspace || item.workspace === workspace));
+if (initialTarget) {
   fs.writeFileSync(file, JSON.stringify(s) + "\n");
   process.exit(0);
 }
@@ -930,7 +945,7 @@ async function exerciseSlotCycle(id, slot, expectedCwd, label, expectAutoOpen) {
   check("slot " + label + "/" + slot + ": ON increases surface count", (
     onResult.on === true &&
     afterOnState.slots[slot] === true &&
-    afterOnCount === beforeCount + 1
+    afterOnCount === beforeCount + (beforeState.open ? 1 : 2)
   ));
   check("slot " + label + "/" + slot + ": ON creates vertical split pane", (
     surface &&
@@ -1443,12 +1458,16 @@ if (cmd === "new-workspace") {
   const s = readState();
   const ref = "workspace:" + (s.nextWorkspace || 1);
   const paneRef = "pane:" + (s.nextPane || 1);
+  const surfaceRef = "surface:" + (s.nextSurface || 1);
   s.nextWorkspace = (s.nextWorkspace || 1) + 1;
   s.nextPane = (s.nextPane || 1) + 1;
+  s.nextSurface = (s.nextSurface || 1) + 1;
   s.workspaces = Array.isArray(s.workspaces) ? s.workspaces : [];
   s.panes = Array.isArray(s.panes) ? s.panes : [];
+  s.surfaces = Array.isArray(s.surfaces) ? s.surfaces : [];
   s.workspaces.push({ ref, description: argValue("--description"), name: argValue("--name"), cwd: argValue("--cwd"), selected: false });
   s.panes.push({ ref: paneRef, workspace: ref, index: 0 });
+  s.surfaces.push({ ref: surfaceRef, workspace: ref, pane: paneRef, title: "terminal", type: "terminal", process: "zsh", sendText: "", initial: true });
   writeState(s);
   console.log(ref);
   process.exit(0);
@@ -1538,8 +1557,16 @@ if (cmd === "close-surface") {
   const workspace = argValue("--workspace");
   const surface = argValue("--surface");
   if (surface.startsWith("pane:")) {
+    if ((s.surfaces || []).some((item) => item && item.pane === surface && item.initial && (!workspace || item.workspace === workspace))) {
+      writeState(s);
+      process.exit(0);
+    }
     s.panes = (s.panes || []).filter((pane) => !(pane && pane.ref === surface && (!workspace || pane.workspace === workspace)));
     s.surfaces = (s.surfaces || []).filter((item) => !(item && item.pane === surface && (!workspace || item.workspace === workspace)));
+    writeState(s);
+    process.exit(0);
+  }
+  if ((s.surfaces || []).some((item) => item && item.ref === surface && item.initial && (!workspace || item.workspace === workspace))) {
     writeState(s);
     process.exit(0);
   }
@@ -1937,7 +1964,7 @@ function countLog(fakes, event) {
     const ccPairOnAction = ccPairOnResp.json && ccPairOnResp.json.actionId ? await waitForAction(port, ccPairOnResp.json.actionId) : null;
     const statePairOn = await request(port, "/api/state");
     const rowPairOn = statePairOn.json.projects.find((p) => p.id === "alpha");
-    check("R5 API CC button collab ON creates visible cc/cdx pair and activates", (
+    const pairOnOk = (
       ccPairOnResp.json && ccPairOnResp.json.queued === true &&
       ccPairOnAction && ccPairOnAction.status === "succeeded" &&
       rowPairOn.action && rowPairOn.action.label === "slot:alpha:cc:on" &&
@@ -1949,7 +1976,11 @@ function countLog(fakes, event) {
       rowPairOn.slotRefs.cc !== rowPairOn.slotRefs.cdx &&
       rowPairOn.slotPaneRefs.cc !== rowPairOn.slotPaneRefs.cdx &&
       rowPairOn.collab.active === true
-    ));
+    );
+    if (!pairOnOk) {
+      console.log("INFO\tR5 API CC pair ON diagnostic " + JSON.stringify({ resp: ccPairOnResp.json, action: ccPairOnAction, row: rowPairOn }));
+    }
+    check("R5 API CC button collab ON creates visible cc/cdx pair and activates", pairOnOk);
 
     const ccPairOffResp = await request(port, "/api/project/alpha/slot/cc", { method: "POST", body: { on: false } });
     const ccPairOffAction = ccPairOffResp.json && ccPairOffResp.json.actionId ? await waitForAction(port, ccPairOffResp.json.actionId) : null;
@@ -2077,6 +2108,9 @@ function makeCtl(rows) {
     async sendToSurface(wsRef, surfaceRef, text) {
       sends.push({ wsRef, surfaceRef, text });
     },
+    async submitToSurface(wsRef, surfaceRef, text) {
+      sends.push({ wsRef, surfaceRef, text });
+    },
   };
 }
 
@@ -2153,6 +2187,9 @@ process.exit(res.status == null ? 1 : res.status);
       teamName(id) { return String(id).replace(/[^A-Za-z0-9_-]/g, "-"); },
       async getState() { return { projects: activeRows, globalRows: [] }; },
       async sendToSurface(wsRef, surfaceRef, text) {
+        sends.push({ wsRef, surfaceRef, text });
+      },
+      async submitToSurface(wsRef, surfaceRef, text) {
         sends.push({ wsRef, surfaceRef, text });
       },
     };
@@ -2352,6 +2389,47 @@ EOF
 if ! run_r6_collab_delivery_checks; then
   finish
 fi
+
+# R6b: submitToSurface must drive a TUI agent with a TWO-STEP send — the text as
+# a paste, then a SEPARATE lone carriage return — because codex/claude have
+# bracketed paste enabled and swallow a trailing \r in the same send. Regression
+# guard for the empirically-verified codex wake fix.
+run_r6b_submit_two_step_checks() {
+  local phase_dir="$TEST_TMP_DIR/r6b-submit"
+  local fake_cmux="$phase_dir/fake-cmux"
+  local log_file="$phase_dir/cmux.log"
+  mkdir -p "$phase_dir"
+  cat >"$fake_cmux" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_CMUX_LOG"
+exit 0
+SH
+  chmod +x "$fake_cmux"
+  rm -f "$log_file"
+  CMUX_BIN="$fake_cmux" FAKE_CMUX_LOG="$log_file" CMUX_DASH_TUI_SUBMIT_GAP_MS=1 \
+    node -e 'require(process.argv[1]).submitToSurface("workspace:1","surface:cdx","wake text\n").then(()=>process.exit(0)).catch((e)=>{console.error(e);process.exit(1)})' \
+    "$DIR/cmuxctl.js" >/dev/null 2>&1
+  local sends first last
+  sends="$(grep -c '^send ' "$log_file" 2>/dev/null || echo 0)"
+  first="$(grep '^send ' "$log_file" | head -1)"
+  last="$(grep '^send ' "$log_file" | tail -1)"
+  if [ "$sends" = "2" ]; then
+    pass "R6b submitToSurface emits exactly two cmux send calls"
+  else
+    fail "R6b submitToSurface should emit two cmux send calls (got $sends)"
+  fi
+  case "$first" in
+    *"wake text"*'\n'* | *"wake text"*'\r') fail "R6b first send must carry text with no trailing Enter escape (got: $first)" ;;
+    *"wake text"*) pass "R6b first send carries the text with no trailing Enter escape" ;;
+    *) fail "R6b first send should carry the wake text (got: $first)" ;;
+  esac
+  case "$last" in
+    *"wake text"*) fail "R6b second send must be the lone submit, not the text (got: $last)" ;;
+    *'\r') pass "R6b second send is a lone carriage return (the submit)" ;;
+    *) fail "R6b second send should be a lone carriage return (got: $last)" ;;
+  esac
+}
+run_r6b_submit_two_step_checks
 
 run_phase2a_checks() {
   local phase_dir="$TEST_TMP_DIR/phase2a"
@@ -5197,10 +5275,14 @@ assert_cc_slot_toggle() {
   panes_after_on="$(pane_count_for_workspace "$workspace_ref" 2>/dev/null || true)"
   if [ -n "$after_on" ] && [ "$after_on" -gt "$before" ]; then
     pass "CC slot ON increased surface count (${before} -> ${after_on})"
-  elif [ -n "$after_on" ] && [ "$after_on" = "$before" ]; then
-    pass "CC slot ON reused existing top surface (${before} -> ${after_on})"
   else
-    fail "CC slot ON did not create or reuse a visible surface (${before} -> ${after_on:-unknown})"
+    fail "CC slot ON did not create a dedicated visible surface (${before} -> ${after_on:-unknown})"
+    return 1
+  fi
+  if [ -n "$panes_before" ] && [ -n "$panes_after_on" ] && [ "$panes_after_on" -gt "$panes_before" ]; then
+    pass "CC slot ON created a dedicated split pane (${panes_before} -> ${panes_after_on})"
+  else
+    fail "CC slot ON did not create a dedicated split pane (${panes_before:-unknown} -> ${panes_after_on:-unknown})"
     return 1
   fi
   if ! slot_action_and_wait cc true on; then return 1; fi
