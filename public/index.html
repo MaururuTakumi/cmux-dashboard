@@ -116,6 +116,7 @@
   .slot-btn:hover{background:#202a3e;color:var(--ink)}
   .slot-btn.on{color:#05120d;background:var(--ok);border-color:transparent}
   .slot-btn.pending{opacity:.58;cursor:progress}
+  .slot-btn:disabled{opacity:.5;cursor:not-allowed}
   .slot-btn.cc.on{background:var(--claude);color:#190a04}
   .slot-btn.cdx.on{background:var(--codex);color:#03140e}
   .slot-btn.yazi.on{background:var(--accent);color:#041126}
@@ -491,7 +492,8 @@ function slotValue(p, slot){
 }
 function collabState(p){
   const c = p && p.collab ? p.collab : {};
-  return { enabled: !!c.enabled, running: !!c.running, error: c.error || '' };
+  const active = Object.prototype.hasOwnProperty.call(c, 'active') ? !!c.active : !!c.running;
+  return { enabled: !!c.enabled, active, running: active, error: c.error || '' };
 }
 function projectAction(p){
   const a = (p && p.action) || {};
@@ -607,10 +609,18 @@ function renderMetricsPanels(){
   </div>`;
 }
 function renderSlotButtons(p){
+  const collab = collabState(p);
+  const isGlobal = projectKind(p) === 'global';
   return SLOT_DEFS.map(({key,label})=>{
     const on = slotValue(p, key);
     const pending = busy.has(`${p.id}:${key}`);
-    return `<button class="slot-btn ${key} ${on?'on':''} ${pending?'pending':''}" data-slot="${esc(key)}" title="${esc(label)} ${on?'OFF':'ON'}" onclick="event.stopPropagation();toggleSlot(${jsArg(p.id)},${jsArg(key)},${on?'false':'true'})">${label}</button>`;
+    const pairManaged = !isGlobal && collab.enabled && (key === 'cc' || key === 'cdx');
+    const disabled = pairManaged && key === 'cdx';
+    const title = pairManaged
+      ? (key === 'cc' ? `CC+Cdx pair ${on ? 'OFF' : 'ON'}` : 'Cdx standalone is available when collab is OFF')
+      : `${label} ${on?'OFF':'ON'}`;
+    const click = disabled ? '' : ` onclick="event.stopPropagation();toggleSlot(${jsArg(p.id)},${jsArg(key)},${on?'false':'true'})"`;
+    return `<button class="slot-btn ${key} ${on?'on':''} ${pending?'pending':''}" data-slot="${esc(key)}" title="${esc(title)}"${disabled?' disabled':''}${click}>${label}</button>`;
   }).join('');
 }
 function projectKind(p){ return p && p.kind === 'global' ? 'global' : 'project'; }
@@ -630,7 +640,7 @@ function renderProjectRow(p, index){
   const openCount = SLOT_DEFS.filter(({key})=>slotValue(p,key)).length;
   const status = p.open ? `open/${openCount}` : `${openCount}`;
   const collabBusy = busy.has(`${p.id}:collab`);
-  const collabLabel = collab.enabled ? (collab.running ? '協業ON' : '協業待') : '協業OFF';
+  const collabLabel = collab.enabled ? (collab.active ? '協業ON' : '協業待') : '協業OFF';
   const collabTitle = collab.enabled ? '協業をOFFにする' : '協業をONにする';
   const dragAttrs = isGlobal ? '' : `draggable="true" ondragstart="dragStart(event,${jsArg(p.id)})" ondragover="dragOver(event)" ondragleave="dragLeave(event)" ondrop="dropProject(event,${jsArg(p.id)})" ondragend="dragEnd(event)"`;
   return `<div class="project-row ${isGlobal?'global-row':''} ${p.open?'open':''} ${failed?'fail':''}" data-project-id="${esc(p.id)}" data-row-kind="${projectKind(p)}" data-project-index="${index}" ${dragAttrs} onclick="cardClick(event,${jsArg(p.id)},${p.open?'true':'false'})" style="--c:${esc(p.color || '#888')}">
@@ -645,7 +655,7 @@ function renderProjectRow(p, index){
     </div>
     <div class="slotbar">${renderSlotButtons(p)}</div>
     <div class="row-actions">
-      ${isGlobal ? '' : `<button class="mini collab-btn ${collab.enabled?'on':''} ${collab.running?'running':''}" data-action="collab" title="${esc(collabTitle)}" onclick="event.stopPropagation();toggleCollab(${jsArg(p.id)},${collab.enabled?'false':'true'})">${collabBusy?'協業…':collabLabel}</button>`}
+      ${isGlobal ? '' : `<button class="mini collab-btn ${collab.enabled?'on':''} ${collab.active?'running':''}" data-action="collab" title="${esc(collabTitle)}" onclick="event.stopPropagation();toggleCollab(${jsArg(p.id)},${collab.enabled?'false':'true'})">${collabBusy?'協業…':collabLabel}</button>`}
       ${p.open
         ? `<button class="mini drop" data-action="drop" title="workspaceを閉じる" onclick="event.stopPropagation();close_(${jsArg(p.id)})">Drop</button>`
         : `<button class="mini drop" data-action="add" title="workspaceを起動" onclick="event.stopPropagation();open_(${jsArg(p.id)})">Add</button>`}
@@ -654,7 +664,7 @@ function renderProjectRow(p, index){
     <div class="row-status">
       <span><b>action</b> ${esc(action)}</span>
       <span><b>health</b> ${esc(health)}</span>
-      <span><b>collab</b> ${esc(collab.enabled ? (collab.running ? 'enabled/running' : 'enabled/stopped') : (collab.running ? 'disabled/running' : 'disabled'))}</span>
+      <span><b>collab</b> ${esc(collab.enabled ? (collab.active ? 'enabled/active' : 'enabled/pending') : 'disabled')}</span>
       ${err?`<span class="err"><b>lastError</b> ${esc(err)}</span>`:`<span><b>lastError</b> none</span>`}
     </div>
   </div>`;

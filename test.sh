@@ -166,7 +166,7 @@ try {
     global.emoji
   ));
 
-  check("P1 projects.example.json defaults include slots, agmsg, claudeMd, and collab=false", (
+  check("P1 projects.example.json defaults include slots, agmsg, claudeMd, and collab=true", (
     slots &&
     ["cc", "cdx", "yazi", "term"].every((slot) => Object.prototype.hasOwnProperty.call(slots, slot)) &&
     agmsg &&
@@ -175,7 +175,7 @@ try {
     agmsg.codexName === "codex" &&
     claudeMd &&
     claudeMd.mode === "managed-block" &&
-    example.defaults.collab === false
+    example.defaults.collab === true
   ));
 
   const cfg = ctl.loadConfig();
@@ -205,7 +205,8 @@ try {
     readme.includes("./cmux-dash up") &&
     readme.includes("cmuxペイン") &&
     readme.includes("collab") &&
-    readme.includes("default OFF")
+    readme.includes("visible pane delivery") &&
+    readme.includes("does not start a headless Codex")
   ));
 } catch (err) {
   failed += 1;
@@ -656,8 +657,40 @@ let s = { surfaces: [] };
 try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
 const surfaces = (s.surfaces || [])
   .filter((x) => (!workspace || x.workspace === workspace) && (!pane || x.pane === pane))
-  .map((x) => ({ ref: x.ref, title: x.title, type: x.type, paneRef: x.pane }));
+  .map((x) => ({ ref: x.ref, title: x.title, type: x.type, paneRef: x.pane, cwd: x.cwd || null }));
 process.stdout.write(JSON.stringify({ surfaces }) + "\n");
+NODE
+    ;;
+  new-pane)
+    workspace=""
+    direction=""
+    type="terminal"
+    while [ "\$#" -gt 0 ]; do
+      case "\$1" in
+        --workspace) workspace="\${2:-}"; shift 2 ;;
+        --direction) direction="\${2:-}"; shift 2 ;;
+        --type) type="\${2:-}"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    "\$NODE_BIN" - "\$STATE" "\$workspace" "\$direction" "\$type" <<'NODE'
+const fs = require("fs");
+const file = process.argv[2];
+const workspace = process.argv[3] || "";
+const direction = process.argv[4] || "";
+const type = process.argv[5] || "terminal";
+let s = { panes: [], surfaces: [], nextPane: 1, nextSurface: 1 };
+try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
+s.panes = Array.isArray(s.panes) ? s.panes : [];
+s.surfaces = Array.isArray(s.surfaces) ? s.surfaces : [];
+const paneRef = "pane:" + (s.nextPane || 1);
+const surfaceRef = "surface:" + (s.nextSurface || 1);
+s.nextPane = (s.nextPane || 1) + 1;
+s.nextSurface = (s.nextSurface || 1) + 1;
+s.panes.push({ ref: paneRef, workspace, index: s.panes.filter((p) => !workspace || p.workspace === workspace).length, direction });
+s.surfaces.push({ ref: surfaceRef, workspace, pane: paneRef, title: "terminal", type, process: "zsh", cwd: null, sendText: null });
+fs.writeFileSync(file, JSON.stringify(s) + "\n");
+process.stdout.write(surfaceRef + "\n");
 NODE
     ;;
   new-surface)
@@ -735,7 +768,9 @@ if (cdStart >= 0) {
 }
 for (const item of (s.surfaces || [])) {
   if (item && item.ref === surface && slot) {
-    item.title = "cmuxdash:slot:" + slot;
+    item.title = process.env.CMUX_FAKE_OVERWRITE_SLOT_TITLE === "1" && slot === "cc"
+      ? "✳ Claude Code"
+      : "cmuxdash:slot:" + slot;
     item.process = processBySlot[slot] || "zsh";
     item.workspace = item.workspace || workspace;
     item.cwd = cwd;
@@ -760,10 +795,34 @@ const fs = require("fs");
 const file = process.argv[2];
 const workspace = process.argv[3] || "";
 const surface = process.argv[4] || "";
-let s = { surfaces: [] };
+let s = { panes: [], surfaces: [] };
 try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
+if (surface.startsWith("pane:")) {
+  s.panes = (Array.isArray(s.panes) ? s.panes : [])
+    .filter((pane) => !(pane && pane.ref === surface && (!workspace || pane.workspace === workspace)));
+  s.surfaces = (Array.isArray(s.surfaces) ? s.surfaces : [])
+    .filter((item) => !(item && item.pane === surface && (!workspace || item.workspace === workspace)));
+  fs.writeFileSync(file, JSON.stringify(s) + "\n");
+  process.exit(0);
+}
+if (process.env.CMUX_FAKE_STALE_SLOT_CLOSE === "1") {
+  const target = (Array.isArray(s.surfaces) ? s.surfaces : [])
+    .find((item) => item && item.ref === surface && (!workspace || item.workspace === workspace));
+  const match = target && String(target.title || "").match(/cmuxdash:slot:(cc|cdx|yazi|term)/);
+  if (match) {
+    fs.writeFileSync(file, JSON.stringify(s) + "\n");
+    process.exit(0);
+  }
+}
+const removed = (Array.isArray(s.surfaces) ? s.surfaces : [])
+  .filter((item) => item && item.ref === surface && (!workspace || item.workspace === workspace));
 s.surfaces = (Array.isArray(s.surfaces) ? s.surfaces : [])
   .filter((item) => !(item && item.ref === surface && (!workspace || item.workspace === workspace)));
+const removedPanes = new Set(removed.map((item) => item && item.pane).filter(Boolean));
+s.panes = (Array.isArray(s.panes) ? s.panes : []).filter((pane) => {
+  if (!pane || !removedPanes.has(pane.ref)) return true;
+  return s.surfaces.some((surface) => surface && surface.pane === pane.ref);
+});
 fs.writeFileSync(file, JSON.stringify(s) + "\n");
 NODE
     ;;
@@ -834,8 +893,23 @@ function surfacesFor(id) {
   if (!ws) return [];
   return (rawCmuxState().surfaces || []).filter((s) => s && s.workspace === ws.ref);
 }
+function panesFor(id) {
+  const ws = workspaceFor(id);
+  if (!ws) return [];
+  return (rawCmuxState().panes || []).filter((p) => p && p.workspace === ws.ref);
+}
+function paneForRef(ref) {
+  return (rawCmuxState().panes || []).find((p) => p && p.ref === ref) || null;
+}
 function surfaceForSlot(id, slot) {
   return surfacesFor(id).find((s) => s && s.title === "cmuxdash:slot:" + slot) || null;
+}
+function stateHasSlotMarker(state, slot) {
+  const marker = "cmuxdash:slot:" + slot;
+  return (state.surfaces || []).some((surface) => {
+    const haystack = [surface.title, surface.paneTitle, surface.paneDescription].filter(Boolean).join("\n");
+    return surface.slot === slot || haystack.includes(marker);
+  });
 }
 function shellQuoted(value) {
   const q = String.fromCharCode(39);
@@ -849,6 +923,7 @@ async function exerciseSlotCycle(id, slot, expectedCwd, label, expectAutoOpen) {
   const afterOnState = await ctl.getProjectState(id);
   const afterOnCount = surfacesFor(id).length;
   const surface = surfaceForSlot(id, slot);
+  const splitPane = surface && surface.pane ? paneForRef(surface.pane) : null;
   if (expectAutoOpen) {
     check("slot " + label + "/" + slot + ": ON auto-opens unopened row", !beforeState.open && afterOnState.open);
   }
@@ -856,6 +931,14 @@ async function exerciseSlotCycle(id, slot, expectedCwd, label, expectAutoOpen) {
     onResult.on === true &&
     afterOnState.slots[slot] === true &&
     afterOnCount === beforeCount + 1
+  ));
+  check("slot " + label + "/" + slot + ": ON creates vertical split pane", (
+    surface &&
+    surface.pane &&
+    onResult.paneRef === surface.pane &&
+    onResult.split === true &&
+    splitPane &&
+    splitPane.direction === "down"
   ));
   check("slot " + label + "/" + slot + ": send text cd into expected cwd", (
     surface &&
@@ -879,11 +962,16 @@ async function exerciseSlotCycle(id, slot, expectedCwd, label, expectAutoOpen) {
   const offResult = await ctl.ensureSlot(id, slot, false);
   const afterOffState = await ctl.getProjectState(id);
   const afterOffCount = surfacesFor(id).length;
+  const paneAfterOff = surface && surface.pane ? paneForRef(surface.pane) : null;
   check("slot " + label + "/" + slot + ": OFF decreases surface count", (
     offResult.on === false &&
     afterOffState.slots[slot] === false &&
+    !afterOffState.slotRefs[slot] &&
+    !afterOffState.slotPaneRefs[slot] &&
+    !stateHasSlotMarker(afterOffState, slot) &&
     afterOffCount === afterOnCount - 1
   ));
+  check("slot " + label + "/" + slot + ": OFF removes the marked split pane", !paneAfterOff);
 
   const repeatOff = await ctl.ensureSlot(id, slot, false);
   check("slot " + label + "/" + slot + ": repeated OFF is idempotent", (
@@ -945,6 +1033,102 @@ async function exerciseAllSlots(id, expectedCwd, label) {
 
     await exerciseAllSlots("alpha", alphaDir, "normal project");
     await exerciseAllSlots("cc-general", os.homedir(), "global row");
+
+    {
+      const raw = rawCmuxState();
+      const ws = workspaceFor("alpha");
+      const pane = panesFor("alpha")[0] || { ref: "pane:marker", workspace: ws && ws.ref };
+      if (!panesFor("alpha").length && ws) raw.panes.push(pane);
+      const unmarkedRef = "surface:marker-unmarked";
+      const markedRef = "surface:marker-cdx";
+      raw.surfaces = (raw.surfaces || []).filter((surface) => ![unmarkedRef, markedRef].includes(surface && surface.ref));
+      raw.surfaces.push({ ref: unmarkedRef, workspace: ws.ref, pane: pane.ref, title: "codex", type: "terminal", process: "codex" });
+      raw.surfaces.push({ ref: markedRef, workspace: ws.ref, pane: pane.ref, title: "cmuxdash:slot:cdx", type: "terminal", process: "zsh" });
+      fs.writeFileSync(stateFile, JSON.stringify(raw) + "\n");
+      const markerState = await ctl.getProjectState("alpha");
+      const unmarked = markerState.surfaces.find((surface) => surface.ref === unmarkedRef);
+      check("slot detection uses marker before process fallback", (
+        markerState.slots.cdx === true &&
+        markerState.slotRefs.cdx === markedRef &&
+        unmarked &&
+        unmarked.slot === null
+      ));
+      const cleaned = rawCmuxState();
+      cleaned.surfaces = (cleaned.surfaces || []).filter((surface) => ![unmarkedRef, markedRef].includes(surface && surface.ref));
+      fs.writeFileSync(stateFile, JSON.stringify(cleaned) + "\n");
+    }
+
+    {
+      process.env.CMUX_FAKE_OVERWRITE_SLOT_TITLE = "1";
+      let onResult;
+      let afterOnState;
+      let repeatOn;
+      let offResult;
+      let afterOffState;
+      let rawSurface;
+      let countAfterOn = 0;
+      let countAfterRepeat = 0;
+      try {
+        onResult = await ctl.ensureSlot("alpha", "cc", true);
+        afterOnState = await ctl.getProjectState("alpha");
+        rawSurface = surfacesFor("alpha").find((surface) => surface && surface.ref === onResult.ref) || null;
+        countAfterOn = surfacesFor("alpha").length;
+        repeatOn = await ctl.ensureSlot("alpha", "cc", true);
+        countAfterRepeat = surfacesFor("alpha").length;
+        offResult = await ctl.ensureSlot("alpha", "cc", false);
+        afterOffState = await ctl.getProjectState("alpha");
+      } finally {
+        delete process.env.CMUX_FAKE_OVERWRITE_SLOT_TITLE;
+      }
+      check("slot recorded ref: fake cmux overwrites visible title marker", (
+        rawSurface &&
+        rawSurface.title === "✳ Claude Code" &&
+        !String(rawSurface.title || "").includes("cmuxdash:slot:cc")
+      ));
+      check("slot recorded ref: getProjectState keeps overwritten-title CC ON", (
+        onResult &&
+        onResult.on === true &&
+        afterOnState &&
+        afterOnState.slots.cc === true &&
+        afterOnState.slotRefs.cc === onResult.ref &&
+        afterOnState.slotPaneRefs.cc === onResult.paneRef
+      ));
+      check("slot recorded ref: repeated ON reuses overwritten-title surface", (
+        repeatOn &&
+        repeatOn.already === true &&
+        repeatOn.ref === onResult.ref &&
+        countAfterRepeat === countAfterOn
+      ));
+      check("slot recorded ref: OFF closes overwritten-title pane and clears refs", (
+        offResult &&
+        offResult.on === false &&
+        afterOffState &&
+        afterOffState.slots.cc === false &&
+        !afterOffState.slotRefs.cc &&
+        !afterOffState.slotPaneRefs.cc &&
+        !surfacesFor("alpha").some((surface) => surface && surface.ref === onResult.ref)
+      ));
+    }
+
+    {
+      await ctl.ensureSlot("alpha", "cc", true);
+      process.env.CMUX_FAKE_STALE_SLOT_CLOSE = "1";
+      let staleOff;
+      try {
+        staleOff = await ctl.ensureSlot("alpha", "cc", false);
+      } finally {
+        delete process.env.CMUX_FAKE_STALE_SLOT_CLOSE;
+      }
+      const staleState = await ctl.getProjectState("alpha");
+      check("slot stale close: OFF drains marker-retaining pane fallback", (
+        staleOff &&
+        staleOff.on === false &&
+        staleState.slots.cc === false &&
+        !staleState.slotRefs.cc &&
+        !staleState.slotPaneRefs.cc &&
+        !stateHasSlotMarker(staleState, "cc")
+      ));
+    }
 
     let unknownProjectError = false;
     try { await ctl.ensureSlot("missing-project", "cc", true); } catch (err) { unknownProjectError = /unknown project: missing-project/.test(err.message); }
@@ -1250,17 +1434,21 @@ const fs = require("fs");
 const stateFile = ${JSON.stringify(stateFile)};
 const args = process.argv.slice(2);
 const cmd = args.shift() || "";
-function readState(){ try { return JSON.parse(fs.readFileSync(stateFile, "utf8")); } catch (_) { return { workspaces: [], next: 1 }; } }
+function readState(){ try { return JSON.parse(fs.readFileSync(stateFile, "utf8")); } catch (_) { return { workspaces: [], panes: [], surfaces: [], nextWorkspace: 1, nextPane: 1, nextSurface: 1 }; } }
 function writeState(s){ fs.writeFileSync(stateFile, JSON.stringify(s) + "\\n"); }
 function argValue(name){ const i = args.indexOf(name); return i >= 0 ? args[i + 1] || "" : ""; }
 if (cmd === "ping") { console.log("pong"); process.exit(0); }
 if (cmd === "list-workspaces") { const s = readState(); console.log(JSON.stringify({ workspaces: s.workspaces || [] })); process.exit(0); }
 if (cmd === "new-workspace") {
   const s = readState();
-  const ref = "workspace:" + (s.next || 1);
-  s.next = (s.next || 1) + 1;
+  const ref = "workspace:" + (s.nextWorkspace || 1);
+  const paneRef = "pane:" + (s.nextPane || 1);
+  s.nextWorkspace = (s.nextWorkspace || 1) + 1;
+  s.nextPane = (s.nextPane || 1) + 1;
   s.workspaces = Array.isArray(s.workspaces) ? s.workspaces : [];
+  s.panes = Array.isArray(s.panes) ? s.panes : [];
   s.workspaces.push({ ref, description: argValue("--description"), name: argValue("--name"), cwd: argValue("--cwd"), selected: false });
+  s.panes.push({ ref: paneRef, workspace: ref, index: 0 });
   writeState(s);
   console.log(ref);
   process.exit(0);
@@ -1269,14 +1457,110 @@ if (cmd === "close-workspace") {
   const ws = argValue("--workspace");
   const s = readState();
   s.workspaces = (s.workspaces || []).filter((w) => w && w.ref !== ws);
+  s.panes = (s.panes || []).filter((p) => p && p.workspace !== ws);
+  s.surfaces = (s.surfaces || []).filter((surface) => surface && surface.workspace !== ws);
   writeState(s);
   console.log("{}");
   process.exit(0);
 }
 if (cmd === "select-workspace" || cmd === "reorder-workspaces") { console.log("{}"); process.exit(0); }
-if (cmd === "list-panes") { console.log(JSON.stringify({ panes: [] })); process.exit(0); }
-if (cmd === "list-pane-surfaces") { console.log(JSON.stringify({ surfaces: [] })); process.exit(0); }
-if (cmd === "top") { process.exit(0); }
+if (cmd === "list-panes") {
+  const s = readState();
+  const workspace = argValue("--workspace");
+  const panes = (s.panes || []).filter((p) => !workspace || p.workspace === workspace);
+  console.log(JSON.stringify({ panes }));
+  process.exit(0);
+}
+if (cmd === "list-pane-surfaces") {
+  const s = readState();
+  const workspace = argValue("--workspace");
+  const pane = argValue("--pane");
+  const surfaces = (s.surfaces || [])
+    .filter((surface) => (!workspace || surface.workspace === workspace) && (!pane || surface.pane === pane))
+    .map((surface) => ({ ref: surface.ref, title: surface.title, type: surface.type, paneRef: surface.pane, cwd: surface.cwd || null }));
+  console.log(JSON.stringify({ surfaces }));
+  process.exit(0);
+}
+if (cmd === "new-pane") {
+  const s = readState();
+  const workspace = argValue("--workspace");
+  const direction = argValue("--direction");
+  const type = argValue("--type") || "terminal";
+  s.panes = Array.isArray(s.panes) ? s.panes : [];
+  s.surfaces = Array.isArray(s.surfaces) ? s.surfaces : [];
+  const paneRef = "pane:" + (s.nextPane || 1);
+  const ref = "surface:" + (s.nextSurface || 1);
+  s.nextPane = (s.nextPane || 1) + 1;
+  s.nextSurface = (s.nextSurface || 1) + 1;
+  s.panes.push({ ref: paneRef, workspace, index: s.panes.filter((item) => item && item.workspace === workspace).length, direction });
+  s.surfaces.push({ ref, workspace, pane: paneRef, title: "terminal", type, process: "zsh", sendText: "" });
+  writeState(s);
+  console.log(ref);
+  process.exit(0);
+}
+if (cmd === "new-surface") {
+  const s = readState();
+  const workspace = argValue("--workspace");
+  let pane = argValue("--pane");
+  s.panes = Array.isArray(s.panes) ? s.panes : [];
+  s.surfaces = Array.isArray(s.surfaces) ? s.surfaces : [];
+  if (!pane) pane = ((s.panes || []).find((item) => item && (!workspace || item.workspace === workspace)) || {}).ref || "pane:1";
+  const ref = "surface:" + (s.nextSurface || 1);
+  s.nextSurface = (s.nextSurface || 1) + 1;
+  s.surfaces.push({ ref, workspace, pane, title: "terminal", type: "terminal", process: "zsh", sendText: "" });
+  writeState(s);
+  console.log(ref);
+  process.exit(0);
+}
+if (cmd === "send") {
+  const s = readState();
+  const surface = argValue("--surface");
+  const workspace = argValue("--workspace");
+  const text = args.filter((arg, idx) => !["--surface", "--workspace"].includes(args[idx - 1]) && !["--surface", "--workspace"].includes(arg)).join(" ");
+  const match = text.match(/cmuxdash:slot:(cc|cdx|yazi|term)/);
+  const slot = match && match[1];
+  const processBySlot = { cc: "claude", cdx: "codex", yazi: "yazi", term: "zsh" };
+  for (const item of (s.surfaces || [])) {
+    if (item && item.ref === surface) {
+      item.sendText = text;
+      item.workspace = item.workspace || workspace;
+      if (slot) {
+        item.title = "cmuxdash:slot:" + slot;
+        item.process = processBySlot[slot] || "zsh";
+      }
+    }
+  }
+  writeState(s);
+  process.exit(0);
+}
+if (cmd === "close-surface") {
+  const s = readState();
+  const workspace = argValue("--workspace");
+  const surface = argValue("--surface");
+  if (surface.startsWith("pane:")) {
+    s.panes = (s.panes || []).filter((pane) => !(pane && pane.ref === surface && (!workspace || pane.workspace === workspace)));
+    s.surfaces = (s.surfaces || []).filter((item) => !(item && item.pane === surface && (!workspace || item.workspace === workspace)));
+    writeState(s);
+    process.exit(0);
+  }
+  const removed = (s.surfaces || []).filter((item) => item && item.ref === surface && (!workspace || item.workspace === workspace));
+  s.surfaces = (s.surfaces || []).filter((item) => !(item && item.ref === surface && (!workspace || item.workspace === workspace)));
+  const removedPanes = new Set(removed.map((item) => item && item.pane).filter(Boolean));
+  s.panes = (s.panes || []).filter((pane) => {
+    if (!pane || !removedPanes.has(pane.ref)) return true;
+    return s.surfaces.some((item) => item && item.pane === pane.ref);
+  });
+  writeState(s);
+  process.exit(0);
+}
+if (cmd === "top") {
+  const s = readState();
+  let idx = 1;
+  for (const surface of (s.surfaces || [])) {
+    process.stdout.write("0\\t0\\t1\\tprocess\\tprocess:" + (idx++) + "\\t" + surface.ref + "\\t" + (surface.process || "zsh") + "\\n");
+  }
+  process.exit(0);
+}
 if (cmd === "memory") { console.log("Footprint: 64 MiB\\nChild RSS total: 16 MiB"); process.exit(0); }
 console.log("{}");
 `);
@@ -1284,7 +1568,7 @@ console.log("{}");
 function writeCollabFakes(base) {
   const stateFile = path.join(base, "collab-state.json");
   const logFile = path.join(base, "collab-log.jsonl");
-  const init = path.join(base, "collab-init");
+  const init = path.join(base, "collab.sh");
   const bridge = path.join(base, "agmsg-codex-bridge.sh");
   const pgrep = path.join(base, "pgrep");
   const nohup = path.join(base, "nohup");
@@ -1304,6 +1588,7 @@ function log(event, args){ fs.appendFileSync(logFile, JSON.stringify({ event, ar
   writeExecutable(init, fakeScriptHeader() + common + `
 const args = process.argv.slice(2);
 log("init", args);
+if (args[0] === "init") args.shift();
 let project = "";
 for (let i = 0; i < args.length; i += 1) {
   const arg = args[i];
@@ -1379,7 +1664,7 @@ function countLog(fakes, event) {
     const cfgFile = path.join(phaseDir, "projects.json");
     const projectDir = path.resolve(path.join(phaseDir, "alpha path"));
     fs.mkdirSync(projectDir, { recursive: true });
-    fs.writeFileSync(cmuxState, JSON.stringify({ workspaces: [], next: 1 }) + "\n");
+    fs.writeFileSync(cmuxState, JSON.stringify({ workspaces: [], panes: [], surfaces: [], nextWorkspace: 1, nextPane: 1, nextSurface: 1 }) + "\n");
     writeFakeCmux(fakeCmux, cmuxState);
     const fakes = writeCollabFakes(phaseDir);
     Object.assign(process.env, {
@@ -1396,90 +1681,173 @@ function countLog(fakes, event) {
     const first = await ctl.ensureCollab(projectDir, true, { team: "alpha-team" });
     const realProjectDir = first.projectDir;
     const firstLog = readLog(fakes.logFile);
-    check("R5 ensureCollab creates config with collab-init --no-start", (
+    check("R5 ensureCollab creates config with collab.sh init --no-start", (
       fs.existsSync(path.join(realProjectDir, ".claude-codex-collab", "config.env")) &&
       first.config && first.config.action === "initialized" &&
-      firstLog.some((item) => item.event === "init" && item.args.includes("--no-start") && item.args.includes("--team") && item.args.includes("alpha-team"))
+      firstLog.some((item) => item.event === "init" && item.args[0] === "init" && item.args.includes("--no-start") && item.args.includes("--team") && item.args.includes("alpha-team"))
     ));
-    check("R5 ensureCollab starts skill bridge via nohup run projectDir", (
-      runningFor(fakes, realProjectDir) &&
-      firstLog.some((item) => item.event === "nohup" && item.args[0] === fakes.bridge && item.args[1] === "run" && item.args[2] === realProjectDir) &&
-      !firstLog.some((item) => JSON.stringify(item).includes(path.join(repo, "bin", "agmsg-codex-bridge.sh")))
+    check("R5 ensureCollab setup-only does not invoke nohup bridge run", (
+      first.setupOnly === true &&
+      first.running === false &&
+      !runningFor(fakes, realProjectDir) &&
+      countLog(fakes, "nohup") === 0
     ));
 
-    const startsBeforeRepeat = countLog(fakes, "nohup");
+    fs.writeFileSync(fakes.stateFile, JSON.stringify({ running: { [realProjectDir]: true } }) + "\n");
     const repeat = await ctl.ensureCollab(projectDir, true, { team: "alpha-team" });
-    check("R5 ensureCollab does not double-start when pgrep sees same project", (
-      repeat.alreadyRunning === true &&
-      repeat.started === false &&
-      Array.isArray(repeat.pids) &&
-      repeat.pids.includes(4242) &&
-      countLog(fakes, "nohup") === startsBeforeRepeat
+    check("R5 ensureCollab enable stops residual headless bridge defensively", (
+      repeat.setupOnly === true &&
+      repeat.bridge &&
+      repeat.bridge.running === false &&
+      !runningFor(fakes, realProjectDir) &&
+      readLog(fakes.logFile).some((item) => item.event === "bridge" && item.args[0] === "stop" && item.args[1] === realProjectDir) &&
+      countLog(fakes, "nohup") === 0
     ));
 
+    fs.writeFileSync(fakes.stateFile, JSON.stringify({ running: { [realProjectDir]: true } }) + "\n");
     const off = await ctl.ensureCollab(projectDir, false);
-    check("R5 ensureCollab off stops project bridge", (
+    check("R5 ensureCollab off stops residual bridge without starting headless", (
       off.running === false &&
       !runningFor(fakes, realProjectDir) &&
-      readLog(fakes.logFile).some((item) => item.event === "bridge" && item.args[0] === "stop" && item.args[1] === realProjectDir)
+      readLog(fakes.logFile).some((item) => item.event === "bridge" && item.args[0] === "stop" && item.args[1] === realProjectDir) &&
+      countLog(fakes, "nohup") === 0
     ));
 
     fs.writeFileSync(cfgFile, JSON.stringify({
-      _comment: "R5 default-off isolated test config",
+      _comment: "R5 default-on isolated test config",
       defaults: { agmsg: { enabled: false }, claudeMd: { mode: "off" } },
       projects: [{ id: "alpha", name: "Alpha", path: projectDir }],
     }, null, 2) + "\n");
-    fs.writeFileSync(cmuxState, JSON.stringify({ workspaces: [], next: 1 }) + "\n");
+    fs.writeFileSync(cmuxState, JSON.stringify({ workspaces: [], panes: [], surfaces: [], nextWorkspace: 1, nextPane: 1, nextSurface: 1 }) + "\n");
     fs.writeFileSync(fakes.stateFile, JSON.stringify({ running: {} }) + "\n");
     fs.writeFileSync(fakes.logFile, "");
-    const defaultOffCfg = ctl.loadConfig();
-    const defaultOffState = await ctl.getState();
-    const defaultOffRow = defaultOffState.projects.find((p) => p.id === "alpha");
-    check("R5 collab defaults to off when defaults.collab is omitted", (
-      defaultOffCfg.defaults.collab === false &&
-      ctl.projectCollabEnabled(defaultOffCfg.projects[0], defaultOffCfg) === false &&
-      defaultOffRow &&
-      defaultOffRow.collab &&
-      defaultOffRow.collab.enabled === false &&
-      defaultOffRow.collab.running === false &&
+    const defaultOnCfg = ctl.loadConfig();
+    const defaultOnState = await ctl.getState();
+    const defaultOnRow = defaultOnState.projects.find((p) => p.id === "alpha");
+    check("R5 collab defaults to on when defaults.collab is omitted", (
+      defaultOnCfg.defaults.collab === true &&
+      ctl.projectCollabEnabled(defaultOnCfg.projects[0], defaultOnCfg) === true &&
+      defaultOnRow &&
+      defaultOnRow.collab &&
+      defaultOnRow.collab.enabled === true &&
+      defaultOnRow.collab.active === false &&
+      defaultOnRow.collab.running === false &&
       countLog(fakes, "init") === 0 &&
       countLog(fakes, "nohup") === 0
     ));
 
     fs.writeFileSync(cfgFile, JSON.stringify({
       _comment: "R5 isolated test config",
-      defaults: { agmsg: { enabled: false }, claudeMd: { mode: "off" }, collab: false },
-      projects: [{ id: "alpha", name: "Alpha", path: projectDir, collab: true }],
+      defaults: { agmsg: { enabled: false }, claudeMd: { mode: "off" }, collab: true },
+      projects: [{ id: "alpha", name: "Alpha", path: projectDir }],
     }, null, 2) + "\n");
-    fs.writeFileSync(cmuxState, JSON.stringify({ workspaces: [], next: 1 }) + "\n");
+    fs.writeFileSync(cmuxState, JSON.stringify({ workspaces: [], panes: [], surfaces: [], nextWorkspace: 1, nextPane: 1, nextSurface: 1 }) + "\n");
     fs.writeFileSync(fakes.stateFile, JSON.stringify({ running: {} }) + "\n");
     fs.writeFileSync(fakes.logFile, "");
 
     const opened = await ctl.openProject("alpha", { focus: false });
     let st = await ctl.getState();
     const rowAfterOpen = st.projects.find((p) => p.id === "alpha");
-    const openStarts = countLog(fakes, "nohup");
-    check("R5 openProject starts collab only when project explicitly enables it", (
+    const ccRefAfterOpen = rowAfterOpen && rowAfterOpen.slotRefs && rowAfterOpen.slotRefs.cc;
+    const cdxRefAfterOpen = rowAfterOpen && rowAfterOpen.slotRefs && rowAfterOpen.slotRefs.cdx;
+    const ccPaneAfterOpen = rowAfterOpen && rowAfterOpen.slotPaneRefs && rowAfterOpen.slotPaneRefs.cc;
+    const cdxPaneAfterOpen = rowAfterOpen && rowAfterOpen.slotPaneRefs && rowAfterOpen.slotPaneRefs.cdx;
+    check("R5 openProject collab ON creates cc/cdx slots and setup-only collab", (
       opened.collab && opened.collab.on === true &&
+      opened.collab.setupOnly === true &&
+      Array.isArray(opened.slots) && opened.slots.length === 2 &&
       rowAfterOpen && rowAfterOpen.open === true &&
+      rowAfterOpen.slots && rowAfterOpen.slots.cc === true &&
+      rowAfterOpen.slots && rowAfterOpen.slots.cdx === true &&
+      ccRefAfterOpen && cdxRefAfterOpen && ccRefAfterOpen !== cdxRefAfterOpen &&
+      ccPaneAfterOpen && cdxPaneAfterOpen && ccPaneAfterOpen !== cdxPaneAfterOpen &&
       rowAfterOpen.collab && rowAfterOpen.collab.enabled === true &&
+      rowAfterOpen.collab.active === true &&
       rowAfterOpen.collab.running === true &&
-      openStarts === 1
+      countLog(fakes, "init") >= 1 &&
+      countLog(fakes, "nohup") === 0
     ));
 
+    {
+      const raw = readJson(cmuxState, {});
+      const ccSurface = (raw.surfaces || []).find((surface) => surface && surface.ref === ccRefAfterOpen);
+      const cdxSurface = (raw.surfaces || []).find((surface) => surface && surface.ref === cdxRefAfterOpen);
+      if (ccSurface) ccSurface.title = "✳ Claude Code";
+      if (cdxSurface) cdxSurface.title = "Codex";
+      fs.writeFileSync(cmuxState, JSON.stringify(raw) + "\n");
+      st = await ctl.getState();
+      const rowAfterTitleOverwrite = st.projects.find((p) => p.id === "alpha");
+      check("R5 collab active survives overwritten CC/Cdx titles via recorded refs", (
+        ccSurface &&
+        cdxSurface &&
+        ccSurface.title === "✳ Claude Code" &&
+        !String(ccSurface.title || "").includes("cmuxdash:slot:cc") &&
+        !String(cdxSurface.title || "").includes("cmuxdash:slot:cdx") &&
+        rowAfterTitleOverwrite &&
+        rowAfterTitleOverwrite.slots.cc === true &&
+        rowAfterTitleOverwrite.slots.cdx === true &&
+        rowAfterTitleOverwrite.slotRefs.cc === ccRefAfterOpen &&
+        rowAfterTitleOverwrite.slotRefs.cdx === cdxRefAfterOpen &&
+        rowAfterTitleOverwrite.collab.active === true
+      ));
+    }
+
     await ctl.openProject("alpha", { focus: false });
-    check("R5 openProject already-open self-heals without duplicate start", countLog(fakes, "nohup") === openStarts);
+    st = await ctl.getState();
+    const rowAfterRepeatOpen = st.projects.find((p) => p.id === "alpha");
+    check("R5 openProject already-open keeps cc/cdx slots idempotent without headless start", (
+      rowAfterRepeatOpen &&
+      rowAfterRepeatOpen.slots.cc === true &&
+      rowAfterRepeatOpen.slots.cdx === true &&
+      rowAfterRepeatOpen.slotRefs.cc === ccRefAfterOpen &&
+      rowAfterRepeatOpen.slotRefs.cdx === cdxRefAfterOpen &&
+      rowAfterRepeatOpen.slotPaneRefs.cc === ccPaneAfterOpen &&
+      rowAfterRepeatOpen.slotPaneRefs.cdx === cdxPaneAfterOpen &&
+      countLog(fakes, "nohup") === 0
+    ));
+
+    const pairOff = await ctl.ensureCollabPair("alpha", false);
+    st = await ctl.getState();
+    const rowAfterPairOff = st.projects.find((p) => p.id === "alpha");
+    check("R5 CC pair OFF closes both cc/cdx panes while keeping collab enabled pending", (
+      pairOff.on === false &&
+      rowAfterPairOff &&
+      rowAfterPairOff.open === true &&
+      rowAfterPairOff.slots.cc === false &&
+      rowAfterPairOff.slots.cdx === false &&
+      rowAfterPairOff.collab.enabled === true &&
+      rowAfterPairOff.collab.active === false
+    ));
+
+    const pairOn = await ctl.ensureCollabPair("alpha", true);
+    st = await ctl.getState();
+    const rowAfterPairOn = st.projects.find((p) => p.id === "alpha");
+    check("R5 CC pair ON recreates distinct marked cc/cdx panes and reactivates collab", (
+      pairOn.on === true &&
+      rowAfterPairOn &&
+      rowAfterPairOn.slots.cc === true &&
+      rowAfterPairOn.slots.cdx === true &&
+      rowAfterPairOn.slotRefs.cc &&
+      rowAfterPairOn.slotRefs.cdx &&
+      rowAfterPairOn.slotRefs.cc !== rowAfterPairOn.slotRefs.cdx &&
+      rowAfterPairOn.slotPaneRefs.cc !== rowAfterPairOn.slotPaneRefs.cdx &&
+      rowAfterPairOn.collab.active === true
+    ));
 
     const closed = await ctl.closeProject("alpha");
     st = await ctl.getState();
     const rowAfterClose = st.projects.find((p) => p.id === "alpha");
-    check("R5 closeProject stops collab even after closing workspace", (
+    check("R5 closeProject stops pane delivery and residual bridge only", (
       closed.collab && closed.collab.running === false &&
       rowAfterClose && rowAfterClose.open === false &&
-      rowAfterClose.collab && rowAfterClose.collab.running === false
+      rowAfterClose.collab &&
+      rowAfterClose.collab.enabled === true &&
+      rowAfterClose.collab.active === false &&
+      rowAfterClose.collab.running === false &&
+      countLog(fakes, "nohup") === 0
     ));
 
-    fs.writeFileSync(cmuxState, JSON.stringify({ workspaces: [], next: 1 }) + "\n");
+    fs.writeFileSync(cmuxState, JSON.stringify({ workspaces: [], panes: [], surfaces: [], nextWorkspace: 1, nextPane: 1, nextSurface: 1 }) + "\n");
     fs.writeFileSync(fakes.stateFile, JSON.stringify({ running: {} }) + "\n");
     fs.writeFileSync(fakes.logFile, "");
     fs.writeFileSync(cfgFile, JSON.stringify({
@@ -1498,12 +1866,15 @@ function countLog(fakes, event) {
       rowAfterOpenOff.open === true &&
       rowAfterOpenOff.collab &&
       rowAfterOpenOff.collab.enabled === false &&
+      rowAfterOpenOff.collab.active === false &&
       rowAfterOpenOff.collab.running === false &&
+      rowAfterOpenOff.slots && rowAfterOpenOff.slots.cc === false &&
+      rowAfterOpenOff.slots && rowAfterOpenOff.slots.cdx === false &&
       countLog(fakes, "init") === 0 &&
       countLog(fakes, "nohup") === 0
     ));
 
-    fs.writeFileSync(cmuxState, JSON.stringify({ workspaces: [], next: 1 }) + "\n");
+    fs.writeFileSync(cmuxState, JSON.stringify({ workspaces: [], panes: [], surfaces: [], nextWorkspace: 1, nextPane: 1, nextSurface: 1 }) + "\n");
     fs.writeFileSync(fakes.stateFile, JSON.stringify({ running: {} }) + "\n");
     fs.writeFileSync(fakes.logFile, "");
     fs.writeFileSync(cfgFile, JSON.stringify({
@@ -1537,10 +1908,11 @@ function countLog(fakes, event) {
 
     const stateBefore = await request(port, "/api/state");
     const rowBefore = stateBefore.json && stateBefore.json.projects && stateBefore.json.projects.find((p) => p.id === "alpha");
-    check("R5 /api/state exposes collab field without bridge fanout", (
+    check("R5 /api/state exposes collab.active field without bridge fanout", (
       rowBefore &&
       rowBefore.collab &&
       rowBefore.collab.enabled === false &&
+      rowBefore.collab.active === false &&
       rowBefore.collab.running === false &&
       countLog(fakes, "init") === 0 &&
       countLog(fakes, "nohup") === 0
@@ -1550,12 +1922,48 @@ function countLog(fakes, event) {
     const onAction = onResp.json && onResp.json.actionId ? await waitForAction(port, onResp.json.actionId) : null;
     const stateOn = await request(port, "/api/state");
     const rowOn = stateOn.json.projects.find((p) => p.id === "alpha");
-    check("R5 API collab ON queues, succeeds, persists action target, and runs", (
+    check("R5 API collab ON queues, succeeds, persists action target, and remains inactive until Cdx slot exists", (
       onResp.json && onResp.json.queued === true &&
       onAction && onAction.status === "succeeded" &&
       rowOn.action && rowOn.action.label === "collab:alpha:on" &&
       rowOn.collab && rowOn.collab.enabled === true &&
-      rowOn.collab.running === true
+      rowOn.collab.active === false &&
+      rowOn.collab.running === false &&
+      countLog(fakes, "init") >= 1 &&
+      countLog(fakes, "nohup") === 0
+    ));
+
+    const ccPairOnResp = await request(port, "/api/project/alpha/slot/cc", { method: "POST", body: { on: true } });
+    const ccPairOnAction = ccPairOnResp.json && ccPairOnResp.json.actionId ? await waitForAction(port, ccPairOnResp.json.actionId) : null;
+    const statePairOn = await request(port, "/api/state");
+    const rowPairOn = statePairOn.json.projects.find((p) => p.id === "alpha");
+    check("R5 API CC button collab ON creates visible cc/cdx pair and activates", (
+      ccPairOnResp.json && ccPairOnResp.json.queued === true &&
+      ccPairOnAction && ccPairOnAction.status === "succeeded" &&
+      rowPairOn.action && rowPairOn.action.label === "slot:alpha:cc:on" &&
+      rowPairOn.open === true &&
+      rowPairOn.slots.cc === true &&
+      rowPairOn.slots.cdx === true &&
+      rowPairOn.slotRefs.cc &&
+      rowPairOn.slotRefs.cdx &&
+      rowPairOn.slotRefs.cc !== rowPairOn.slotRefs.cdx &&
+      rowPairOn.slotPaneRefs.cc !== rowPairOn.slotPaneRefs.cdx &&
+      rowPairOn.collab.active === true
+    ));
+
+    const ccPairOffResp = await request(port, "/api/project/alpha/slot/cc", { method: "POST", body: { on: false } });
+    const ccPairOffAction = ccPairOffResp.json && ccPairOffResp.json.actionId ? await waitForAction(port, ccPairOffResp.json.actionId) : null;
+    const statePairOff = await request(port, "/api/state");
+    const rowPairOff = statePairOff.json.projects.find((p) => p.id === "alpha");
+    check("R5 API CC button OFF removes both pair panes and leaves collab pending", (
+      ccPairOffResp.json && ccPairOffResp.json.queued === true &&
+      ccPairOffAction && ccPairOffAction.status === "succeeded" &&
+      rowPairOff.action && rowPairOff.action.label === "slot:alpha:cc:off" &&
+      rowPairOff.open === true &&
+      rowPairOff.slots.cc === false &&
+      rowPairOff.slots.cdx === false &&
+      rowPairOff.collab.enabled === true &&
+      rowPairOff.collab.active === false
     ));
 
     const offResp = await request(port, "/api/project/alpha/collab", { method: "POST", body: { on: false } });
@@ -1568,6 +1976,7 @@ function countLog(fakes, event) {
       offAction && offAction.status === "succeeded" &&
       rowOff.action && rowOff.action.label === "collab:alpha:off" &&
       rowOff.collab && rowOff.collab.enabled === false &&
+      rowOff.collab.active === false &&
       rowOff.collab.running === false &&
       saved.projects[0].collab === false
     ));
@@ -1581,6 +1990,7 @@ function countLog(fakes, event) {
       script.includes("function toggleCollab(id, on)") &&
       script.includes("/api/project/${encodeURIComponent(id)}/collab") &&
       script.includes("p.collab") &&
+      script.includes("active") &&
       script.includes("data-action=\"collab\"")
     ));
 
@@ -1621,6 +2031,325 @@ EOF
 }
 
 if ! run_r5_collab_checks; then
+  finish
+fi
+
+run_r6_collab_delivery_checks() {
+  local phase_dir="$TEST_TMP_DIR/r6-collab-delivery"
+  local results
+  local rc
+  local saw_output=0
+  mkdir -p "$phase_dir"
+
+  results="$(
+    "$NODE_BIN" - "$DIR" "$phase_dir" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const { spawnSync } = require("child_process");
+
+const repo = process.argv[2];
+const phaseDir = process.argv[3];
+const realSqlite3 = spawnSync("bash", ["-lc", "command -v sqlite3"], { encoding: "utf8" }).stdout.trim();
+
+let failed = 0;
+function check(label, ok) {
+  if (ok) console.log("PASS\t" + label);
+  else {
+    failed += 1;
+    console.log("FAIL\t" + label);
+  }
+}
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+function writeExecutable(file, body) { fs.writeFileSync(file, body, { mode: 0o755 }); }
+function readJsonLines(file) {
+  try { return fs.readFileSync(file, "utf8").trim().split(/\n+/).filter(Boolean).map((line) => JSON.parse(line)); }
+  catch (_) { return []; }
+}
+function sqlite(db, sql) {
+  const res = spawnSync(realSqlite3, [db, sql], { encoding: "utf8" });
+  if (res.status !== 0) throw new Error(res.stderr || res.stdout || "sqlite failed");
+  return res.stdout;
+}
+function makeCtl(rows) {
+  return {
+    teamName(id) { return String(id).replace(/[^A-Za-z0-9_-]/g, "-"); },
+    async getState() { return { projects: rows(), globalRows: [] }; },
+    async sendToSurface(wsRef, surfaceRef, text) {
+      sends.push({ wsRef, surfaceRef, text });
+    },
+  };
+}
+
+(async () => {
+  try {
+    if (!realSqlite3) {
+      check("R6 sqlite3 executable is available for collab delivery tests", false);
+      process.exit(1);
+    }
+
+    const db = path.join(phaseDir, "agmsg.sqlite3");
+    const sqliteLog = path.join(phaseDir, "sqlite-log.jsonl");
+    const sqliteWrapper = path.join(phaseDir, "sqlite3-wrapper");
+    writeExecutable(sqliteWrapper, `#!/usr/bin/env node
+const fs = require("fs");
+const { spawnSync } = require("child_process");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(sqliteLog)}, JSON.stringify({ args }) + "\\n");
+if (!args.includes("-readonly")) {
+  console.error("missing -readonly");
+  process.exit(64);
+}
+const res = spawnSync(process.env.REAL_SQLITE3, args, { stdio: "inherit" });
+process.exit(res.status == null ? 1 : res.status);
+`);
+
+    sqlite(db, [
+      "CREATE TABLE messages (id INTEGER PRIMARY KEY, created_at TEXT, team TEXT, from_agent TEXT, to_agent TEXT, body TEXT, read_at TEXT);",
+      "INSERT INTO messages (id, created_at, team, from_agent, to_agent, body, read_at) VALUES",
+      "(1, '2026-06-08T00:00:01Z', 'alpha', 'claude', 'codex', 'SECRET_BODY_ALPHA', NULL),",
+      "(2, '2026-06-08T00:00:02Z', 'alpha', 'claude', 'codex', 'already read', '2026-06-08T00:00:03Z'),",
+      "(3, '2026-06-08T00:00:03Z', 'alpha', 'bob', 'codex', 'wrong from', NULL),",
+      "(4, '2026-06-08T00:00:04Z', 'beta', 'claude', 'codex', 'wrong team', NULL),",
+      "(0, '2026-06-08T00:00:05Z', 'alpha', 'codex', 'claude', 'wrong direction', NULL);",
+    ].join(" "));
+
+    const deliveryModule = require(path.join(repo, "collab-delivery.js"));
+    const readOpts = {
+      dbPath: db,
+      sqlite3Bin: sqliteWrapper,
+      env: { ...process.env, REAL_SQLITE3: realSqlite3 },
+    };
+    const unread = await deliveryModule.readUnreadWakeMessages("alpha", readOpts);
+    const sqliteCalls = readJsonLines(sqliteLog);
+    check("R6 delivery unread filter uses sqlite3 -readonly", (
+      sqliteCalls.length >= 1 &&
+      sqliteCalls.every((call) => Array.isArray(call.args) && call.args.includes("-readonly"))
+    ));
+    check("R6 delivery unread filter selects only team/from claude/to codex/read_at NULL", (
+      unread.length === 1 &&
+      unread[0].id === 1 &&
+      unread[0].team === "alpha" &&
+      unread[0].from === "claude" &&
+      unread[0].to === "codex" &&
+      !Object.prototype.hasOwnProperty.call(unread[0], "body")
+    ));
+
+    let sends = [];
+    let now = 1000;
+    let activeRows = [{
+      id: "alpha",
+      team: "alpha",
+      open: true,
+      wsRef: "workspace:1",
+      slotRefs: { cc: "surface:cc", cdx: "surface:cdx" },
+      collab: { enabled: true, active: true },
+      surfaces: [
+        { ref: "surface:cc", title: "cmuxdash:slot:cc", slot: "cc" },
+        { ref: "surface:first", title: "terminal", processes: ["codex"] },
+        { ref: "surface:cdx", title: "cmuxdash:slot:cdx", slot: "cdx" },
+      ],
+    }];
+    const ctl = {
+      teamName(id) { return String(id).replace(/[^A-Za-z0-9_-]/g, "-"); },
+      async getState() { return { projects: activeRows, globalRows: [] }; },
+      async sendToSurface(wsRef, surfaceRef, text) {
+        sends.push({ wsRef, surfaceRef, text });
+      },
+    };
+    const delivery = deliveryModule.createCollabDelivery({
+      ctl,
+      dbPath: db,
+      sqlite3Bin: sqliteWrapper,
+      env: { ...process.env, REAL_SQLITE3: realSqlite3 },
+      intervalMs: 0,
+      retryMs: 50,
+      minWakeIntervalMs: 0,
+      now: () => now,
+    });
+
+    await delivery.tick();
+    let snap = delivery.snapshot().projects.alpha;
+    check("R6 delivery sends fixed wake text only and never includes agmsg body", (
+      sends.length === 1 &&
+      sends[0].text === deliveryModule.DEFAULT_WAKE_TEXT &&
+      !sends[0].text.includes("SECRET_BODY_ALPHA")
+    ));
+    check("R6 delivery sends only to cmuxdash:slot:cdx marker surface", (
+      sends[0].surfaceRef === "surface:cdx" &&
+      sends[0].surfaceRef !== "surface:first"
+    ));
+    check("R6 delivery keeps pending and does not advance HWM after cmux send success alone", (
+      snap &&
+      snap.pending.length === 1 &&
+      snap.pending[0].id === 1 &&
+      snap.highWater === 0 &&
+      snap.sentHighWater === 1
+    ));
+
+    await delivery.tick();
+    check("R6 delivery pending unread does not retry before retry interval", sends.length === 1);
+    now += 60;
+    await delivery.tick();
+    snap = delivery.snapshot().projects.alpha;
+    check("R6 delivery retries pending unread after retry interval", (
+      sends.length === 2 &&
+      snap.pending[0].attempts === 2 &&
+      snap.highWater === 0
+    ));
+
+    sqlite(db, "UPDATE messages SET read_at='2026-06-08T00:01:00Z' WHERE id=1;");
+    await delivery.tick();
+    snap = delivery.snapshot().projects.alpha;
+    check("R6 delivery marks delivered and advances HWM only after read_at", (
+      snap.pending.length === 0 &&
+      snap.highWater === 1
+    ));
+
+    sqlite(db, "INSERT INTO messages (id, created_at, team, from_agent, to_agent, body, read_at) VALUES (6, '2026-06-08T00:02:00Z', 'alpha', 'claude', 'codex', 'reply-pending-body', NULL);");
+    now += 60;
+    await delivery.tick();
+    sqlite(db, "INSERT INTO messages (id, created_at, team, from_agent, to_agent, body, read_at) VALUES (7, '2026-06-08T00:02:10Z', 'alpha', 'codex', 'claude', 'reply', NULL);");
+    await delivery.tick();
+    snap = delivery.snapshot().projects.alpha;
+    check("R6 delivery treats codex reply as delivered", (
+      snap.pending.length === 0 &&
+      snap.highWater === 6
+    ));
+
+    sends = [];
+    activeRows = [{
+      id: "alpha",
+      team: "alpha",
+      open: true,
+      wsRef: "workspace:1",
+      slotRefs: { cdx: "surface:first" },
+      collab: { enabled: true, active: false },
+      surfaces: [{ ref: "surface:first", title: "terminal", processes: ["codex"] }],
+    }];
+    const markerOnly = deliveryModule.createCollabDelivery({
+      ctl,
+      readUnreadWakeMessages: async () => [{ id: 99, createdAt: "now" }],
+      readDeliveryStatus: async () => ({ delivered: false }),
+      intervalMs: 0,
+      minWakeIntervalMs: 0,
+      now: () => now,
+    });
+    await markerOnly.tick();
+    check("R6 delivery refuses first terminal/process=codex fallback without cdx marker", sends.length === 0);
+
+    sends = [];
+    activeRows = [{
+      id: "alpha",
+      team: "alpha",
+      open: true,
+      wsRef: "workspace:1",
+      slotRefs: { cdx: "surface:cdx" },
+      collab: { enabled: true, active: true },
+      surfaces: [{ ref: "surface:cdx", title: "cmuxdash:slot:cdx", slot: "cdx" }],
+    }];
+    const cdxOnly = deliveryModule.createCollabDelivery({
+      ctl,
+      readUnreadWakeMessages: async () => [{ id: 100, createdAt: "now" }],
+      readDeliveryStatus: async () => ({ delivered: false }),
+      intervalMs: 0,
+      minWakeIntervalMs: 0,
+      now: () => now,
+    });
+    await cdxOnly.tick();
+    check("R6 delivery active predicate requires cc/cdx pair refs", sends.length === 0);
+
+    let slowStarted = false;
+    const slowDelivery = deliveryModule.createCollabDelivery({
+      ctl: makeCtl(() => [{
+        id: "slow",
+        team: "slow",
+        open: true,
+        wsRef: "workspace:slow",
+        slotRefs: { cc: "surface:slow-cc", cdx: "surface:slow" },
+        collab: { enabled: true, active: true },
+      }]),
+      readUnreadWakeMessages: async () => {
+        slowStarted = true;
+        await sleep(80);
+        return [];
+      },
+      readDeliveryStatus: async () => ({ delivered: false }),
+      sendWake: async () => {},
+      intervalMs: 0,
+      minWakeIntervalMs: 0,
+      now: () => now,
+    });
+    const firstTick = slowDelivery.tick();
+    while (!slowStarted) await sleep(5);
+    const secondTick = await slowDelivery.tick();
+    await firstTick;
+    check("R6 delivery single in-flight guard suppresses concurrent duplicate ticks", secondTick && secondTick.skipped === "in-flight");
+
+    let failFirst = true;
+    const failRows = [{
+      id: "fail",
+      team: "fail",
+      open: true,
+      wsRef: "workspace:fail",
+      slotRefs: { cc: "surface:fail-cc", cdx: "surface:fail" },
+      collab: { enabled: true, active: true },
+    }];
+    const failDelivery = deliveryModule.createCollabDelivery({
+      ctl: makeCtl(() => failRows),
+      readUnreadWakeMessages: async () => [{ id: 200, createdAt: "now" }],
+      readDeliveryStatus: async () => ({ delivered: false }),
+      sendWake: async () => {
+        if (failFirst) {
+          failFirst = false;
+          throw new Error("send failed");
+        }
+      },
+      intervalMs: 0,
+      retryMs: 10,
+      minWakeIntervalMs: 0,
+      now: () => now,
+    });
+    await failDelivery.tick();
+    let failSnap = failDelivery.snapshot().projects.fail;
+    now += 11;
+    await failDelivery.tick();
+    failSnap = failDelivery.snapshot().projects.fail;
+    check("R6 delivery failure leaves message pending and eligible for retry", (
+      failSnap.pending.length === 1 &&
+      failSnap.pending[0].attempts === 2 &&
+      failSnap.pending[0].lastError === null
+    ));
+  } catch (err) {
+    failed += 1;
+    console.log("FAIL\tR6 runner exception: " + (err && err.message ? err.message : err));
+  }
+  process.exit(failed ? 1 : 0);
+})();
+NODE
+  )"
+  rc=$?
+
+  while IFS="$(printf '\t')" read -r status label; do
+    [ -z "$status" ] && continue
+    saw_output=1
+    case "$status" in
+      PASS) pass "$label" ;;
+      FAIL) fail "$label" ;;
+      *) info "R6 output: $status $label" ;;
+    esac
+  done <<EOF
+$results
+EOF
+
+  if [ "$saw_output" -eq 0 ]; then
+    fail "R6 runner produced no output"
+  fi
+  if [ "$rc" -ne 0 ]; then
+    return "$rc"
+  fi
+}
+
+if ! run_r6_collab_delivery_checks; then
   finish
 fi
 
@@ -3104,6 +3833,38 @@ const surfaces = (s.surfaces || [])
 process.stdout.write(JSON.stringify({ surfaces }) + "\n");
 NODE
     ;;
+  new-pane)
+    workspace=""
+    direction=""
+    type="terminal"
+    while [ "\$#" -gt 0 ]; do
+      case "\$1" in
+        --workspace) workspace="\${2:-}"; shift 2 ;;
+        --direction) direction="\${2:-}"; shift 2 ;;
+        --type) type="\${2:-}"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    "\$NODE_BIN" - "\$STATE" "\$workspace" "\$direction" "\$type" <<'NODE'
+const fs = require("fs");
+const file = process.argv[2];
+const workspace = process.argv[3] || "";
+const direction = process.argv[4] || "";
+const type = process.argv[5] || "terminal";
+let s = { panes: [], surfaces: [], nextPane: 1, nextSurface: 1 };
+try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
+s.panes = Array.isArray(s.panes) ? s.panes : [];
+s.surfaces = Array.isArray(s.surfaces) ? s.surfaces : [];
+const paneRef = "pane:" + (s.nextPane || 1);
+const surfaceRef = "surface:" + (s.nextSurface || 1);
+s.nextPane = (s.nextPane || 1) + 1;
+s.nextSurface = (s.nextSurface || 1) + 1;
+s.panes.push({ ref: paneRef, workspace, index: s.panes.filter((p) => !workspace || p.workspace === workspace).length, direction });
+s.surfaces.push({ ref: surfaceRef, workspace, pane: paneRef, title: "terminal", type, process: "zsh" });
+fs.writeFileSync(file, JSON.stringify(s) + "\n");
+process.stdout.write(surfaceRef + "\n");
+NODE
+    ;;
   new-surface)
     workspace=""
     pane=""
@@ -3135,20 +3896,35 @@ process.stdout.write(surfaceRef + "\n");
 NODE
     ;;
   close-surface)
+    workspace=""
     surface=""
     while [ "\$#" -gt 0 ]; do
       case "\$1" in
+        --workspace) workspace="\${2:-}"; shift 2 ;;
         --surface) surface="\${2:-}"; shift 2 ;;
         *) shift ;;
       esac
     done
-    "\$NODE_BIN" - "\$STATE" "\$surface" <<'NODE'
+    "\$NODE_BIN" - "\$STATE" "\$workspace" "\$surface" <<'NODE'
 const fs = require("fs");
 const file = process.argv[2];
-const surface = process.argv[3] || "";
-let s = { surfaces: [] };
+const workspace = process.argv[3] || "";
+const surface = process.argv[4] || "";
+let s = { panes: [], surfaces: [] };
 try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
-s.surfaces = (s.surfaces || []).filter((x) => x && x.ref !== surface);
+if (surface.startsWith("pane:")) {
+  s.panes = (s.panes || []).filter((p) => !(p && p.ref === surface && (!workspace || p.workspace === workspace)));
+  s.surfaces = (s.surfaces || []).filter((x) => !(x && x.pane === surface && (!workspace || x.workspace === workspace)));
+  fs.writeFileSync(file, JSON.stringify(s) + "\n");
+  process.exit(0);
+}
+const removed = (s.surfaces || []).filter((x) => x && x.ref === surface && (!workspace || x.workspace === workspace));
+s.surfaces = (s.surfaces || []).filter((x) => !(x && x.ref === surface && (!workspace || x.workspace === workspace)));
+const removedPanes = new Set(removed.map((x) => x && x.pane).filter(Boolean));
+s.panes = (s.panes || []).filter((pane) => {
+  if (!pane || !removedPanes.has(pane.ref)) return true;
+  return s.surfaces.some((x) => x && x.pane === pane.ref);
+});
 fs.writeFileSync(file, JSON.stringify(s) + "\n");
 NODE
     ;;
@@ -3441,6 +4217,17 @@ let obj;
 try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
 const surfaces = Array.isArray(obj.surfaces) ? obj.surfaces : [];
 process.stdout.write(String(surfaces.length));
+'
+}
+
+pane_count_for_workspace() {
+  local workspace_ref="$1"
+  CMUX_QUIET=1 "$CMUX_BIN" list-panes --workspace "$workspace_ref" --json 2>/dev/null | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+const panes = Array.isArray(obj.panes) ? obj.panes : [];
+process.stdout.write(String(panes.length));
 '
 }
 
@@ -4382,15 +5169,19 @@ slot_action_and_wait() {
 assert_cc_slot_toggle() {
   local workspace_ref
   local before
+  local panes_before
   local after_on
+  local panes_after_on
   local after_repeat
   local after_off
+  local panes_after_off
   workspace_ref="$(workspace_ref_by_tag 2>/dev/null || true)"
   if [ -z "$workspace_ref" ]; then
     fail "cannot test slot toggle without tagged workspace"
     return 1
   fi
   before="$(surface_count_for_workspace "$workspace_ref" 2>/dev/null || true)"
+  panes_before="$(pane_count_for_workspace "$workspace_ref" 2>/dev/null || true)"
   if [ -z "$before" ]; then
     fail "could not count surfaces before CC slot toggle"
     return 1
@@ -4403,10 +5194,13 @@ assert_cc_slot_toggle() {
   fi
   if ! slot_action_and_wait cc true on; then return 1; fi
   after_on="$(surface_count_for_workspace "$workspace_ref" 2>/dev/null || true)"
+  panes_after_on="$(pane_count_for_workspace "$workspace_ref" 2>/dev/null || true)"
   if [ -n "$after_on" ] && [ "$after_on" -gt "$before" ]; then
     pass "CC slot ON increased surface count (${before} -> ${after_on})"
+  elif [ -n "$after_on" ] && [ "$after_on" = "$before" ]; then
+    pass "CC slot ON reused existing top surface (${before} -> ${after_on})"
   else
-    fail "CC slot ON did not increase surface count (${before} -> ${after_on:-unknown})"
+    fail "CC slot ON did not create or reuse a visible surface (${before} -> ${after_on:-unknown})"
     return 1
   fi
   if ! slot_action_and_wait cc true on; then return 1; fi
@@ -4419,10 +5213,20 @@ assert_cc_slot_toggle() {
   fi
   if ! slot_action_and_wait cc false off; then return 1; fi
   after_off="$(surface_count_for_workspace "$workspace_ref" 2>/dev/null || true)"
+  panes_after_off="$(pane_count_for_workspace "$workspace_ref" 2>/dev/null || true)"
   if [ -n "$after_off" ] && [ "$after_off" -lt "$after_on" ]; then
     pass "CC slot OFF decreased surface count (${after_on} -> ${after_off})"
   else
     fail "CC slot OFF did not decrease surface count (${after_on} -> ${after_off:-unknown})"
+    return 1
+  fi
+  if [ -n "$panes_after_on" ] && [ -n "$panes_after_off" ] && [ "$panes_after_off" -lt "$panes_after_on" ]; then
+    pass "CC slot OFF decreased pane count (${panes_after_on} -> ${panes_after_off})"
+  elif [ -n "$panes_before" ] && [ -n "$panes_after_on" ] && [ "$panes_after_on" = "$panes_before" ] && [ -n "$panes_after_off" ] && [ "$panes_after_off" = "$panes_after_on" ]; then
+    fail "CC slot OFF left reused top pane in place (${panes_after_on} -> ${panes_after_off})"
+    return 1
+  else
+    fail "CC slot OFF did not decrease pane count (${panes_after_on:-unknown} -> ${panes_after_off:-unknown})"
     return 1
   fi
 }

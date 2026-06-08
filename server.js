@@ -5,6 +5,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const ctl = require('./cmuxctl');
+const { createCollabDelivery } = require('./collab-delivery');
 
 const PORT = parseInt(process.env.CMUX_DASH_PORT || '7799', 10);
 const HOST = process.env.CMUX_DASH_HOST || '127.0.0.1';
@@ -41,6 +42,7 @@ let actionChain = Promise.resolve();
 const actions = [];
 let selfExitScheduled = false;
 let unhealthyExitCheckInFlight = false;
+const collabDelivery = createCollabDelivery({ ctl });
 
 function nowIso() { return new Date().toISOString(); }
 function actionParts(label) {
@@ -188,7 +190,11 @@ async function api(req, res, urlPath) {
     if (req.method === 'POST' && m) {
       const id = decodeURIComponent(m[2]);
       if (m[1] === 'open')  return defer(res, () => ctl.openProject(id, { focus: true }), "open:"+id);
-      if (m[1] === 'close') return defer(res, () => ctl.closeProject(id), "close:"+id);
+      if (m[1] === 'close') return defer(res, async () => {
+        const result = await ctl.closeProject(id);
+        collabDelivery.forgetProject(id);
+        return result;
+      }, "close:"+id);
       if (m[1] === 'focus') return defer(res, () => ctl.focusProject(id), "focus:"+id);
     }
     if (req.method === 'POST' && slotToggle) {
@@ -196,20 +202,34 @@ async function api(req, res, urlPath) {
       const slot = decodeURIComponent(slotToggle[2]);
       const body = await readBody(req);
       const on = body && body.on === true;
-      return defer(res, () => ctl.ensureSlot(id, slot, on), `slot:${id}:${slot}:${on ? 'on' : 'off'}`);
+      return defer(res, () => (
+        slot === 'cc' && ctl.projectCollabEnabledById(id)
+          ? ctl.ensureCollabPair(id, on)
+          : ctl.ensureSlot(id, slot, on)
+      ), `slot:${id}:${slot}:${on ? 'on' : 'off'}`);
     }
     if (req.method === 'POST' && collabToggle) {
       const id = decodeURIComponent(collabToggle[1]);
       const body = await readBody(req);
       const on = body && body.on === true;
-      return defer(res, () => ctl.ensureProjectCollab(id, on), `collab:${id}:${on ? 'on' : 'off'}`);
+      return defer(res, async () => {
+        const result = await ctl.ensureProjectCollab(id, on);
+        if (!on) collabDelivery.forgetProject(id);
+        return result;
+      }, `collab:${id}:${on ? 'on' : 'off'}`);
     }
     if (req.method === 'POST' && urlPath === '/api/reorder') {
       const body = await readBody(req);
       return defer(res, () => ctl.reorderProjects(body.order), 'reorder');
     }
     if (req.method === 'POST' && urlPath === '/api/open-all')  return defer(res, () => ctl.openAll());
-    if (req.method === 'POST' && urlPath === '/api/close-all') return defer(res, () => ctl.closeAll());
+    if (req.method === 'POST' && urlPath === '/api/close-all') return defer(res, async () => {
+      const result = await ctl.closeAll();
+      for (const item of Array.isArray(result) ? result : []) {
+        if (item && item.id) collabDelivery.forgetProject(item.id);
+      }
+      return result;
+    });
     if (req.method === 'POST' && urlPath === '/api/restart') {
       sendJson(res, 202, { ok: true, restarting: true });
       scheduleExit('manual restart requested via /api/restart', 75);
@@ -274,4 +294,6 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`cmux-dashboard → http://${HOST}:${PORT}`);
   console.log(`  agmsg installed: ${ctl.agmsgAvailable()}`);
+  const delivery = collabDelivery.start();
+  if (delivery.started) console.log(`  collab pane delivery: every ${delivery.intervalMs}ms`);
 });

@@ -38,3 +38,9 @@
 | 回帰 test.sh | ✅ 201 PASS |
 
 **運用の正解**: `./cmux-dash up`（または `server`）で起動。background/launchd起動は孤児化するので不可。cmux.appは起動したままに。
+
+## グリッド化 進捗（2026-06-08, /loop運用）
+- Phase1 縦分割UI: codex実装。**スロット検出のroot cause（claude/codexがタイトルを上書きしmarkerが消える）をclaudeが実cmuxで特定→state記録方式(slotRefs)へ修正済み**。直接実機テストで CC on→検出OK / off→除去OK を確認。
+- ただし `./test.sh` の実cmux slot-off チェックが**環境過負荷で不安定**（Codex.app/Codex Computer Use/Chrome由来のゾンビ大量発生→fork失敗・cmux操作遅延）。コードは正しいが自動フル検証が timing で揺れる。
+- /loop は環境ブロックのため一旦停止。資源を空けてから再開推奨。
+- 残: test.sh slot-off を timing 耐性化、collab pane-delivery 実機反応確認、Phase2(複数列+側パネル)。

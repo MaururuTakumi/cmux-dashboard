@@ -15,12 +15,12 @@ of a live cmux pane prevents the common detached/orphan server failure mode.
 The dashboard can:
 
 - Open, close, and focus project workspaces.
-- Toggle individual slots: `CC`, `Cdx`, `Yazi`, and `Term`.
+- Toggle visible vertical split slots: `CC`, `Cdx`, `Yazi`, and `Term`.
 - Show monitoring panels for cmux health, memory, actions, and agent messages.
 - Reorder projects, add new projects, and delete rows from the local config.
-- Optionally prepare Claude/Codex collaboration through agmsg. Automatic collab
-  bridge startup is default OFF (`collab: false`) and only runs when explicitly
-  enabled.
+- Prepare Claude/Codex collaboration through agmsg by default. Collab uses
+  visible pane delivery to the `Cdx` slot and does not start a headless Codex
+  bridge.
 
 ## 必要要件
 
@@ -80,8 +80,8 @@ dashboard server.
 
 ### Slotトグル
 
-各行の `CC`、`Cdx`、`Yazi`、`Term` をON/OFFできます。未起動の行でslotをONにすると、そのプロジェクトの
-cmux workspace が自動で開きます。slotごとの起動コマンドは `defaults.slotCommands` またはプロジェクト単位の
+各行の `CC`、`Cdx`、`Yazi`、`Term` をON/OFFできます。slotは同一pane内のタブではなく、縦分割paneとして上から順に表示されます。未起動の行でslotをONにすると、そのプロジェクトの
+cmux workspace が自動で開きます。cmuxが初期terminalを1つ作る場合、最初のslotはそのpaneを再利用し、以降のslotは下方向のsplitとして追加します。slotごとの起動コマンドは `defaults.slotCommands` またはプロジェクト単位の
 `slotCommands` で上書きできます。
 
 ### 監視パネル
@@ -94,14 +94,14 @@ UIは `/api/state`、`/api/metrics`、`/api/agmsg/:id` を定期取得し、cmux
 
 ### 自動collab
 
-`collab` は既定OFFです。自動collab bridgeを使うプロジェクトだけ、`projects.json` で明示的に有効化してください。
+`collab` は通常プロジェクトで既定ONです。プロジェクトを開くと `CC` が上、`Cdx` が下の縦分割ペアを作り、claude から codex 宛ての未読 agmsg がある場合は `Cdx` slot に固定 wake 文だけを投入します。本文は `Cdx` 側が agmsg inbox で読みます。collab有効時の `CC` ボタンはペアのON/OFFを担当し、`Cdx` 単独起動はcollabをOFFにした行で使います。headless Codex bridge は起動しません。
 
 ```json
 {
   "id": "sample-app",
   "name": "Sample App",
   "path": "~/projects/sample-app",
-  "collab": true
+  "collab": false
 }
 ```
 

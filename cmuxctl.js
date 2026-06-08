@@ -4,7 +4,7 @@
 // R1 rebuild: workspace 内の terminal surface を slot として扱う。
 //   cc=claude, cdx=codex, yazi=yazi, term=shell
 // workspace.description タグ "cmuxdash:<id>" で識別する。
-const { execFile, spawn } = require('child_process');
+const { execFile } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -15,7 +15,7 @@ const PROJECTS_EXAMPLE_FILE = process.env.CMUX_DASH_PROJECTS_EXAMPLE_FILE || pat
 const AGMSG_DIR = path.join(os.homedir(), '.agents', 'skills', 'agmsg');
 const AGMSG_SCRIPTS = path.join(AGMSG_DIR, 'scripts');
 const COLLAB_SKILL_DIR = path.join(os.homedir(), '.claude', 'skills', 'claude-codex-collab');
-const DEFAULT_COLLAB = false;
+const DEFAULT_COLLAB = true;
 const CMUX_CONTEXT_ENV_KEYS = [
   'CMUX_WORKSPACE_ID',
   'CMUX_TAB_ID',
@@ -649,20 +649,23 @@ function projectCollabEnabled(project, cfg = {}) {
   return normalizeCollabSetting(cfg.defaults && hasOwn(cfg.defaults, 'collab') ? cfg.defaults.collab : undefined, DEFAULT_COLLAB);
 }
 
+function projectCollabEnabledById(id) {
+  const cfg = loadConfig();
+  const project = findConfiguredRow(cfg, id);
+  if (!project) throw new Error('unknown project: ' + id);
+  return projectCollabEnabled(project, cfg);
+}
+
 function collabBridgePath() {
   return process.env.CMUX_DASH_COLLAB_BRIDGE || path.join(COLLAB_SKILL_DIR, 'bridge', 'agmsg-codex-bridge.sh');
 }
 
 function collabInitPath() {
-  return process.env.CMUX_DASH_COLLAB_INIT || path.join(COLLAB_SKILL_DIR, 'scripts', 'collab-init.sh');
+  return process.env.CMUX_DASH_COLLAB_INIT || path.join(COLLAB_SKILL_DIR, 'scripts', 'collab.sh');
 }
 
 function collabPgrepPath() {
   return process.env.CMUX_DASH_COLLAB_PGREP || 'pgrep';
-}
-
-function collabNohupPath() {
-  return process.env.CMUX_DASH_COLLAB_NOHUP || 'nohup';
 }
 
 function collabKillPath() {
@@ -721,11 +724,10 @@ function writeCollabConfigFallback(projectDir, opts = {}) {
 
 async function ensureCollabConfig(projectDir, opts = {}) {
   const configFile = collabConfigFile(projectDir);
-  if (fs.existsSync(configFile)) return { action: 'exists', configFile };
-
   const init = collabInitPath();
   if (fs.existsSync(init)) {
-    const args = [projectDir];
+    const existed = fs.existsSync(configFile);
+    const args = path.basename(init) === 'collab.sh' ? ['init', projectDir] : [projectDir];
     if (opts.team) args.push('--team', opts.team);
     args.push('--no-start');
     await run(init, args, {
@@ -733,9 +735,10 @@ async function ensureCollabConfig(projectDir, opts = {}) {
       timeout: intEnv('CMUX_DASH_COLLAB_INIT_TIMEOUT_MS', 30000),
       env: { ...process.env },
     });
-    return { action: 'initialized', configFile };
+    return { action: existed ? 'refreshed' : 'initialized', configFile };
   }
 
+  if (fs.existsSync(configFile)) return { action: 'exists', configFile };
   writeCollabConfigFallback(projectDir, opts);
   return { action: 'created-fallback', configFile };
 }
@@ -792,33 +795,6 @@ async function isCollabRunning(projectDir) {
   return (await collabBridgeProcesses(projectDir)).length > 0;
 }
 
-async function startCollabBridge(projectDir) {
-  const dir = normalizeCollabProjectDir(projectDir, { create: true });
-  const existing = await collabBridgeProcesses(dir);
-  if (existing.length) {
-    return { started: false, alreadyRunning: true, running: true, pids: existing.map((p) => p.pid) };
-  }
-
-  const bridge = collabBridgePath();
-  if (!fs.existsSync(bridge)) throw new Error(`collab bridge not found: ${bridge}`);
-  const child = spawn(collabNohupPath(), [bridge, 'run', dir], {
-    cwd: dir,
-    detached: true,
-    stdio: 'ignore',
-    env: { ...process.env },
-  });
-  child.unref();
-  const waitMs = intEnv('CMUX_DASH_COLLAB_START_WAIT_MS', 1000);
-  const delayMs = Math.max(10, intEnv('CMUX_DASH_COLLAB_START_DELAY_MS', 80));
-  const deadline = Date.now() + waitMs;
-  let after = [];
-  do {
-    await sleep(delayMs);
-    after = await collabBridgeProcesses(dir);
-  } while (!after.length && Date.now() < deadline);
-  return { started: true, alreadyRunning: false, running: after.length > 0, pid: child.pid, pids: after.map((p) => p.pid) };
-}
-
 async function stopCollabBridge(projectDir) {
   const dir = normalizeCollabProjectDir(projectDir);
   setCollabDisabled(dir, true);
@@ -861,34 +837,62 @@ async function ensureCollab(projectDir, on, opts = {}) {
   const dir = normalizeCollabProjectDir(projectDir, { create: !!on });
   if (!on) {
     const stopped = await stopCollabBridge(dir);
-    return { ok: true, on: false, projectDir: dir, ...stopped };
+    return { ok: true, on: false, projectDir: dir, active: false, running: false, ...stopped };
   }
 
   const config = await ensureCollabConfig(dir, opts);
+  const stopped = await stopCollabBridge(dir);
   setCollabDisabled(dir, false);
-  const started = await startCollabBridge(dir);
-  return { ok: true, on: true, projectDir: dir, config, ...started };
+  return {
+    ok: true,
+    on: true,
+    projectDir: dir,
+    config,
+    setupOnly: true,
+    active: false,
+    running: false,
+    bridge: stopped,
+  };
 }
 
-async function projectCollabState(project, cfg = {}) {
+function collabActiveFromProjectState(projectState) {
+  return !!(
+    projectState &&
+    projectState.open &&
+    projectState.slots &&
+    projectState.slots.cc &&
+    projectState.slots.cdx &&
+    projectState.slotRefs &&
+    projectState.slotRefs.cc &&
+    projectState.slotRefs.cdx &&
+    projectState.slotRefs.cc !== projectState.slotRefs.cdx
+  );
+}
+
+async function projectCollabState(project, cfg = {}, projectState = null) {
   const enabled = projectCollabEnabled(project, cfg);
   const explicit = hasOwn(project, 'collab');
-  if (!project || (isGlobalProject(project) && !explicit)) return { enabled, running: false };
-  try {
-    return { enabled, running: await isCollabRunning(rowCwd(project)) };
-  } catch (e) {
-    return { enabled, running: false, error: summarizeError(e) };
-  }
+  const active = enabled && !(isGlobalProject(project) && !explicit) && collabActiveFromProjectState(projectState);
+  return { enabled, active, running: active, mode: 'pane-delivery' };
 }
 
 async function ensureProjectCollab(id, on) {
   const cfg = loadConfig();
   const project = findConfiguredRow(cfg, id);
   if (!project) throw new Error('unknown project: ' + id);
+  const claudeMd = on ? ensureClaudeMd(project, cfg) : { ok: true, action: 'skipped-off' };
   const result = await ensureCollab(rowCwd(project), !!on, { team: teamName(project.id) });
   project.collab = !!on;
   saveConfig(cfg);
-  return { id, collab: { enabled: !!on, running: await isCollabRunning(rowCwd(project)) }, result };
+  let projectState = null;
+  try { projectState = await getProjectState(id); } catch (_) {}
+  const slots = [];
+  if (on && projectState && projectState.open) {
+    slots.push(...await ensureCollabSlots(id));
+    try { projectState = await getProjectState(id); } catch (_) {}
+  }
+  const active = !!on && collabActiveFromProjectState(projectState);
+  return { id, collab: { enabled: !!on, active, running: active, mode: 'pane-delivery' }, claudeMd, slots, result };
 }
 
 // ---- cmux 状態 ----
@@ -958,10 +962,62 @@ function emptySlotRefs() {
   }, {});
 }
 
-function normalizeSurfaces(obj, paneRef = null) {
+const slotRefState = new Map();
+
+function cleanRef(value) {
+  const text = String(value || '').trim();
+  return text || null;
+}
+
+function projectSlotRefState(projectId, { create = false } = {}) {
+  const key = cleanRef(projectId);
+  if (!key) return null;
+  let records = slotRefState.get(key);
+  if (!records && create) {
+    records = {};
+    slotRefState.set(key, records);
+  }
+  return records || null;
+}
+
+function recordSlotRef(projectId, slot, refs = {}) {
+  if (!SLOT_DEFS[slot]) return null;
+  const surfaceRef = cleanRef(refs.surfaceRef || refs.ref);
+  if (!surfaceRef) return null;
+  const records = projectSlotRefState(projectId, { create: true });
+  if (!records) return null;
+  records[slot] = {
+    surfaceRef,
+    paneRef: cleanRef(refs.paneRef),
+    wsRef: cleanRef(refs.wsRef),
+    updatedAt: new Date().toISOString(),
+  };
+  return records[slot];
+}
+
+function forgetSlotRef(projectId, slot) {
+  const key = cleanRef(projectId);
+  const records = projectSlotRefState(projectId);
+  if (!records || !SLOT_DEFS[slot]) return false;
+  const had = !!records[slot];
+  delete records[slot];
+  if (!SLOT_ORDER.some((key) => records[key])) {
+    slotRefState.delete(key);
+  }
+  return had;
+}
+
+function forgetProjectSlotRefs(projectId) {
+  const key = cleanRef(projectId);
+  return key ? slotRefState.delete(key) : false;
+}
+
+function normalizeSurfaces(obj, paneRef = null, pane = null) {
   return (Array.isArray(obj && obj.surfaces) ? obj.surfaces : []).map((surface) => ({
     ...surface,
     paneRef: surface.paneRef || surface.pane || paneRef,
+    paneTitle: surface.paneTitle || surface.paneName || (pane && (pane.title || pane.name || pane.description)) || null,
+    paneDescription: surface.paneDescription || (pane && pane.description) || null,
   }));
 }
 
@@ -983,14 +1039,14 @@ async function listWorkspaceSurfaces(wsRef) {
       if (!paneRef) continue;
       try {
         const obj = await cmuxJson(['list-pane-surfaces', '--workspace', wsRef, '--pane', paneRef]);
-        surfaces.push(...normalizeSurfaces(obj, paneRef));
+        surfaces.push(...normalizeSurfaces(obj, paneRef, pane));
       } catch (_) {}
     }
   }
   if (surfaces.length) return surfaces;
   try {
     const obj = await cmuxJson(['list-pane-surfaces', '--workspace', wsRef]);
-    return normalizeSurfaces(obj, panes[0] && panes[0].ref);
+    return normalizeSurfaces(obj, panes[0] && panes[0].ref, panes[0] || null);
   } catch (_) {
     return [];
   }
@@ -999,6 +1055,178 @@ async function listWorkspaceSurfaces(wsRef) {
 async function getDefaultPaneRef(wsRef) {
   const panes = await listWorkspacePanes(wsRef);
   return panes.length && panes[0].ref ? panes[0].ref : null;
+}
+
+function surfaceRefFromText(text) {
+  return (String(text || '').match(/surface:[^\s"']+/) || [])[0] || null;
+}
+
+function paneRefFromText(text) {
+  return (String(text || '').match(/pane:[^\s"']+/) || [])[0] || null;
+}
+
+function surfaceByRef(surfaces, ref) {
+  return (Array.isArray(surfaces) ? surfaces : []).find((surface) => surface && surface.ref === ref) || null;
+}
+
+function validateRecordedSlots(projectId, wsRef, panes, surfaces) {
+  const records = projectSlotRefState(projectId);
+  const live = {};
+  if (!records) return live;
+
+  const bySurface = new Map();
+  for (const surface of Array.isArray(surfaces) ? surfaces : []) {
+    if (surface && surface.ref) bySurface.set(surface.ref, surface);
+  }
+  const paneRefs = new Set((Array.isArray(panes) ? panes : []).map((pane) => pane && pane.ref).filter(Boolean));
+
+  for (const slot of SLOT_ORDER) {
+    const record = records[slot];
+    if (!record || !record.surfaceRef) continue;
+    const surface = bySurface.get(record.surfaceRef);
+    const livePaneRef = surface && cleanRef(surface.paneRef);
+    const wsOk = !record.wsRef || record.wsRef === wsRef;
+    const paneOk = !record.paneRef || (livePaneRef ? livePaneRef === record.paneRef : paneRefs.has(record.paneRef));
+    if (surface && wsOk && paneOk) {
+      if ((!record.paneRef && livePaneRef) || record.wsRef !== wsRef) {
+        recordSlotRef(projectId, slot, { surfaceRef: record.surfaceRef, paneRef: livePaneRef || record.paneRef, wsRef });
+      }
+      live[slot] = { surface, surfaceRef: record.surfaceRef, paneRef: livePaneRef || record.paneRef || null };
+    } else {
+      forgetSlotRef(projectId, slot);
+    }
+  }
+  return live;
+}
+
+function slotSurfacesInPane(state, paneRef) {
+  if (!paneRef) return [];
+  return (state.surfaces || []).filter((surface) => surface && surface.paneRef === paneRef && surface.slot);
+}
+
+function reusableInitialSurface(state) {
+  const surfaces = Array.isArray(state && state.surfaces) ? state.surfaces : [];
+  if (surfaces.some((surface) => surface && surface.slot)) return null;
+  const terminalSurfaces = surfaces.filter((surface) => (
+    surface &&
+    surface.ref &&
+    !surface.slot &&
+    (!surface.type || surface.type === 'terminal')
+  ));
+  return terminalSurfaces.length === 1 ? terminalSurfaces[0] : null;
+}
+
+async function closeSlotSurfaceRefs(state, refs) {
+  const uniqueRefs = Array.from(new Set((refs || []).filter(Boolean)));
+  for (const ref of uniqueRefs) {
+    await cmux(['close-surface', '--workspace', state.wsRef, '--surface', ref]);
+  }
+  return uniqueRefs.length;
+}
+
+async function closeSlotPaneRefs(state, paneRefs) {
+  const uniqueRefs = Array.from(new Set((paneRefs || []).filter(Boolean)));
+  let closed = 0;
+  for (const ref of uniqueRefs) {
+    try {
+      await cmux(['close-surface', '--workspace', state.wsRef, '--surface', ref]);
+      closed += 1;
+    } catch (_) {}
+  }
+  return closed;
+}
+
+function slotOwnedPaneRefs(state, slot) {
+  const panes = new Set();
+  for (const surface of state.surfaces || []) {
+    if (!surface || surface.slot !== slot || !surface.paneRef) continue;
+    const managed = slotSurfacesInPane(state, surface.paneRef);
+    if (managed.every((item) => item && item.slot === slot)) panes.add(surface.paneRef);
+  }
+  return panes;
+}
+
+function slotOffSurfaceRefs(state, slot, paneRefsToDrain = new Set()) {
+  const refs = [];
+  for (const surface of state.surfaces || []) {
+    if (!surface || !surface.ref) continue;
+    if (surface.slot === slot || (surface.paneRef && paneRefsToDrain.has(surface.paneRef))) {
+      refs.push(surface.ref);
+    }
+  }
+  return Array.from(new Set(refs));
+}
+
+function paneRefsHaveSurfaces(state, paneRefs) {
+  for (const surface of state.surfaces || []) {
+    if (surface && surface.paneRef && paneRefs.has(surface.paneRef)) return true;
+  }
+  return false;
+}
+
+async function closeSlotOwnedPaneSurfaces(id, state, slot) {
+  const paneRefsToDrain = slotOwnedPaneRefs(state, slot);
+  let next = state;
+  let closed = 0;
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const refs = slotOffSurfaceRefs(next, slot, paneRefsToDrain);
+    if (!refs.length && !next.slots[slot] && !paneRefsHaveSurfaces(next, paneRefsToDrain)) break;
+
+    closed += await closeSlotSurfaceRefs(next, refs);
+    await settle(Math.min(CMUX_SETTLE_MS, 500));
+    next = await getProjectState(id);
+
+    if (!next.slots[slot] && !paneRefsHaveSurfaces(next, paneRefsToDrain)) break;
+
+    if (paneRefsHaveSurfaces(next, paneRefsToDrain)) {
+      await closeSlotPaneRefs(next, Array.from(paneRefsToDrain));
+      await settle(Math.min(CMUX_SETTLE_MS, 500));
+      next = await getProjectState(id);
+      if (!next.slots[slot] && !paneRefsHaveSurfaces(next, paneRefsToDrain)) break;
+    }
+  }
+
+  return { next, closed, paneRefs: Array.from(paneRefsToDrain) };
+}
+
+async function repairSharedSlotPane(state, slot) {
+  const current = surfaceByRef(state.surfaces, state.slotRefs && state.slotRefs[slot]);
+  if (!current || !current.paneRef) return 0;
+  const slotSurfaces = slotSurfacesInPane(state, current.paneRef);
+  if (slotSurfaces.length <= 1) return 0;
+  return closeSlotSurfaceRefs(state, slotSurfaces.map((surface) => surface.ref));
+}
+
+async function createSplitPaneSurface(wsRef) {
+  const beforePanes = await listWorkspacePanes(wsRef);
+  const beforeSurfaces = await listWorkspaceSurfaces(wsRef);
+  const beforePaneRefs = new Set(beforePanes.map((pane) => pane && pane.ref).filter(Boolean));
+  const beforeSurfaceRefs = new Set(beforeSurfaces.map((surface) => surface && surface.ref).filter(Boolean));
+  const out = await cmux(['new-pane', '--type', 'terminal', '--direction', 'down', '--workspace', wsRef, '--focus', 'false']);
+  const outputSurfaceRef = surfaceRefFromText(out);
+  const outputPaneRef = paneRefFromText(out);
+  await settle(Math.min(CMUX_SETTLE_MS, 500));
+
+  const afterPanes = await listWorkspacePanes(wsRef);
+  const afterSurfaces = await listWorkspaceSurfaces(wsRef);
+  const createdPanes = afterPanes.filter((pane) => pane && pane.ref && !beforePaneRefs.has(pane.ref));
+  const createdSurfaces = afterSurfaces.filter((surface) => surface && surface.ref && !beforeSurfaceRefs.has(surface.ref));
+
+  let surface = outputSurfaceRef ? surfaceByRef(afterSurfaces, outputSurfaceRef) : null;
+  if (!surface && outputPaneRef) {
+    surface = createdSurfaces.find((item) => item.paneRef === outputPaneRef) || null;
+  }
+  if (!surface && createdPanes.length) {
+    const paneRefs = new Set(createdPanes.map((pane) => pane.ref));
+    surface = createdSurfaces.find((item) => paneRefs.has(item.paneRef)) || null;
+  }
+  if (!surface && createdSurfaces.length) surface = createdSurfaces[createdSurfaces.length - 1];
+  if (!surface && outputSurfaceRef) surface = { ref: outputSurfaceRef, paneRef: outputPaneRef || null };
+  if (!surface || !surface.ref) {
+    throw new Error(`new-pane did not return or create a terminal surface in ${wsRef}`);
+  }
+  return { surfaceRef: surface.ref, paneRef: surface.paneRef || outputPaneRef || null, split: true };
 }
 
 async function surfaceProcessMap(wsRef) {
@@ -1313,12 +1541,57 @@ function slotLaunchText(project, cfg, slot) {
   return `${prefix}; cd ${cwd} && exec ${cmd || SLOT_DEFS[slot].defaultCommand}\\n`;
 }
 
+function slotMarkerSearchText(surface) {
+  return [
+    surface && surface.title,
+    surface && surface.name,
+    surface && surface.command,
+    surface && surface.description,
+    surface && surface.paneTitle,
+    surface && surface.paneName,
+    surface && surface.paneDescription,
+  ].filter(Boolean).join('\n').toLowerCase();
+}
+
+function normalizedPath(value) {
+  const expanded = expandHome(value);
+  if (!expanded) return null;
+  try { return fs.realpathSync(expanded); } catch (_) {}
+  try { return path.resolve(expanded); } catch (_) { return String(expanded); }
+}
+
+function surfaceCwd(surface) {
+  return cleanRef(
+    surface && (
+      surface.cwd ||
+      surface.currentWorkingDirectory ||
+      surface.workingDirectory ||
+      surface.currentPath
+    ),
+  );
+}
+
+function surfaceMatchesProjectCwd(surface, project) {
+  const cwd = normalizedPath(surfaceCwd(surface));
+  const expected = normalizedPath(rowCwd(project));
+  return !!(cwd && expected && cwd === expected);
+}
+
+function recoverableSlotForSurface(surface, project) {
+  if (!surface || !surface.ref || !surfaceMatchesProjectCwd(surface, project)) return null;
+  const processMap = {};
+  processMap[surface.ref] = Array.isArray(surface.processes) ? surface.processes : [];
+  const slot = detectSlot(surface, processMap);
+  return slot && slot !== 'term' ? slot : null;
+}
+
 function detectSlot(surface, processMap = {}, opts = {}) {
-  const title = String(surface && (surface.title || surface.name || '') || '').toLowerCase();
+  const markerText = slotMarkerSearchText(surface);
   for (const slot of SLOT_ORDER) {
-    if (title.includes(slotMarker(slot))) return slot;
+    if (markerText.includes(slotMarker(slot))) return slot;
   }
   if (opts.explicitOnly) return null;
+  const title = String(surface && (surface.title || surface.name || '') || '').toLowerCase();
   if (/\bclaude\b/.test(title)) return 'cc';
   if (/\bcodex\b/.test(title)) return 'cdx';
   if (/\byazi\b/.test(title)) return 'yazi';
@@ -1344,24 +1617,43 @@ async function getProjectState(projectId) {
     wsRef: ws ? ws.ref : null,
     ref: ws ? ws.ref : null,
     selected: ws ? !!ws.selected : false,
+    panes: [],
     slots: emptySlots(false),
     slotRefs: emptySlotRefs(),
+    slotPaneRefs: emptySlotRefs(),
     surfaces: [],
     lastMessage: ws ? (ws.latest_conversation_message || null) : null,
     lastAt: ws ? (ws.latest_submitted_at || null) : null,
   };
-  if (!ws) return base;
+  if (!ws) {
+    forgetProjectSlotRefs(projectId);
+    return base;
+  }
 
+  base.panes = await listWorkspacePanes(ws.ref);
   const surfaces = await listWorkspaceSurfaces(ws.ref);
   const processes = await surfaceProcessMap(ws.ref);
+  const recordedSlots = validateRecordedSlots(projectId, ws.ref, base.panes, surfaces);
+  const slotByRecordedSurface = new Map();
+  for (const slot of SLOT_ORDER) {
+    if (recordedSlots[slot] && recordedSlots[slot].surfaceRef) {
+      slotByRecordedSurface.set(recordedSlots[slot].surfaceRef, slot);
+    }
+  }
   base.surfaces = surfaces.map((surface) => {
-    const slot = detectSlot(surface, processes, { explicitOnly: true });
+    const recordedSlot = surface && surface.ref ? slotByRecordedSurface.get(surface.ref) : null;
+    const markerSlot = recordedSlot ? null : detectSlot(surface, processes, { explicitOnly: true });
+    const slot = recordedSlot || markerSlot;
     return {
       ref: surface.ref || null,
       paneRef: surface.paneRef || null,
+      paneTitle: surface.paneTitle || null,
+      paneDescription: surface.paneDescription || null,
       title: surface.title || null,
+      cwd: surfaceCwd(surface),
       type: surface.type || null,
       slot,
+      slotSource: recordedSlot ? 'recorded' : (markerSlot ? 'marker' : null),
       processes: processes[surface.ref] || [],
     };
   });
@@ -1369,6 +1661,31 @@ async function getProjectState(projectId) {
     if (!surface.slot || !SLOT_DEFS[surface.slot]) continue;
     base.slots[surface.slot] = true;
     if (!base.slotRefs[surface.slot] && surface.ref) base.slotRefs[surface.slot] = surface.ref;
+    if (!base.slotPaneRefs[surface.slot] && surface.paneRef) base.slotPaneRefs[surface.slot] = surface.paneRef;
+    if (surface.slotSource === 'marker' && surface.ref) {
+      recordSlotRef(projectId, surface.slot, { surfaceRef: surface.ref, paneRef: surface.paneRef, wsRef: ws.ref });
+    }
+  }
+
+  const claimedRefs = new Set(base.surfaces.filter((surface) => surface && surface.slot && surface.ref).map((surface) => surface.ref));
+  const recoveryCandidates = SLOT_ORDER.reduce((acc, slot) => {
+    acc[slot] = [];
+    return acc;
+  }, {});
+  for (const surface of base.surfaces) {
+    if (!surface || !surface.ref || claimedRefs.has(surface.ref)) continue;
+    const slot = recoverableSlotForSurface(surface, project);
+    if (slot && !base.slotRefs[slot]) recoveryCandidates[slot].push(surface);
+  }
+  for (const slot of SLOT_ORDER) {
+    if (base.slotRefs[slot] || recoveryCandidates[slot].length !== 1) continue;
+    const surface = recoveryCandidates[slot][0];
+    surface.slot = slot;
+    surface.slotSource = 'recovered';
+    base.slots[slot] = true;
+    base.slotRefs[slot] = surface.ref;
+    base.slotPaneRefs[slot] = surface.paneRef || null;
+    recordSlotRef(projectId, slot, { surfaceRef: surface.ref, paneRef: surface.paneRef, wsRef: ws.ref });
   }
   return base;
 }
@@ -1390,7 +1707,6 @@ async function getState() {
   const buildRow = async (p) => {
     const ws = byTag[p.id];
     const ag = projectAgmsgConfig(p, cfg);
-    const collab = await projectCollabState(p, cfg);
     let projectState = {
       open: !!ws,
       wsRef: ws ? ws.ref : null,
@@ -1398,6 +1714,7 @@ async function getState() {
       selected: ws ? !!ws.selected : false,
       slots: emptySlots(false),
       slotRefs: emptySlotRefs(),
+      slotPaneRefs: emptySlotRefs(),
       surfaces: [],
       lastMessage: ws ? (ws.latest_conversation_message || null) : null,
       lastAt: ws ? (ws.latest_submitted_at || null) : null,
@@ -1409,6 +1726,7 @@ async function getState() {
         projectState.surfaceError = summarizeError(e);
       }
     }
+    const collab = await projectCollabState(p, cfg, projectState);
     return {
       id: p.id,
       kind: projectKind(p),
@@ -1433,6 +1751,7 @@ async function getState() {
       selected: projectState.selected,
       slots: projectState.slots,
       slotRefs: projectState.slotRefs,
+      slotPaneRefs: projectState.slotPaneRefs || emptySlotRefs(),
       surfaces: projectState.surfaces,
       surfaceError: projectState.surfaceError || null,
       lastMessage: projectState.lastMessage,
@@ -1531,6 +1850,7 @@ function workspaceYamlRow(row = {}) {
     slots[slot] = {
       on: !!(row.slots && row.slots[slot]),
       ref: row.slotRefs && row.slotRefs[slot] ? row.slotRefs[slot] : null,
+      paneRef: row.slotPaneRefs && row.slotPaneRefs[slot] ? row.slotPaneRefs[slot] : null,
       command: row.slotCommands && row.slotCommands[slot] != null ? row.slotCommands[slot] : null,
     };
   }
@@ -1654,7 +1974,8 @@ async function openProject(id, { focus = true } = {}) {
   if (existing) {
     if (focus) await focusProject(id);
     const collab = collabEnabled ? await ensureCollab(rowCwd(p), true, { team: teamName(p.id) }) : { ok: true, on: false, skipped: true };
-    return { ref: existing.ref, wsRef: existing.ref, alreadyOpen: true, claudeMd, collab, state: await getProjectState(id) };
+    const slots = collabEnabled ? await ensureCollabSlots(id) : [];
+    return { ref: existing.ref, wsRef: existing.ref, alreadyOpen: true, claudeMd, slots, collab, state: await getProjectState(id) };
   }
 
   // 1) agmsg チームをセットアップ（claude 起動前に hook を書き込む）
@@ -1673,8 +1994,36 @@ async function openProject(id, { focus = true } = {}) {
   const ref = (out.match(/workspace:\d+/) || [])[0] || null;
   await settle();
   const collab = (ref && collabEnabled) ? await ensureCollab(rowCwd(p), true, { team: teamName(p.id) }) : { ok: true, on: false, skipped: true };
+  const slots = (ref && collabEnabled) ? await ensureCollabSlots(id) : [];
 
-  return { ref, wsRef: ref, alreadyOpen: false, agmsg: agResult, claudeMd, collab, state: ref ? await getProjectState(id) : null };
+  return { ref, wsRef: ref, alreadyOpen: false, agmsg: agResult, claudeMd, slots, collab, state: ref ? await getProjectState(id) : null };
+}
+
+async function ensureCollabSlots(id) {
+  const results = [];
+  for (const slot of ['cc', 'cdx']) {
+    results.push(await ensureSlot(id, slot, true));
+  }
+  return results;
+}
+
+async function ensureCollabPair(id, on) {
+  const cfg = loadConfig();
+  const project = findConfiguredRow(cfg, id);
+  if (!project) throw new Error('unknown project: ' + id);
+  const collab = projectCollabEnabled(project, cfg)
+    ? await ensureCollab(rowCwd(project), true, { team: teamName(project.id) })
+    : { ok: true, on: false, skipped: true };
+  const slots = [];
+  if (on) {
+    slots.push(...await ensureCollabSlots(id));
+  } else {
+    slots.push(await ensureSlot(id, 'cdx', false));
+    slots.push(await ensureSlot(id, 'cc', false));
+  }
+  const state = await getProjectState(id);
+  const active = projectCollabEnabled(project, cfg) && collabActiveFromProjectState(state);
+  return { id, on: !!on, collab: { enabled: projectCollabEnabled(project, cfg), active, running: active, mode: 'pane-delivery' }, slots, setup: collab, state };
 }
 
 async function ensureSlot(id, slot, on) {
@@ -1690,29 +2039,41 @@ async function ensureSlot(id, slot, on) {
       state = await getProjectState(id);
     }
     if (state.slots[slot] && state.slotRefs[slot]) {
-      return { id, slot, on: true, already: true, ref: state.slotRefs[slot], wsRef: state.wsRef };
+      const repaired = await repairSharedSlotPane(state, slot);
+      if (!repaired) {
+        return { id, slot, on: true, already: true, ref: state.slotRefs[slot], paneRef: state.slotPaneRefs[slot] || null, wsRef: state.wsRef };
+      }
+      await settle(Math.min(CMUX_SETTLE_MS, 500));
+      state = await getProjectState(id);
     }
-    const args = ['new-surface', '--type', 'terminal', '--workspace', state.wsRef, '--focus', 'false'];
-    const paneRef = await getDefaultPaneRef(state.wsRef);
-    if (paneRef) args.push('--pane', paneRef);
-    const out = await cmux(args);
-    const surfaceRef = (String(out || '').match(/surface:[^\s"']+/) || [])[0] || null;
-    if (!surfaceRef) throw new Error(`new-surface did not return a surface ref for ${id}/${slot}`);
+    const reusable = reusableInitialSurface(state);
+    const created = reusable
+      ? { surfaceRef: reusable.ref, paneRef: reusable.paneRef || null, split: false, reused: true }
+      : await createSplitPaneSurface(state.wsRef);
+    const surfaceRef = created.surfaceRef;
+    if (!surfaceRef) throw new Error(`slot surface was not resolved for ${id}/${slot}`);
     await cmux(['send', '--workspace', state.wsRef, '--surface', surfaceRef, slotLaunchText(p, cfg, slot)]);
+    recordSlotRef(id, slot, { surfaceRef, paneRef: created.paneRef || null, wsRef: state.wsRef });
     await settle();
     const next = await getProjectState(id);
-    return { id, slot, on: !!next.slots[slot], ref: next.slotRefs[slot] || surfaceRef, wsRef: next.wsRef };
+    return {
+      id,
+      slot,
+      on: !!next.slots[slot],
+      ref: next.slotRefs[slot] || surfaceRef,
+      paneRef: next.slotPaneRefs[slot] || created.paneRef || null,
+      wsRef: next.wsRef,
+      split: created.split,
+      reused: !!created.reused,
+    };
   }
 
   const state = await getProjectState(id);
   if (!state.open || !state.slots[slot]) return { id, slot, on: false, already: true, wsRef: state.wsRef };
-  const refs = state.surfaces.filter((s) => s.slot === slot && s.ref).map((s) => s.ref);
-  for (const ref of refs) {
-    await cmux(['close-surface', '--workspace', state.wsRef, '--surface', ref]);
-  }
-  await settle(Math.min(CMUX_SETTLE_MS, 500));
-  const next = await getProjectState(id);
-  return { id, slot, on: !!next.slots[slot], closed: refs.length, wsRef: next.wsRef };
+  const closed = await closeSlotOwnedPaneSurfaces(id, state, slot);
+  const next = closed.next || await getProjectState(id);
+  if (!next.slots[slot]) forgetSlotRef(id, slot);
+  return { id, slot, on: !!next.slots[slot], closed: closed.closed, paneRefs: closed.paneRefs, wsRef: next.wsRef };
 }
 
 async function closeProject(id) {
@@ -1723,6 +2084,7 @@ async function closeProject(id) {
   if (ws) {
     await cmux(['close-workspace', '--workspace', ws.ref]);
     await settle(Math.min(CMUX_SETTLE_MS, 500));
+    forgetProjectSlotRefs(id);
     result = { closed: true, ref: ws.ref };
   }
   if (p && projectCollabEnabled(p, cfg)) {
@@ -1736,6 +2098,12 @@ async function focusProject(id) {
   if (!ws) return { focused: false };
   await cmux(['select-workspace', '--workspace', ws.ref]);
   return { focused: true, ref: ws.ref };
+}
+
+async function sendToSurface(wsRef, surfaceRef, text) {
+  if (!wsRef) throw new Error('workspace ref is required for cmux send');
+  if (!surfaceRef) throw new Error('surface ref is required for cmux send');
+  return cmux(['send', '--workspace', wsRef, '--surface', surfaceRef, String(text || '')]);
 }
 
 async function openAll() {
@@ -1854,6 +2222,7 @@ function removeProject(id) {
   const before = cfg.projects.length;
   cfg.projects = cfg.projects.filter((p) => p.id !== id);
   saveConfig(cfg);
+  forgetProjectSlotRefs(id);
   return { removed: before !== cfg.projects.length };
 }
 
@@ -1863,10 +2232,10 @@ module.exports = {
   parseTop, parseMemory, classifyProcess, getMetrics,
   doctor,
   ensureClaudeMd,
-  ensureCollab, ensureProjectCollab, isCollabRunning, projectCollabEnabled,
-  getTeamMessages,
+  ensureCollab, ensureProjectCollab, ensureCollabPair, isCollabRunning, projectCollabEnabled, projectCollabEnabledById,
+  agmsgDbPath, getTeamMessages,
   createCmuxHealthTracker, getCmuxHealth, pingCmuxForRecovery,
-  getState, getWorkspaceYaml, getProjectState, ensureSlot, loadConfig, saveConfig, openProject, closeProject, focusProject,
+  getState, getWorkspaceYaml, getProjectState, ensureSlot, ensureCollabSlots, sendToSurface, loadConfig, saveConfig, openProject, closeProject, focusProject,
   openAll, closeAll, reorderProjects, addProject, removeProject, expandHome,
   projectKind, isGlobalProject, configuredRows, configuredProjectRows, configuredGlobalRows,
 };

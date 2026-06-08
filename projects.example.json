@@ -21,7 +21,7 @@
       "mode": "managed-block",
       "templatePath": "templates/CLAUDE.md"
     },
-    "collab": false,
+    "collab": true,
     "briefing": "You are the planning/review agent. Delegate implementation and tests to codex through agmsg, then review the result before continuing."
   },
   "projects": [
