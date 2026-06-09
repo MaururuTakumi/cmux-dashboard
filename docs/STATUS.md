@@ -76,3 +76,12 @@
 - ✅ slot-toggle バグ解決（Generator/Evaluator ループ）・`./test.sh` 253 PASS・独立検証済み。
 - ✅ 自動collab（claude×codex の見える2ペイン交渉）が実機で機能。
 - ✅ Phase2 グリッド化 C0-C4 完成（dashboard browser side panel + project columns）・`./test.sh` PASS・claude実機直接検証済み（5ペイン/2列/anchor=browser/add-remove-cleanup）。
+
+## ★完成：誰でも使える化＋grid列の決定的ref修正（2026-06-09 夕, /loop運用）
+**ユーザー報告「CCボタンが失敗」→ 根本2件を解消し、理想（実在projectを誰でも作れる＋複数列CC/Codex横タイル並列）を実機達成。**
+- **根本原因(確定的)**: even系projectのpathが `/projects/evencustom`（macOS read-only root配下＝作成不可）で、CC押下時 `normalizeCollabProjectDir` の mkdir が ENOENT。
+- **R-B 実在project自動作成（誰でも使える）**: `CMUX_DASH_PROJECTS_ROOT`(既定~/projects)導入。作成不可/書込不可な絶対パスを `<root>/<id>` へ remap+mkdir する resolver を rowCwd/openProject/ensureSlot/ensureCollab/ensureClaudeMd/addProject に接続。addProjectのmkdir握り潰し廃止。→ `POST /api/projects` 名前のみで `~/projects/<id>` 自動作成を実機確認。commit ed9b1c6。
+- **R-C spike耐性**: `isTransient()` に EAGAIN/ENOMEM 追加（プロセス上限スパイク時の一過性失敗を再試行）。commit ed9b1c6。
+- **grid列ref決定的化**: `rebuildGridWorkspace` が cc/cdx を marker(端末タイトル)再検出で解決→exec claude/codexがタイトル上書きでmarker消失→「did not create cc surface」で列追加失敗していた。素のterminalペアを作りlist-panes順序からsurfaceRefを確定してからlaunch送信する方式へ（slot同思想）。commit b300ad3。
+- **検証**: `./test.sh` 独立再実行 FINAL: PASS (283 checks, FAIL 0)。実機: grid 2列→anchor(browser)+各列CC(✳Claude Code)/Codex の5ペイン、タイトル上書き下でも columns=2 cc/cdx確定、1列削除→残存、全削除→自動クローズ。
+- **運用メモ**: サーバーは新コード反映に `./cmux-dash restart`（専用 __server__ ペイン内・孤児化なし）。.server.pid が古いと stop が空振るので現リスナーPIDに更新してから restart。push は人間確認のため保留中（commit 2本ローカル）。
