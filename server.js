@@ -50,7 +50,7 @@ function actionParts(label) {
   let target = rest.join(':') || null;
   if (type === 'slot' && rest.length) target = rest[0];
   if (type === 'collab' && rest.length) target = rest[0];
-  if (type === 'grid' && rest.length) target = rest[0];
+  if (type === 'grid') target = rest.length > 1 ? rest[0] : null;
   return { type, target };
 }
 function rememberAction(label) {
@@ -175,6 +175,9 @@ async function api(req, res, urlPath) {
     if (req.method === 'GET' && urlPath === '/api/grid') {
       return sendJson(res, 200, await ctl.getGridState());
     }
+    if (req.method === 'POST' && urlPath === '/api/grid/focus') {
+      return defer(res, () => ctl.focusGridWorkspace(), 'grid:focus');
+    }
     if (req.method === 'GET' && urlPath === '/api/workspace-yaml') {
       return sendText(res, 200, await ctl.getWorkspaceYaml(), 'text/yaml; charset=utf-8');
     }
@@ -228,7 +231,7 @@ async function api(req, res, urlPath) {
       const body = await readBody(req);
       const on = body && body.on === true;
       return defer(res, () => (
-        on ? ctl.addProjectColumn(id) : ctl.removeProjectColumn(id)
+        on ? ctl.addProjectColumn(id, { focus: body.focus !== false }) : ctl.removeProjectColumn(id)
       ), `grid:${id}:${on ? 'on' : 'off'}`);
     }
     if (req.method === 'POST' && urlPath === '/api/reorder') {

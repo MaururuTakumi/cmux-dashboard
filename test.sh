@@ -1017,7 +1017,29 @@ for (const surface of (s.surfaces || [])) {
 }
 NODE
     ;;
-  reorder-workspaces|select-workspace)
+  select-workspace)
+    workspace=""
+    while [ "\$#" -gt 0 ]; do
+      case "\$1" in
+        --workspace) workspace="\${2:-}"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    "\$NODE_BIN" - "\$STATE" "\$workspace" <<'NODE'
+const fs = require("fs");
+const file = process.argv[2];
+const workspace = process.argv[3] || "";
+let s = { workspaces: [] };
+try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
+s.selectedWorkspace = workspace || null;
+s.workspaces = (Array.isArray(s.workspaces) ? s.workspaces : []).map((ws) => ({
+  ...ws,
+  selected: !!workspace && ws && ws.ref === workspace,
+}));
+fs.writeFileSync(file, JSON.stringify(s) + "\n");
+NODE
+    ;;
+  reorder-workspaces)
     ;;
   *)
     printf '{}\n'
@@ -1358,6 +1380,10 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       const afterRepeatCount = surfaceCountFor("__grid__");
       const generalColumn = await ctl.addProjectColumn("cc-general");
       const gridState = await ctl.getGridState();
+      const beforeFocusCount = surfaceCountFor("__grid__");
+      const focusedAlpha = await ctl.addProjectColumn("alpha", { focus: true });
+      const afterFocusCount = surfaceCountFor("__grid__");
+      const selectedGridRef = rawCmuxState().selectedWorkspace;
       const gridWs = workspaceFor("__grid__");
       const alphaGridColumn = gridState.columns.find((column) => column.projectId === "alpha");
       const generalGridColumn = gridState.columns.find((column) => column.projectId === "cc-general");
@@ -1471,6 +1497,16 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         repeatAlpha.added === false &&
         repeatAlpha.cc.surfaceRef === alphaColumn.cc.surfaceRef &&
         afterRepeatCount === afterAlphaCount
+      ));
+      check("grid G1: addProjectColumn focus option selects existing grid workspace idempotently", (
+        focusedAlpha &&
+        focusedAlpha.already === true &&
+        focusedAlpha.added === false &&
+        focusedAlpha.focus &&
+        focusedAlpha.focus.focused === true &&
+        focusedAlpha.focus.wsRef === gridState.wsRef &&
+        selectedGridRef === gridState.wsRef &&
+        afterFocusCount === beforeFocusCount
       ));
 
       const removedAlpha = await ctl.removeProjectColumn("alpha");
@@ -1638,6 +1674,46 @@ if (action) process.stdout.write(`${action.status}\t${action.error || ""}`);
     return 1
   }
 
+  r4_grid_focus_api_and_wait() {
+    local label="$1"
+    local body
+    local action_id
+    local line
+    local status=""
+    body="$(curl -fsS -X POST --max-time 10 -H 'Content-Type: application/json' --data '{}' "$api_url/api/grid/focus" 2>/dev/null || true)"
+    action_id="$(printf '%s' "$body" | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+if (obj && obj.queued === true && obj.actionId && obj.label === "grid:focus") process.stdout.write(String(obj.actionId));
+' 2>/dev/null || true)"
+    if [ -z "$action_id" ]; then
+      fail "R4 API: $label did not return queued grid focus actionId"
+      info "R4 API grid focus payload: ${body:-empty}"
+      return 1
+    fi
+    for _ in $(seq 1 50); do
+      line="$(curl -fsS --max-time 5 "$api_url/api/state" 2>/dev/null | "$NODE_BIN" -e '
+const fs = require("fs");
+const actionId = Number(process.argv[1]);
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+const action = (Array.isArray(obj.actions) ? obj.actions : []).find((a) => Number(a.id) === actionId);
+if (action) process.stdout.write(`${action.status}\t${action.error || ""}`);
+' "$action_id" 2>/dev/null || true)"
+      status="${line%%	*}"
+      [ "$status" = "succeeded" ] && break
+      [ "$status" = "failed" ] && break
+      sleep 0.2
+    done
+    if [ "$status" = "succeeded" ]; then
+      pass "R4 API: $label queued and succeeded"
+      return 0
+    fi
+    fail "R4 API: $label action status was ${status:-missing}"
+    return 1
+  }
+
   (cd "$DIR" && exec env CMUX_BIN="$fake_cmux" CMUX_DASH_PORT="$api_port" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$cfg_file" CMUX_DASH_SETTLE_MS=0 "$NODE_BIN" server.js >"$api_log" 2>&1) &
   BAD_SERVER_PID=$!
   for _ in $(seq 1 50); do
@@ -1707,6 +1783,33 @@ process.exit(col && col.cc && col.cc.surfaceRef && col.cdx && col.cdx.surfaceRef
     fail "R4 API: grid ON did not reflect in /api/grid or /api/state.grid"
     return 1
   fi
+  if "$NODE_BIN" - "$state_file" <<'NODE' 2>/dev/null
+const fs = require("fs");
+let s;
+try { s = JSON.parse(fs.readFileSync(process.argv[2], "utf8")); } catch (_) { process.exit(2); }
+const gridWs = (Array.isArray(s.workspaces) ? s.workspaces : []).find((ws) => ws && ws.description === "cmuxdash:__grid__");
+process.exit(gridWs && s.selectedWorkspace === gridWs.ref && gridWs.selected === true ? 0 : 1);
+NODE
+  then
+    pass "R4 API: grid ON auto-focus selects the grid workspace"
+  else
+    fail "R4 API: grid ON did not auto-focus the grid workspace"
+    return 1
+  fi
+  if ! r4_grid_focus_api_and_wait "grid focus endpoint"; then return 1; fi
+  if "$NODE_BIN" - "$state_file" <<'NODE' 2>/dev/null
+const fs = require("fs");
+let s;
+try { s = JSON.parse(fs.readFileSync(process.argv[2], "utf8")); } catch (_) { process.exit(2); }
+const gridWs = (Array.isArray(s.workspaces) ? s.workspaces : []).find((ws) => ws && ws.description === "cmuxdash:__grid__");
+process.exit(gridWs && s.selectedWorkspace === gridWs.ref && gridWs.selected === true ? 0 : 1);
+NODE
+  then
+    pass "R4 API: /api/grid/focus selects the grid workspace"
+  else
+    fail "R4 API: /api/grid/focus did not select the grid workspace"
+    return 1
+  fi
   if ! r4_grid_api_and_wait "alpha" "false" "grid alpha OFF"; then return 1; fi
   if curl -fsS --max-time 5 "$api_url/api/grid" 2>/dev/null | "$NODE_BIN" -e '
 const fs = require("fs");
@@ -1770,6 +1873,16 @@ const checks = [
   script.includes("function renderGridSidePanel(s)"),
   script.includes("function toggleGridColumn(id, on)"),
   script.includes("/api/grid/column/"),
+  html.includes(".grid-primary"),
+  html.includes(".row-details"),
+  html.includes("▶ 開く"),
+  html.includes("× 閉じる"),
+  script.includes('data-action="grid-primary"'),
+  script.includes("/api/grid/focus"),
+  script.includes("function focusGrid()"),
+  script.includes("if(gridOpen) focusGrid()"),
+  script.includes("else toggleGridColumn(id,true)"),
+  script.includes("gridColumnForProject(s,p.id)"),
   script.includes("data-grid-project-id"),
   script.includes("data-grid-column-project"),
   script.includes("renderGridSidePanel(s)"),
@@ -5366,7 +5479,7 @@ const checks = [
   toggleThread && toggleThread[1].includes("setInterval(()=>fetchThread(id,false),3000)"),
   closeThread && closeThread[1].includes("clearInterval(st.timer)"),
   fetchThread && fetchThread[1].includes("/api/agmsg/") && fetchThread[1].includes("since="),
-  script.includes("function renderProjectRow(p, index)") && script.includes("function toggleSlot(id, slot, on)"),
+  script.includes("function renderProjectRow(p, index, s)") && script.includes("function toggleSlot(id, slot, on)"),
 ];
 process.stdout.write(checks.every(Boolean) ? "ok" : "bad");
 NODE
@@ -5820,7 +5933,7 @@ const checks = [
   script.includes("encodeURIComponent(id),{method:'DELETE'}"),
   script.includes("function renderProjectRows(s)"),
   script.includes('id="projectRows"'),
-  script.includes("projects.map((p,i)=>renderProjectRow(p,i)).join('')"),
+  script.includes("projects.map((p,i)=>renderProjectRow(p,i,s)).join('')"),
   gridAssign && gridAssign[1].includes("renderProjectRows(s)"),
   html.includes("Memory") && html.includes("CC &amp; Codex"),
 ];

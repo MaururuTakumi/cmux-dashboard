@@ -2504,7 +2504,23 @@ async function getGridState() {
   return validateGridRuntimeState();
 }
 
-async function addProjectColumn(projectId) {
+async function focusGridWorkspace({ ensure = false, wsRef = null } = {}) {
+  let ref = cleanRef(wsRef || gridRuntimeState.wsRef);
+  let ws = ref ? { ref } : null;
+  if (!ws || !ws.ref) {
+    ws = await findGridWorkspace({ attempts: 3, delayMs: 500, allowStale: true, quick: true });
+  }
+  if ((!ws || !ws.ref) && ensure) {
+    ref = await ensureGridWorkspace();
+    ws = ref ? { ref } : null;
+  }
+  if (!ws || !ws.ref) return { focused: false };
+  await cmux(['select-workspace', '--workspace', ws.ref]);
+  gridRuntimeState.wsRef = ws.ref;
+  return { focused: true, ref: ws.ref, wsRef: ws.ref };
+}
+
+async function addProjectColumn(projectId, { focus = false } = {}) {
   const cfg = loadConfig();
   const project = findConfiguredRow(cfg, projectId);
   if (!project) throw new Error('unknown project: ' + projectId);
@@ -2513,7 +2529,11 @@ async function addProjectColumn(projectId) {
 
   await validateGridRuntimeState();
   const existing = gridRuntimeState.columns.find((column) => column.projectId === projectId);
-  if (existing) return { ...gridColumnSnapshot(existing, existing.order), already: true, added: false };
+  if (existing) {
+    const result = { ...gridColumnSnapshot(existing, existing.order), already: true, added: false };
+    if (focus) result.focus = await focusGridWorkspace({ wsRef: result.wsRef });
+    return result;
+  }
 
   const now = new Date().toISOString();
   const result = await rebuildGridWorkspace([
@@ -2522,7 +2542,9 @@ async function addProjectColumn(projectId) {
   ], cfg);
   const column = result.columns.find((item) => item && item.projectId === projectId);
   if (!column) throw new Error('grid column was not rebuilt: ' + projectId);
-  return { ...column, added: true, already: false, rebuilt: true };
+  const response = { ...column, added: true, already: false, rebuilt: true };
+  if (focus) response.focus = await focusGridWorkspace({ wsRef: result.wsRef });
+  return response;
 }
 
 async function removeProjectColumn(projectId) {
@@ -2854,7 +2876,7 @@ module.exports = {
   agmsgDbPath, getTeamMessages,
   createCmuxHealthTracker, getCmuxHealth, pingCmuxForRecovery,
   getState, getWorkspaceYaml, getProjectState, ensureSlot, ensureCollabSlots, sendToSurface, submitToSurface, loadConfig, saveConfig, openProject, closeProject, focusProject,
-  ensureGridWorkspace, addProjectColumn, removeProjectColumn, getGridState, gridWorkspaceLayout,
+  ensureGridWorkspace, focusGridWorkspace, addProjectColumn, removeProjectColumn, getGridState, gridWorkspaceLayout,
   openAll, closeAll, reorderProjects, addProject, removeProject, expandHome, rowCwd, rowCwdInfo, normalizeCollabProjectDir, normalizeCollabProjectDirInfo,
   projectKind, isGlobalProject, configuredRows, configuredProjectRows, configuredGlobalRows,
 };
