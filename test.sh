@@ -654,7 +654,10 @@ function addPaneSurface(surfaceSpec, meta) {
   const url = surfaceSpec && surfaceSpec.url || null;
   const gridMatch = String(command).match(/(cmuxdash:grid:[^\s']+:slot:(cc|cdx))/);
   const slot = gridMatch && gridMatch[2] || null;
-  const title = type === "browser" ? url : (gridMatch && gridMatch[1] || "terminal");
+  const overwrittenGridTitle = process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE === "1" && gridMatch
+    ? (slot === "cc" ? "✳ Claude Code" : "Codex")
+    : null;
+  const title = type === "browser" ? url : (overwrittenGridTitle || (gridMatch && gridMatch[1] || "terminal"));
   const processBySlot = { cc: "claude", cdx: "codex" };
   s.panes.push({ ref: paneRef, workspace: wsRef, index: s.panes.filter((p) => p && p.workspace === wsRef).length, ...(meta || {}) });
   s.surfaces.push({
@@ -905,6 +908,9 @@ const match = text.match(/cmuxdash:slot:(cc|cdx|yazi|term)/);
 const gridMatch = text.match(/(cmuxdash:grid:[^\s']+:slot:(cc|cdx))/);
 const slot = gridMatch && gridMatch[2] || match && match[1];
 const title = gridMatch && gridMatch[1] || (slot ? "cmuxdash:slot:" + slot : null);
+const overwrittenGridTitle = process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE === "1" && gridMatch
+  ? (slot === "cc" ? "✳ Claude Code" : "Codex")
+  : null;
 const processBySlot = { cc: "claude", cdx: "codex", yazi: "yazi", term: "zsh" };
 const cdMarker = "cd " + String.fromCharCode(39);
 const cdStart = text.indexOf(cdMarker);
@@ -929,9 +935,9 @@ if (cdStart >= 0) {
 }
 for (const item of (s.surfaces || [])) {
   if (item && item.ref === surface && slot) {
-    item.title = process.env.CMUX_FAKE_OVERWRITE_SLOT_TITLE === "1" && slot === "cc"
+    item.title = overwrittenGridTitle || (process.env.CMUX_FAKE_OVERWRITE_SLOT_TITLE === "1" && slot === "cc"
       ? "✳ Claude Code"
-      : title;
+      : title);
     item.process = processBySlot[slot] || "zsh";
     item.workspace = item.workspace || workspace;
     item.cwd = cwd;
@@ -1340,6 +1346,8 @@ async function exerciseAllSlots(id, expectedCwd, label) {
     check("workspace YAML is parseable and contains global CC slot state", yamlHasGlobalCcOn(yaml));
 
     {
+      process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE = "1";
+      try {
       const initialGridRef = await ctl.ensureGridWorkspace();
       const initialGridWs = workspaceFor("__grid__");
       const dashboardUrl = "http://" + (process.env.CMUX_DASH_HOST || "127.0.0.1") + ":" + (process.env.CMUX_DASH_PORT || "7799");
@@ -1388,12 +1396,28 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         alphaCdx &&
         generalCc &&
         generalCdx &&
-        alphaCc.title === alphaColumn.cc.marker &&
-        alphaCdx.title === alphaColumn.cdx.marker &&
-        generalCc.title === generalColumn.cc.marker &&
-        generalCdx.title === generalColumn.cdx.marker &&
-        !alphaCc.title.includes("cmuxdash:slot:") &&
-        !generalCdx.title.includes("cmuxdash:slot:")
+        alphaGridColumn.cc.marker === alphaColumn.cc.marker &&
+        alphaGridColumn.cdx.marker === alphaColumn.cdx.marker &&
+        generalGridColumn.cc.marker === generalColumn.cc.marker &&
+        generalGridColumn.cdx.marker === generalColumn.cdx.marker &&
+        !String(alphaCc.title || "").includes("cmuxdash:slot:") &&
+        !String(generalCdx.title || "").includes("cmuxdash:slot:")
+      ));
+      check("grid C1: deterministic refs survive overwritten grid launch titles", (
+        alphaCc.title === "✳ Claude Code" &&
+        alphaCdx.title === "Codex" &&
+        generalCc.title === "✳ Claude Code" &&
+        generalCdx.title === "Codex" &&
+        [alphaCc, alphaCdx, generalCc, generalCdx].every((surface) => (
+          surface &&
+          surface.ref &&
+          surface.pane &&
+          !String(surface.title || "").includes("cmuxdash:grid:")
+        )) &&
+        String(alphaCc.sendText || "").includes(alphaGridColumn.cc.marker) &&
+        String(alphaCdx.sendText || "").includes(alphaGridColumn.cdx.marker) &&
+        String(generalCc.sendText || "").includes(generalGridColumn.cc.marker) &&
+        String(generalCdx.sendText || "").includes(generalGridColumn.cdx.marker)
       ));
       check("grid C4: dashboard browser anchor points at the running dashboard URL", (
         browserAnchor &&
@@ -1481,6 +1505,9 @@ async function exerciseAllSlots(id, expectedCwd, label) {
           Array.isArray(staleGridState.columns) &&
           staleGridState.columns.length === 0
         ));
+      }
+      } finally {
+        delete process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE;
       }
     }
   } catch (err) {

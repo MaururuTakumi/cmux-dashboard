@@ -2291,17 +2291,17 @@ function gridBrowserLayout() {
   return paneLayout({ type: 'browser', url: dashboardBrowserUrl() });
 }
 
-function gridTerminalLayout(project, cfg, columnId, slot) {
-  return paneLayout({ type: 'terminal', command: gridLaunchCommand(project, cfg, columnId, slot) });
+function gridTerminalLayout() {
+  return paneLayout({ type: 'terminal' });
 }
 
-function gridColumnLayout(project, cfg, columnId) {
+function gridColumnLayout() {
   return {
     direction: 'vertical',
     split: 0.5,
     children: [
-      gridTerminalLayout(project, cfg, columnId, 'cc'),
-      gridTerminalLayout(project, cfg, columnId, 'cdx'),
+      gridTerminalLayout(),
+      gridTerminalLayout(),
     ],
   };
 }
@@ -2323,7 +2323,7 @@ function gridWorkspaceLayout(columns, cfg) {
   const columnLayouts = (Array.isArray(columns) ? columns : []).map((column) => {
     const project = findConfiguredRow(cfg, column.projectId);
     if (!project) throw new Error('unknown project: ' + column.projectId);
-    return gridColumnLayout(project, cfg, column.columnId || gridColumnId(column.projectId));
+    return gridColumnLayout();
   });
   if (!columnLayouts.length) return gridBrowserLayout();
   return {
@@ -2367,6 +2367,62 @@ async function listWorkspaceSurfacesWithRetry(wsRef, attempts = 4, markers = [])
   return surfaces;
 }
 
+function isGridTerminalSurface(surface) {
+  if (!surface || !surface.ref) return false;
+  const type = String(surface.type || '').toLowerCase();
+  if (type === 'browser') return false;
+  if (surface.url) return false;
+  return true;
+}
+
+function gridTerminalSurfaces(surfaces) {
+  return (Array.isArray(surfaces) ? surfaces : []).filter(isGridTerminalSurface);
+}
+
+async function listGridTerminalSurfacesWithRetry(wsRef, expectedCount, attempts = 6) {
+  let terminals = [];
+  for (let i = 0; i < attempts; i += 1) {
+    terminals = gridTerminalSurfaces(await listWorkspaceSurfaces(wsRef));
+    if (terminals.length >= expectedCount) return terminals;
+    await settle(Math.min(CMUX_SETTLE_MS, 500));
+  }
+  return terminals;
+}
+
+function resolveGridColumnSurfaces(wsRef, desired, terminalSurfaces, now) {
+  const expectedCount = desired.length * 2;
+  if (terminalSurfaces.length < expectedCount) {
+    throw new Error(`grid layout created ${terminalSurfaces.length}/${expectedCount} terminal surfaces`);
+  }
+  return desired.map((column, idx) => {
+    const ccMarker = gridSlotMarker(column.columnId, 'cc');
+    const cdxMarker = gridSlotMarker(column.columnId, 'cdx');
+    const cc = terminalSurfaces[idx * 2] || null;
+    const cdx = terminalSurfaces[idx * 2 + 1] || null;
+    if (!cc || !cc.ref) throw new Error(`grid layout did not create cc surface for ${column.projectId}`);
+    if (!cdx || !cdx.ref) throw new Error(`grid layout did not create cdx surface for ${column.projectId}`);
+    return {
+      columnId: column.columnId,
+      projectId: column.projectId,
+      wsRef,
+      order: idx,
+      cc: { surfaceRef: cc.ref, paneRef: cc.paneRef || null, marker: ccMarker },
+      cdx: { surfaceRef: cdx.ref, paneRef: cdx.paneRef || null, marker: cdxMarker },
+      createdAt: column.createdAt || now,
+      updatedAt: now,
+    };
+  });
+}
+
+async function launchGridColumnSurfaces(wsRef, columns, cfg) {
+  for (const column of columns) {
+    const project = findConfiguredRow(cfg, column.projectId);
+    if (!project) throw new Error('unknown project: ' + column.projectId);
+    await cmux(['send', '--workspace', wsRef, '--surface', column.cc.surfaceRef, gridLaunchCommand(project, cfg, column.columnId, 'cc') + '\n']);
+    await cmux(['send', '--workspace', wsRef, '--surface', column.cdx.surfaceRef, gridLaunchCommand(project, cfg, column.columnId, 'cdx') + '\n']);
+  }
+}
+
 async function rebuildGridWorkspace(columns, cfg = loadConfig()) {
   const desired = (Array.isArray(columns) ? columns : []).map((column) => ({
     columnId: gridColumnId(column.projectId),
@@ -2395,30 +2451,11 @@ async function rebuildGridWorkspace(columns, cfg = loadConfig()) {
   if (!wsRef) throw new Error('grid workspace was not resolved');
   await settle();
 
-  const expectedMarkers = desired.flatMap((column) => [
-    gridSlotMarker(column.columnId, 'cc'),
-    gridSlotMarker(column.columnId, 'cdx'),
-  ]);
-  const surfaces = await listWorkspaceSurfacesWithRetry(wsRef, 6, expectedMarkers);
   const now = new Date().toISOString();
-  const rebuilt = desired.map((column, idx) => {
-    const ccMarker = gridSlotMarker(column.columnId, 'cc');
-    const cdxMarker = gridSlotMarker(column.columnId, 'cdx');
-    const cc = markerSurface(surfaces, ccMarker);
-    const cdx = markerSurface(surfaces, cdxMarker);
-    if (!cc || !cc.ref) throw new Error(`grid layout did not create cc surface for ${column.projectId}`);
-    if (!cdx || !cdx.ref) throw new Error(`grid layout did not create cdx surface for ${column.projectId}`);
-    return {
-      columnId: column.columnId,
-      projectId: column.projectId,
-      wsRef,
-      order: idx,
-      cc: { surfaceRef: cc.ref, paneRef: cc.paneRef || null, marker: ccMarker },
-      cdx: { surfaceRef: cdx.ref, paneRef: cdx.paneRef || null, marker: cdxMarker },
-      createdAt: column.createdAt || now,
-      updatedAt: now,
-    };
-  });
+  const terminalSurfaces = await listGridTerminalSurfacesWithRetry(wsRef, desired.length * 2, 6);
+  const rebuilt = resolveGridColumnSurfaces(wsRef, desired, terminalSurfaces, now);
+  await launchGridColumnSurfaces(wsRef, rebuilt, cfg);
+  await settle();
   gridRuntimeState.wsRef = wsRef;
   gridRuntimeState.columns = rebuilt;
   return { wsRef, columns: rebuilt.map((column, idx) => gridColumnSnapshot(column, idx)), layout, rebuilt: true };
