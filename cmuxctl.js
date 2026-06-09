@@ -59,8 +59,191 @@ function expandHome(p) {
   return p;
 }
 
+const CMUX_DASH_PROJECTS_ROOT_INPUT = process.env.CMUX_DASH_PROJECTS_ROOT || '~/projects';
+const CMUX_DASH_PROJECTS_ROOT = path.resolve(expandHome(CMUX_DASH_PROJECTS_ROOT_INPUT));
+
 function hasOwn(obj, key) {
   return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function pathInsideOrEqual(child, parent) {
+  const rel = path.relative(path.resolve(parent), path.resolve(child));
+  return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+function accessOk(dir, mode = fs.constants.W_OK | fs.constants.X_OK) {
+  try {
+    fs.accessSync(dir, mode);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function safeStat(target) {
+  try { return fs.statSync(target); } catch (_) { return null; }
+}
+
+function existingWritableDir(target) {
+  const st = safeStat(target);
+  return !!(st && st.isDirectory() && accessOk(target));
+}
+
+function nearestExistingAncestor(target) {
+  let current = path.resolve(target);
+  while (true) {
+    const st = safeStat(current);
+    if (st) return { path: current, stat: st };
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+function canCreateProjectDir(target) {
+  const ancestor = nearestExistingAncestor(path.dirname(path.resolve(target)));
+  return !!(ancestor && ancestor.stat && ancestor.stat.isDirectory() && accessOk(ancestor.path));
+}
+
+function slugForProjectDir(value) {
+  return String(value || '')
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || ('proj-' + process.pid);
+}
+
+function defaultProjectPath(id) {
+  return path.join(CMUX_DASH_PROJECTS_ROOT_INPUT, slugForProjectDir(id));
+}
+
+function safeProjectDir(id, originalPath) {
+  const raw = id || path.basename(path.resolve(expandHome(originalPath || '') || 'project'));
+  return path.join(CMUX_DASH_PROJECTS_ROOT, slugForProjectDir(raw));
+}
+
+function toHomeDisplayPath(resolved) {
+  const home = path.resolve(os.homedir());
+  const homeReal = realpathOrResolved(home);
+  const target = path.resolve(resolved);
+  const targetReal = realpathOrResolved(target);
+  const base = pathInsideOrEqual(target, home) ? home : (pathInsideOrEqual(targetReal, homeReal) ? homeReal : null);
+  const value = base === homeReal ? targetReal : target;
+  if (base) {
+    const rel = path.relative(base, value);
+    return rel ? path.join('~', rel) : '~';
+  }
+  return targetReal;
+}
+
+function projectDirUsability(resolved) {
+  const st = safeStat(resolved);
+  if (st) {
+    if (!st.isDirectory()) return { ok: false, reason: 'project path exists but is not a directory' };
+    if (!accessOk(resolved)) return { ok: false, reason: 'project path is not writable' };
+    return { ok: true };
+  }
+
+  const slashProjects = path.resolve('/projects');
+  if (
+    pathInsideOrEqual(resolved, slashProjects) &&
+    !pathInsideOrEqual(CMUX_DASH_PROJECTS_ROOT, slashProjects)
+  ) {
+    return { ok: false, reason: '/projects is not a managed writable project root on this machine' };
+  }
+
+  if (pathInsideOrEqual(resolved, os.homedir()) || pathInsideOrEqual(resolved, CMUX_DASH_PROJECTS_ROOT)) {
+    return { ok: true };
+  }
+  if (canCreateProjectDir(resolved)) return { ok: true };
+  return { ok: false, reason: 'project path cannot be created from a writable parent' };
+}
+
+function projectDirErrorMessage(target, errors = []) {
+  const details = errors
+    .filter(Boolean)
+    .map((e) => summarizeError(e))
+    .filter(Boolean)
+    .join('; ');
+  return [
+    `Could not create a project directory at ${target}.`,
+    `Set CMUX_DASH_PROJECTS_ROOT to a writable folder, or choose a path under ${toHomeDisplayPath(CMUX_DASH_PROJECTS_ROOT)}.`,
+    details ? `Details: ${details}` : '',
+  ].filter(Boolean).join(' ');
+}
+
+function realpathOrResolved(target) {
+  try { return fs.realpathSync(target); } catch (_) { return path.resolve(target); }
+}
+
+function remapFields(info = {}) {
+  return info.remappedFrom ? {
+    remappedFrom: info.remappedFrom,
+    remappedTo: info.remappedTo || info.dir,
+  } : {};
+}
+
+function withRemapFields(result, info = {}) {
+  return { ...(result || {}), ...remapFields(info) };
+}
+
+function resolveProjectDirInput(inputPath, opts = {}) {
+  const fallback = opts.fallback || process.cwd();
+  const expanded = expandHome(inputPath || fallback);
+  if (!expanded) throw new Error('project path is required');
+  const original = path.resolve(expanded);
+  const allowRemap = opts.allowRemap !== false && opts.kind !== 'global';
+  let dir = original;
+  let remappedFrom = null;
+  let remappedTo = null;
+  let remapReason = null;
+
+  if (allowRemap) {
+    const usability = projectDirUsability(original);
+    if (!usability.ok) {
+      remappedFrom = original;
+      dir = safeProjectDir(opts.id || opts.name, original);
+      remappedTo = dir;
+      remapReason = usability.reason;
+    }
+  }
+
+  if (opts.create) {
+    const errors = [];
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch (e) {
+      errors.push(e);
+      if (allowRemap && !remappedFrom) {
+        remappedFrom = original;
+        dir = safeProjectDir(opts.id || opts.name, original);
+        remappedTo = dir;
+        remapReason = 'mkdir failed at requested path';
+        try {
+          fs.mkdirSync(dir, { recursive: true });
+        } catch (fallbackErr) {
+          errors.push(fallbackErr);
+          throw new Error(projectDirErrorMessage(dir, errors));
+        }
+      } else {
+        throw new Error(projectDirErrorMessage(dir, errors));
+      }
+    }
+    if (!existingWritableDir(dir)) {
+      throw new Error(projectDirErrorMessage(dir, [`${dir} is not a writable directory after creation`]));
+    }
+  }
+
+  const finalDir = path.resolve(dir);
+  return {
+    dir: finalDir,
+    cwd: finalDir,
+    input: inputPath || fallback,
+    resolved: original,
+    remappedFrom,
+    remappedTo: remappedFrom ? path.resolve(remappedTo || dir) : null,
+    remapReason,
+  };
 }
 
 function run(bin, args, opts = {}) {
@@ -100,7 +283,7 @@ function isTransient(err) {
   const code = typeof err === 'object' && err ? String(err.code || '') : '';
   const signal = typeof err === 'object' && err ? String(err.signal || '') : '';
   return !!(err && err.timedOut)
-    || /broken pipe|EPIPE|errno 32|socket|ECONNRESET|ETIMEDOUT|timeout|timed out|SIGKILL/i.test(`${msg} ${code} ${signal}`);
+    || /broken pipe|EPIPE|errno 32|socket|ECONNRESET|ETIMEDOUT|EAGAIN|ENOMEM|timeout|timed out|SIGKILL/i.test(`${msg} ${code} ${signal}`);
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const CMUX_TIMEOUT = intEnv('CMUX_DASH_TIMEOUT', 20000);
@@ -624,9 +807,19 @@ function findConfiguredRow(cfg, id) {
   return configuredRows(cfg).find((p) => p && p.id === id);
 }
 
-function rowCwd(project = {}) {
+function rowCwdInfo(project = {}, opts = {}) {
   const fallback = isGlobalProject(project) ? os.homedir() : process.cwd();
-  return expandHome(project.path || fallback);
+  return resolveProjectDirInput(project.path || fallback, {
+    ...opts,
+    id: project.id,
+    name: project.name,
+    kind: projectKind(project),
+    fallback,
+  });
+}
+
+function rowCwd(project = {}, opts = {}) {
+  return rowCwdInfo(project, opts).dir;
 }
 
 function rowDisplayPath(project = {}) {
@@ -680,12 +873,17 @@ function collabKillPath() {
   return process.env.CMUX_DASH_COLLAB_KILL || 'kill';
 }
 
-function normalizeCollabProjectDir(projectDir, { create = false } = {}) {
-  const expanded = expandHome(projectDir);
-  if (!expanded) throw new Error('projectDir is required for collab bridge');
-  const resolved = path.resolve(expanded);
-  if (create) fs.mkdirSync(resolved, { recursive: true });
-  try { return fs.realpathSync(resolved); } catch (_) { return resolved; }
+function normalizeCollabProjectDirInfo(projectDir, { create = false, projectId = null } = {}) {
+  if (!projectDir) throw new Error('projectDir is required for collab bridge');
+  return resolveProjectDirInput(projectDir, {
+    create,
+    id: projectId || path.basename(path.resolve(expandHome(projectDir))),
+    fallback: process.cwd(),
+  });
+}
+
+function normalizeCollabProjectDir(projectDir, opts = {}) {
+  return normalizeCollabProjectDirInfo(projectDir, opts).dir;
 }
 
 function collabStateDir(projectDir) {
@@ -842,10 +1040,11 @@ async function stopCollabBridge(projectDir) {
 }
 
 async function ensureCollab(projectDir, on, opts = {}) {
-  const dir = normalizeCollabProjectDir(projectDir, { create: !!on });
+  const dirInfo = normalizeCollabProjectDirInfo(projectDir, { create: !!on, projectId: opts.projectId });
+  const dir = dirInfo.dir;
   if (!on) {
     const stopped = await stopCollabBridge(dir);
-    return { ok: true, on: false, projectDir: dir, active: false, running: false, ...stopped };
+    return { ok: true, on: false, projectDir: dir, active: false, running: false, ...stopped, ...remapFields(dirInfo) };
   }
 
   const config = await ensureCollabConfig(dir, opts);
@@ -860,6 +1059,7 @@ async function ensureCollab(projectDir, on, opts = {}) {
     active: false,
     running: false,
     bridge: stopped,
+    ...remapFields(dirInfo),
   };
 }
 
@@ -889,7 +1089,8 @@ async function ensureProjectCollab(id, on) {
   const project = findConfiguredRow(cfg, id);
   if (!project) throw new Error('unknown project: ' + id);
   const claudeMd = on ? ensureClaudeMd(project, cfg) : { ok: true, action: 'skipped-off' };
-  const result = await ensureCollab(rowCwd(project), !!on, { team: teamName(project.id) });
+  const cwdInfo = rowCwdInfo(project, { create: !!on });
+  const result = withRemapFields(await ensureCollab(cwdInfo.dir, !!on, { team: teamName(project.id), projectId: project.id }), cwdInfo);
   project.collab = !!on;
   saveConfig(cfg);
   let projectState = null;
@@ -900,7 +1101,7 @@ async function ensureProjectCollab(id, on) {
     try { projectState = await getProjectState(id); } catch (_) {}
   }
   const active = !!on && collabActiveFromProjectState(projectState);
-  return { id, collab: { enabled: !!on, active, running: active, mode: 'pane-delivery' }, claudeMd, slots, result };
+  return { id, collab: { enabled: !!on, active, running: active, mode: 'pane-delivery' }, claudeMd, slots, result, cwd: cwdInfo.dir, ...remapFields(cwdInfo) };
 }
 
 // ---- cmux 状態 ----
@@ -975,6 +1176,10 @@ const gridRuntimeState = {
   wsRef: null,
   columns: [],
 };
+const GRID_DASHBOARD_SPLIT = (() => {
+  const n = Number.parseFloat(process.env.CMUX_DASH_GRID_DASHBOARD_SPLIT || '');
+  return Number.isFinite(n) && n > 0.08 && n < 0.4 ? n : 0.18;
+})();
 
 function cleanRef(value) {
   const text = String(value || '').trim();
@@ -1546,16 +1751,16 @@ function shellQuote(value) {
 
 function slotLaunchText(project, cfg, slot) {
   const cmd = configuredSlotCommand(project, cfg, slot);
-  const cwd = shellQuote(rowCwd(project));
+  const cwd = shellQuote(rowCwd(project, { create: true }));
   const prefix = titleCommand(slot);
   if (slot === 'term' && !cmd) return `${prefix}; cd ${cwd}\\n`;
   return `${prefix}; cd ${cwd} && exec ${cmd || SLOT_DEFS[slot].defaultCommand}\\n`;
 }
 
-function gridLaunchText(project, cfg, columnId, slot) {
+function gridLaunchCommand(project, cfg, columnId, slot) {
   const cmd = configuredSlotCommand(project, cfg, slot);
-  const cwd = shellQuote(rowCwd(project));
-  return `${gridTitleCommand(columnId, slot)}; cd ${cwd} && exec ${cmd || SLOT_DEFS[slot].defaultCommand}\\n`;
+  const cwd = shellQuote(rowCwd(project, { create: true }));
+  return `${gridTitleCommand(columnId, slot)}; cd ${cwd} && exec ${cmd || SLOT_DEFS[slot].defaultCommand}`;
 }
 
 function slotMarkerSearchText(surface) {
@@ -1640,11 +1845,14 @@ async function getProjectState(projectId) {
   const cfg = loadConfig();
   const project = findConfiguredRow(cfg, projectId);
   if (!project) throw new Error('unknown project: ' + projectId);
+  const cwdInfo = rowCwdInfo(project);
   const ws = await findWorkspaceByTag(projectId, { attempts: 1, allowStale: true, quick: true });
   const base = {
     open: !!ws,
     wsRef: ws ? ws.ref : null,
     ref: ws ? ws.ref : null,
+    cwd: cwdInfo.dir,
+    ...remapFields(cwdInfo),
     selected: ws ? !!ws.selected : false,
     panes: [],
     slots: emptySlots(false),
@@ -1737,10 +1945,13 @@ async function getState() {
   const buildRow = async (p) => {
     const ws = byTag[p.id];
     const ag = projectAgmsgConfig(p, cfg);
+    const cwdInfo = rowCwdInfo(p);
     let projectState = {
       open: !!ws,
       wsRef: ws ? ws.ref : null,
       ref: ws ? ws.ref : null,
+      cwd: cwdInfo.dir,
+      ...remapFields(cwdInfo),
       selected: ws ? !!ws.selected : false,
       slots: emptySlots(false),
       slotRefs: emptySlotRefs(),
@@ -1762,6 +1973,8 @@ async function getState() {
       kind: projectKind(p),
       name: p.name || p.id,
       path: rowDisplayPath(p),
+      cwd: projectState.cwd || cwdInfo.dir,
+      ...remapFields(projectState.remappedFrom ? projectState : cwdInfo),
       color: p.color || '#9ca3af',
       emoji: p.emoji || (isGlobalProject(p) ? '⌘' : '📁'),
       topCmd: p.topCmd || cfg.defaults.topCmd,
@@ -1961,12 +2174,11 @@ function ensureClaudeMd(project, cfg = {}) {
   if (claudeMd.mode === 'off') return { ok: true, action: 'off' };
 
   try {
-    const projectPath = expandHome(project.path);
-    if (!projectPath) throw new Error(`project path is missing for ${project.id}`);
-    const target = path.join(projectPath, 'CLAUDE.md');
+    const cwdInfo = rowCwdInfo(project, { create: true });
+    const target = path.join(cwdInfo.dir, 'CLAUDE.md');
 
     if (claudeMd.mode === 'create-if-missing' && fs.existsSync(target)) {
-      return { ok: true, action: 'skipped' };
+      return { ok: true, action: 'skipped', cwd: cwdInfo.dir, ...remapFields(cwdInfo) };
     }
 
     const rendered = renderClaudeMdTemplate(
@@ -1976,23 +2188,23 @@ function ensureClaudeMd(project, cfg = {}) {
 
     if (claudeMd.mode === 'create-if-missing') {
       fs.writeFileSync(target, rendered, 'utf8');
-      return { ok: true, action: 'created' };
+      return { ok: true, action: 'created', cwd: cwdInfo.dir, ...remapFields(cwdInfo) };
     }
 
     if (!fs.existsSync(target)) {
       fs.writeFileSync(target, rendered, 'utf8');
-      return { ok: true, action: 'created' };
+      return { ok: true, action: 'created', cwd: cwdInfo.dir, ...remapFields(cwdInfo) };
     }
 
     const block = managedClaudeMdBlock(rendered);
     const current = fs.readFileSync(target, 'utf8');
     if (CLAUDE_MD_BLOCK_RE.test(current)) {
       fs.writeFileSync(target, current.replace(CLAUDE_MD_BLOCK_RE, block), 'utf8');
-      return { ok: true, action: 'updated-block' };
+      return { ok: true, action: 'updated-block', cwd: cwdInfo.dir, ...remapFields(cwdInfo) };
     }
 
     fs.writeFileSync(target, appendManagedBlock(current, block), 'utf8');
-    return { ok: true, action: 'appended-block' };
+    return { ok: true, action: 'appended-block', cwd: cwdInfo.dir, ...remapFields(cwdInfo) };
   } catch (e) {
     return { ok: false, error: e.message };
   }
@@ -2043,20 +2255,6 @@ function dashboardBrowserUrl() {
   return `http://${urlHost}:${port}`;
 }
 
-function surfaceType(surface) {
-  return String(surface && surface.type || '').toLowerCase();
-}
-
-function surfaceUrl(surface) {
-  return surface && (surface.url || surface.href || surface.title || null);
-}
-
-function isDashboardBrowserSurface(surface, url) {
-  if (!surface || !surface.ref || surfaceType(surface) !== 'browser') return false;
-  const current = surfaceUrl(surface);
-  return !current || String(current) === url || !/^https?:\/\//i.test(String(current));
-}
-
 async function findGridWorkspace(opts = {}) {
   return findWorkspaceByTag(GRID_ID, opts);
 }
@@ -2068,11 +2266,13 @@ async function ensureGridWorkspace() {
     return existing.ref;
   }
 
+  const layout = gridWorkspaceLayout([], loadConfig());
   const out = await cmux([
     'new-workspace',
     '--name', 'cmux-dashboard grid',
     '--description', GRID_TAG,
     '--cwd', __dirname,
+    '--layout', JSON.stringify(layout),
     '--focus', 'false',
   ]);
   const ref = (out.match(/workspace:\d+/) || [])[0] || null;
@@ -2083,101 +2283,145 @@ async function ensureGridWorkspace() {
   return ref;
 }
 
-async function ensureGridAnchorSurface(wsRef) {
-  const surfaces = await listWorkspaceSurfaces(wsRef);
-  const url = dashboardBrowserUrl();
-  const existingBrowser = surfaces.find((surface) => isDashboardBrowserSurface(surface, url))
-    || surfaces.find((surface) => surface && surface.ref && surfaceType(surface) === 'browser');
-  if (existingBrowser) {
-    return {
-      surfaceRef: existingBrowser.ref,
-      paneRef: existingBrowser.paneRef || null,
-      type: 'browser',
-      url,
-      existing: true,
-    };
-  }
-
-  const terminalAnchor = surfaces.find((surface) => surface && surface.ref) || null;
-  const paneRef = terminalAnchor && terminalAnchor.paneRef || await getDefaultPaneRef(wsRef);
-  const beforeRefs = new Set(surfaces.map((surface) => surface && surface.ref).filter(Boolean));
-  const args = ['new-surface', '--type', 'browser', '--url', url, '--workspace', wsRef, '--focus', 'false'];
-  if (paneRef) args.push('--pane', paneRef);
-  try {
-    const out = await cmux(args);
-    const surfaceRef = surfaceRefFromText(out);
-    await settle(Math.min(CMUX_SETTLE_MS, 500));
-    const nextSurfaces = await listWorkspaceSurfaces(wsRef);
-    let created = surfaceRef ? surfaceByRef(nextSurfaces, surfaceRef) : null;
-    if (!created) {
-      created = nextSurfaces.find((surface) => surface && surface.ref && !beforeRefs.has(surface.ref) && surfaceType(surface) === 'browser') || null;
-    }
-    if (!created) {
-      created = nextSurfaces.find((surface) => surface && surface.ref && !beforeRefs.has(surface.ref)) || null;
-    }
-    if (!created || !created.ref) throw new Error(`grid browser anchor surface was not resolved in ${wsRef}`);
-    if (terminalAnchor && terminalAnchor.ref !== created.ref && terminalAnchor.paneRef === created.paneRef) {
-      try { await cmux(['close-surface', '--workspace', wsRef, '--surface', terminalAnchor.ref]); } catch (_) {}
-    }
-    return {
-      surfaceRef: created.ref,
-      paneRef: created.paneRef || paneRef || null,
-      type: surfaceType(created) || 'browser',
-      url,
-      existing: false,
-    };
-  } catch (e) {
-    if (terminalAnchor && terminalAnchor.ref) {
-      return {
-        surfaceRef: terminalAnchor.ref,
-        paneRef: terminalAnchor.paneRef || paneRef || null,
-        type: surfaceType(terminalAnchor) || 'terminal',
-        url: null,
-        existing: true,
-        fallback: true,
-        error: summarizeError(e),
-      };
-    }
-    throw e;
-  }
+function paneLayout(surface) {
+  return { pane: { surfaces: [surface] } };
 }
 
-async function createGridSplitSurface(wsRef, anchorSurfaceRef, direction) {
-  if (!wsRef) throw new Error('grid workspace ref is required');
-  if (!anchorSurfaceRef) throw new Error('grid split anchor surface is required');
-  if (!['left', 'right', 'up', 'down'].includes(direction)) throw new Error('invalid grid split direction: ' + direction);
+function gridBrowserLayout() {
+  return paneLayout({ type: 'browser', url: dashboardBrowserUrl() });
+}
 
-  const beforePanes = await listWorkspacePanes(wsRef);
-  const beforeSurfaces = await listWorkspaceSurfaces(wsRef);
-  const beforePaneRefs = new Set(beforePanes.map((pane) => pane && pane.ref).filter(Boolean));
-  const beforeSurfaceRefs = new Set(beforeSurfaces.map((surface) => surface && surface.ref).filter(Boolean));
+function gridTerminalLayout(project, cfg, columnId, slot) {
+  return paneLayout({ type: 'terminal', command: gridLaunchCommand(project, cfg, columnId, slot) });
+}
 
+function gridColumnLayout(project, cfg, columnId) {
+  return {
+    direction: 'vertical',
+    split: 0.5,
+    children: [
+      gridTerminalLayout(project, cfg, columnId, 'cc'),
+      gridTerminalLayout(project, cfg, columnId, 'cdx'),
+    ],
+  };
+}
+
+function equalHorizontalLayout(children) {
+  const list = (Array.isArray(children) ? children : []).filter(Boolean);
+  if (list.length <= 1) return list[0] || gridBrowserLayout();
+  return {
+    direction: 'horizontal',
+    split: 1 / list.length,
+    children: [
+      list[0],
+      equalHorizontalLayout(list.slice(1)),
+    ],
+  };
+}
+
+function gridWorkspaceLayout(columns, cfg) {
+  const columnLayouts = (Array.isArray(columns) ? columns : []).map((column) => {
+    const project = findConfiguredRow(cfg, column.projectId);
+    if (!project) throw new Error('unknown project: ' + column.projectId);
+    return gridColumnLayout(project, cfg, column.columnId || gridColumnId(column.projectId));
+  });
+  if (!columnLayouts.length) return gridBrowserLayout();
+  return {
+    direction: 'horizontal',
+    split: GRID_DASHBOARD_SPLIT,
+    children: [
+      gridBrowserLayout(),
+      equalHorizontalLayout(columnLayouts),
+    ],
+  };
+}
+
+async function closeGridWorkspaceIfPresent() {
+  const existing = await findGridWorkspace({ attempts: 1, allowStale: true, quick: true });
+  if (!existing || !existing.ref) return null;
+  try {
+    await cmux(['close-workspace', '--workspace', existing.ref]);
+    await settle(Math.min(CMUX_SETTLE_MS, 500));
+  } catch (_) {}
+  return existing.ref;
+}
+
+function markerSurface(surfaces, marker) {
+  return (Array.isArray(surfaces) ? surfaces : []).find((surface) => {
+    const text = slotMarkerSearchText(surface);
+    return text.includes(String(marker || '').toLowerCase());
+  }) || null;
+}
+
+async function listWorkspaceSurfacesWithRetry(wsRef, attempts = 4, markers = []) {
+  let surfaces = [];
+  const expected = (Array.isArray(markers) ? markers : []).map((marker) => String(marker || '').toLowerCase()).filter(Boolean);
+  for (let i = 0; i < attempts; i += 1) {
+    surfaces = await listWorkspaceSurfaces(wsRef);
+    if (
+      surfaces.length &&
+      (!expected.length || expected.every((marker) => markerSurface(surfaces, marker)))
+    ) return surfaces;
+    await settle(Math.min(CMUX_SETTLE_MS, 500));
+  }
+  return surfaces;
+}
+
+async function rebuildGridWorkspace(columns, cfg = loadConfig()) {
+  const desired = (Array.isArray(columns) ? columns : []).map((column) => ({
+    columnId: gridColumnId(column.projectId),
+    projectId: column.projectId,
+    createdAt: column.createdAt || new Date().toISOString(),
+  }));
+
+  if (!desired.length) {
+    const closedWs = await closeGridWorkspaceIfPresent();
+    gridRuntimeState.wsRef = null;
+    gridRuntimeState.columns = [];
+    return { wsRef: null, columns: [], closedWs, rebuilt: true };
+  }
+
+  await closeGridWorkspaceIfPresent();
+  const layout = gridWorkspaceLayout(desired, cfg);
   const out = await cmux([
-    'new-split',
-    direction,
-    '--workspace', wsRef,
-    '--surface', anchorSurfaceRef,
+    'new-workspace',
+    '--name', 'cmux-dashboard grid',
+    '--description', GRID_TAG,
+    '--cwd', __dirname,
+    '--layout', JSON.stringify(layout),
     '--focus', 'false',
   ]);
-  const outputSurfaceRef = surfaceRefFromText(out);
-  await settle(Math.min(CMUX_SETTLE_MS, 500));
+  const wsRef = (out.match(/workspace:\d+/) || [])[0] || null;
+  if (!wsRef) throw new Error('grid workspace was not resolved');
+  await settle();
 
-  const afterPanes = await listWorkspacePanes(wsRef);
-  const afterSurfaces = await listWorkspaceSurfaces(wsRef);
-  const createdPanes = afterPanes.filter((pane) => pane && pane.ref && !beforePaneRefs.has(pane.ref));
-  const createdSurfaces = afterSurfaces.filter((surface) => surface && surface.ref && !beforeSurfaceRefs.has(surface.ref));
-
-  let surface = outputSurfaceRef ? surfaceByRef(afterSurfaces, outputSurfaceRef) : null;
-  if (!surface && createdPanes.length) {
-    const paneRefs = new Set(createdPanes.map((pane) => pane.ref));
-    surface = createdSurfaces.find((item) => paneRefs.has(item.paneRef)) || null;
-  }
-  if (!surface && createdSurfaces.length) surface = createdSurfaces[createdSurfaces.length - 1];
-  if (!surface && outputSurfaceRef) surface = { ref: outputSurfaceRef, paneRef: null };
-  if (!surface || !surface.ref) {
-    throw new Error(`new-split did not create a grid surface in ${wsRef}`);
-  }
-  return { surfaceRef: surface.ref, paneRef: surface.paneRef || null, direction, splitFrom: anchorSurfaceRef };
+  const expectedMarkers = desired.flatMap((column) => [
+    gridSlotMarker(column.columnId, 'cc'),
+    gridSlotMarker(column.columnId, 'cdx'),
+  ]);
+  const surfaces = await listWorkspaceSurfacesWithRetry(wsRef, 6, expectedMarkers);
+  const now = new Date().toISOString();
+  const rebuilt = desired.map((column, idx) => {
+    const ccMarker = gridSlotMarker(column.columnId, 'cc');
+    const cdxMarker = gridSlotMarker(column.columnId, 'cdx');
+    const cc = markerSurface(surfaces, ccMarker);
+    const cdx = markerSurface(surfaces, cdxMarker);
+    if (!cc || !cc.ref) throw new Error(`grid layout did not create cc surface for ${column.projectId}`);
+    if (!cdx || !cdx.ref) throw new Error(`grid layout did not create cdx surface for ${column.projectId}`);
+    return {
+      columnId: column.columnId,
+      projectId: column.projectId,
+      wsRef,
+      order: idx,
+      cc: { surfaceRef: cc.ref, paneRef: cc.paneRef || null, marker: ccMarker },
+      cdx: { surfaceRef: cdx.ref, paneRef: cdx.paneRef || null, marker: cdxMarker },
+      createdAt: column.createdAt || now,
+      updatedAt: now,
+    };
+  });
+  gridRuntimeState.wsRef = wsRef;
+  gridRuntimeState.columns = rebuilt;
+  return { wsRef, columns: rebuilt.map((column, idx) => gridColumnSnapshot(column, idx)), layout, rebuilt: true };
 }
 
 function liveSurfaceIndex(surfaces) {
@@ -2234,61 +2478,33 @@ async function addProjectColumn(projectId) {
   const existing = gridRuntimeState.columns.find((column) => column.projectId === projectId);
   if (existing) return { ...gridColumnSnapshot(existing, existing.order), already: true, added: false };
 
-  const wsRef = await ensureGridWorkspace();
-  await validateGridRuntimeState();
-  const anchor = gridRuntimeState.columns.length
-    ? { surfaceRef: gridRuntimeState.columns[gridRuntimeState.columns.length - 1].cc.surfaceRef }
-    : await ensureGridAnchorSurface(wsRef);
-  const cc = await createGridSplitSurface(wsRef, anchor.surfaceRef, 'right');
-  const cdx = await createGridSplitSurface(wsRef, cc.surfaceRef, 'down');
-
-  await cmux(['send', '--workspace', wsRef, '--surface', cc.surfaceRef, gridLaunchText(project, cfg, columnId, 'cc')]);
-  await cmux(['send', '--workspace', wsRef, '--surface', cdx.surfaceRef, gridLaunchText(project, cfg, columnId, 'cdx')]);
-  await settle();
-
   const now = new Date().toISOString();
-  const column = {
-    columnId,
-    projectId,
-    wsRef,
-    order: gridRuntimeState.columns.length,
-    cc: { surfaceRef: cc.surfaceRef, paneRef: cc.paneRef || null, marker: gridSlotMarker(columnId, 'cc') },
-    cdx: { surfaceRef: cdx.surfaceRef, paneRef: cdx.paneRef || null, marker: gridSlotMarker(columnId, 'cdx') },
-    createdAt: now,
-    updatedAt: now,
-  };
-  gridRuntimeState.columns.push(column);
-  return { ...gridColumnSnapshot(column, column.order), added: true, already: false };
+  const result = await rebuildGridWorkspace([
+    ...gridRuntimeState.columns,
+    { columnId, projectId, createdAt: now },
+  ], cfg);
+  const column = result.columns.find((item) => item && item.projectId === projectId);
+  if (!column) throw new Error('grid column was not rebuilt: ' + projectId);
+  return { ...column, added: true, already: false, rebuilt: true };
 }
 
 async function removeProjectColumn(projectId) {
   await validateGridRuntimeState();
   const idx = gridRuntimeState.columns.findIndex((column) => column.projectId === projectId);
   if (idx < 0) {
-    return { projectId, removed: false, already: true, ...(await getGridState()) };
+      return { projectId, removed: false, already: true, ...(await getGridState()) };
   }
-  const column = gridRuntimeState.columns[idx];
-  const wsRef = gridRuntimeState.wsRef || column.wsRef;
-  const refs = [column.cdx && column.cdx.surfaceRef, column.cc && column.cc.surfaceRef].filter(Boolean);
-  let closed = 0;
-  for (const ref of refs) {
-    try {
-      await cmux(['close-surface', '--workspace', wsRef, '--surface', ref]);
-      closed += 1;
-    } catch (_) {}
-  }
-  gridRuntimeState.columns.splice(idx, 1);
-  reindexGridColumns();
-  await settle(Math.min(CMUX_SETTLE_MS, 500));
-  if (gridRuntimeState.columns.length === 0 && wsRef) {
-    await cmux(['close-workspace', '--workspace', wsRef]);
-    await settle(Math.min(CMUX_SETTLE_MS, 500));
-    gridRuntimeState.wsRef = null;
-    gridRuntimeState.columns = [];
-    return { projectId, removed: true, closed, wsClosed: true, wsRef: null, columns: [] };
-  }
-  const state = await getGridState();
-  return { projectId, removed: true, closed, ...state };
+  const previousWsRef = gridRuntimeState.wsRef || gridRuntimeState.columns[idx].wsRef || null;
+  const remaining = gridRuntimeState.columns.filter((_, columnIdx) => columnIdx !== idx);
+  const result = await rebuildGridWorkspace(remaining);
+  return {
+    projectId,
+    removed: true,
+    rebuilt: true,
+    closedWorkspace: previousWsRef,
+    wsClosed: remaining.length === 0,
+    ...result,
+  };
 }
 
 async function openProject(id, { focus = true } = {}) {
@@ -2297,15 +2513,16 @@ async function openProject(id, { focus = true } = {}) {
   if (!p) throw new Error('unknown project: ' + id);
   const ag = projectAgmsgConfig(p, cfg);
   const collabEnabled = projectCollabEnabled(p, cfg);
+  const cwdInfo = rowCwdInfo(p, { create: true });
   const claudeMd = ensureClaudeMd(p, cfg);
   if (!claudeMd.ok) console.warn(`CLAUDE.md preflight failed for ${id}: ${claudeMd.error}`);
 
   const existing = await findWorkspaceByTag(id, { attempts: 3, delayMs: 500 });
   if (existing) {
     if (focus) await focusProject(id);
-    const collab = collabEnabled ? await ensureCollab(rowCwd(p), true, { team: teamName(p.id) }) : { ok: true, on: false, skipped: true };
+    const collab = collabEnabled ? withRemapFields(await ensureCollab(cwdInfo.dir, true, { team: teamName(p.id), projectId: p.id }), cwdInfo) : { ok: true, on: false, skipped: true };
     const slots = collabEnabled ? await ensureCollabSlots(id) : [];
-    return { ref: existing.ref, wsRef: existing.ref, alreadyOpen: true, claudeMd, slots, collab, state: await getProjectState(id) };
+    return { ref: existing.ref, wsRef: existing.ref, alreadyOpen: true, cwd: cwdInfo.dir, ...remapFields(cwdInfo), claudeMd, slots, collab, state: await getProjectState(id) };
   }
 
   // 1) agmsg チームをセットアップ（claude 起動前に hook を書き込む）
@@ -2317,16 +2534,16 @@ async function openProject(id, { focus = true } = {}) {
     'new-workspace',
     '--name', `${p.emoji || (isGlobalProject(p) ? '⌘' : '📁')} ${p.name || p.id}`,
     '--description', TAG + id,
-    '--cwd', rowCwd(p),
+    '--cwd', cwdInfo.dir,
     '--focus', focus ? 'true' : 'false',
   ];
   const out = await cmux(args);
   const ref = (out.match(/workspace:\d+/) || [])[0] || null;
   await settle();
-  const collab = (ref && collabEnabled) ? await ensureCollab(rowCwd(p), true, { team: teamName(p.id) }) : { ok: true, on: false, skipped: true };
+  const collab = (ref && collabEnabled) ? withRemapFields(await ensureCollab(cwdInfo.dir, true, { team: teamName(p.id), projectId: p.id }), cwdInfo) : { ok: true, on: false, skipped: true };
   const slots = (ref && collabEnabled) ? await ensureCollabSlots(id) : [];
 
-  return { ref, wsRef: ref, alreadyOpen: false, agmsg: agResult, claudeMd, slots, collab, state: ref ? await getProjectState(id) : null };
+  return { ref, wsRef: ref, alreadyOpen: false, cwd: cwdInfo.dir, ...remapFields(cwdInfo), agmsg: agResult, claudeMd, slots, collab, state: ref ? await getProjectState(id) : null };
 }
 
 async function ensureCollabSlots(id) {
@@ -2341,8 +2558,9 @@ async function ensureCollabPair(id, on) {
   const cfg = loadConfig();
   const project = findConfiguredRow(cfg, id);
   if (!project) throw new Error('unknown project: ' + id);
+  const cwdInfo = rowCwdInfo(project, { create: projectCollabEnabled(project, cfg) });
   const collab = projectCollabEnabled(project, cfg)
-    ? await ensureCollab(rowCwd(project), true, { team: teamName(project.id) })
+    ? withRemapFields(await ensureCollab(cwdInfo.dir, true, { team: teamName(project.id), projectId: project.id }), cwdInfo)
     : { ok: true, on: false, skipped: true };
   const slots = [];
   if (on) {
@@ -2353,7 +2571,7 @@ async function ensureCollabPair(id, on) {
   }
   const state = await getProjectState(id);
   const active = projectCollabEnabled(project, cfg) && collabActiveFromProjectState(state);
-  return { id, on: !!on, collab: { enabled: projectCollabEnabled(project, cfg), active, running: active, mode: 'pane-delivery' }, slots, setup: collab, state };
+  return { id, on: !!on, cwd: cwdInfo.dir, ...remapFields(cwdInfo), collab: { enabled: projectCollabEnabled(project, cfg), active, running: active, mode: 'pane-delivery' }, slots, setup: collab, state };
 }
 
 async function ensureSlot(id, slot, on) {
@@ -2361,6 +2579,7 @@ async function ensureSlot(id, slot, on) {
   const cfg = loadConfig();
   const p = findConfiguredRow(cfg, id);
   if (!p) throw new Error('unknown project: ' + id);
+  const cwdInfo = rowCwdInfo(p, { create: !!on });
 
   if (on) {
     let state = await getProjectState(id);
@@ -2371,7 +2590,7 @@ async function ensureSlot(id, slot, on) {
     if (state.slots[slot] && state.slotRefs[slot]) {
       const repaired = await repairSharedSlotPane(state, slot);
       if (!repaired) {
-        return { id, slot, on: true, already: true, ref: state.slotRefs[slot], paneRef: state.slotPaneRefs[slot] || null, wsRef: state.wsRef };
+        return { id, slot, on: true, already: true, ref: state.slotRefs[slot], paneRef: state.slotPaneRefs[slot] || null, wsRef: state.wsRef, cwd: cwdInfo.dir, ...remapFields(cwdInfo) };
       }
       await settle(Math.min(CMUX_SETTLE_MS, 500));
       state = await getProjectState(id);
@@ -2392,15 +2611,17 @@ async function ensureSlot(id, slot, on) {
       wsRef: next.wsRef,
       split: created.split,
       reused: !!created.reused,
+      cwd: cwdInfo.dir,
+      ...remapFields(cwdInfo),
     };
   }
 
   const state = await getProjectState(id);
-  if (!state.open || !state.slots[slot]) return { id, slot, on: false, already: true, wsRef: state.wsRef };
+  if (!state.open || !state.slots[slot]) return { id, slot, on: false, already: true, wsRef: state.wsRef, cwd: cwdInfo.dir, ...remapFields(cwdInfo) };
   const closed = await closeSlotOwnedPaneSurfaces(id, state, slot);
   const next = closed.next || await getProjectState(id);
   if (!next.slots[slot]) forgetSlotRef(id, slot);
-  return { id, slot, on: !!next.slots[slot], closed: closed.closed, paneRefs: closed.paneRefs, wsRef: next.wsRef };
+  return { id, slot, on: !!next.slots[slot], closed: closed.closed, paneRefs: closed.paneRefs, wsRef: next.wsRef, cwd: cwdInfo.dir, ...remapFields(cwdInfo) };
 }
 
 async function closeProject(id) {
@@ -2415,7 +2636,10 @@ async function closeProject(id) {
     result = { closed: true, ref: ws.ref };
   }
   if (p && projectCollabEnabled(p, cfg)) {
-    result.collab = await ensureCollab(rowCwd(p), false, { team: teamName(p.id) });
+    const cwdInfo = rowCwdInfo(p);
+    result.cwd = cwdInfo.dir;
+    Object.assign(result, remapFields(cwdInfo));
+    result.collab = withRemapFields(await ensureCollab(cwdInfo.dir, false, { team: teamName(p.id), projectId: p.id }), cwdInfo);
   }
   return result;
 }
@@ -2546,8 +2770,15 @@ function addProject({ name, path: ppath, color, emoji, topCmd, bottomCmd, create
   if (!cleanName && !cleanPath) throw new Error('project name or path is required');
   let id = slugify(cleanName || path.basename(expandHome(cleanPath)) || cleanPath);
   while (cfg.projects.some((p) => p.id === id)) id += '-1';
-  // パス未指定なら ~/projects/<id> を既定にする（新規プロジェクト作成を楽にする）
-  const finalPath = cleanPath || `~/projects/${id}`;
+  // パス未指定なら安全な projects root 配下を既定にする（新規プロジェクト作成を楽にする）
+  const requestedPath = cleanPath || defaultProjectPath(id);
+  const dirInfo = resolveProjectDirInput(requestedPath, {
+    id,
+    name: cleanName || id,
+    create: !!create,
+    fallback: defaultProjectPath(id),
+  });
+  const finalPath = dirInfo.remappedFrom ? toHomeDisplayPath(dirInfo.dir) : requestedPath;
   const proj = {
     id, name: cleanName || id, path: finalPath,
     color: color || PALETTE[cfg.projects.length % PALETTE.length],
@@ -2558,15 +2789,14 @@ function addProject({ name, path: ppath, color, emoji, topCmd, bottomCmd, create
 
   // フォルダを実際に作成（無ければ）。理想形を自動で保つための足場づくり。
   if (create) {
-    const abs = expandHome(finalPath);
-    try { fs.mkdirSync(abs, { recursive: true }); } catch (_) {}
+    const abs = dirInfo.dir;
     if (gitInit) {
       try { if (!fs.existsSync(path.join(abs, '.git'))) require('child_process').execFileSync('git', ['init', '-q'], { cwd: abs }); } catch (_) {}
     }
   }
   cfg.projects.push(proj);
   saveConfig(cfg);
-  return proj;
+  return { ...proj, cwd: dirInfo.dir, ...remapFields(dirInfo) };
 }
 function removeProject(id) {
   const cfg = loadConfig();
@@ -2578,8 +2808,8 @@ function removeProject(id) {
 }
 
 module.exports = {
-  CMUX, TAG, AGMSG_DIR, CMUX_CONTEXT_ENV_KEYS, SLOT_ORDER, SLOT_DEFS,
-  buildCmuxEnv, agmsgAvailable, teamName,
+  CMUX, TAG, AGMSG_DIR, CMUX_CONTEXT_ENV_KEYS, SLOT_ORDER, SLOT_DEFS, CMUX_DASH_PROJECTS_ROOT,
+  buildCmuxEnv, agmsgAvailable, teamName, isTransient,
   parseTop, parseMemory, classifyProcess, getMetrics,
   doctor,
   ensureClaudeMd,
@@ -2587,7 +2817,7 @@ module.exports = {
   agmsgDbPath, getTeamMessages,
   createCmuxHealthTracker, getCmuxHealth, pingCmuxForRecovery,
   getState, getWorkspaceYaml, getProjectState, ensureSlot, ensureCollabSlots, sendToSurface, submitToSurface, loadConfig, saveConfig, openProject, closeProject, focusProject,
-  ensureGridWorkspace, addProjectColumn, removeProjectColumn, getGridState,
-  openAll, closeAll, reorderProjects, addProject, removeProject, expandHome,
+  ensureGridWorkspace, addProjectColumn, removeProjectColumn, getGridState, gridWorkspaceLayout,
+  openAll, closeAll, reorderProjects, addProject, removeProject, expandHome, rowCwd, rowCwdInfo, normalizeCollabProjectDir, normalizeCollabProjectDirInfo,
   projectKind, isGlobalProject, configuredRows, configuredProjectRows, configuredGlobalRows,
 };

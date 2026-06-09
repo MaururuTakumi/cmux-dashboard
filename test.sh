@@ -596,34 +596,105 @@ NODE
     desc=""
     name=""
     cwd=""
+    layout=""
     while [ "\$#" -gt 0 ]; do
       case "\$1" in
         --description) desc="\${2:-}"; shift 2 ;;
         --name) name="\${2:-}"; shift 2 ;;
         --cwd) cwd="\${2:-}"; shift 2 ;;
+        --layout) layout="\${2:-}"; shift 2 ;;
         *) shift ;;
       esac
     done
-    "\$NODE_BIN" - "\$STATE" "\$desc" "\$name" "\$cwd" <<'NODE'
+    "\$NODE_BIN" - "\$STATE" "\$desc" "\$name" "\$cwd" "\$layout" <<'NODE'
 const fs = require("fs");
 const file = process.argv[2];
 const desc = process.argv[3] || "cmuxdash:unknown";
 const name = process.argv[4] || "";
 const cwd = process.argv[5] || "";
+const layoutText = process.argv[6] || "";
 let s = { workspaces: [], panes: [], surfaces: [], nextWorkspace: 1, nextPane: 1, nextSurface: 1 };
 try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
 s.workspaces = Array.isArray(s.workspaces) ? s.workspaces : [];
 s.panes = Array.isArray(s.panes) ? s.panes : [];
 s.surfaces = Array.isArray(s.surfaces) ? s.surfaces : [];
 const wsRef = "workspace:" + (s.nextWorkspace || 1);
-const paneRef = "pane:" + (s.nextPane || 1);
-const surfaceRef = "surface:" + (s.nextSurface || 1);
 s.nextWorkspace = (s.nextWorkspace || 1) + 1;
-s.nextPane = (s.nextPane || 1) + 1;
-s.nextSurface = (s.nextSurface || 1) + 1;
-s.workspaces.push({ ref: wsRef, description: desc, name, cwd, selected: false, latest_conversation_message: null, latest_submitted_at: null });
-s.panes.push({ ref: paneRef, workspace: wsRef, index: 0 });
-s.surfaces.push({ ref: surfaceRef, workspace: wsRef, pane: paneRef, title: "terminal", type: "terminal", process: "zsh", cwd, sendText: null, initial: true });
+let layout = null;
+try { if (layoutText) layout = JSON.parse(layoutText); } catch (_) {}
+s.workspaces.push({ ref: wsRef, description: desc, name, cwd, selected: false, latest_conversation_message: null, latest_submitted_at: null, layout });
+function parseCwd(text) {
+  const cdMarker = "cd " + String.fromCharCode(39);
+  const cdStart = String(text || "").indexOf(cdMarker);
+  if (cdStart < 0) return null;
+  const quote = String.fromCharCode(39);
+  const backslash = String.fromCharCode(92);
+  const rest = String(text || "").slice(cdStart + cdMarker.length);
+  let parsed = "";
+  for (let i = 0; i < rest.length; i += 1) {
+    if (rest[i] === quote) {
+      if (rest[i + 1] === backslash && rest[i + 2] === quote && rest[i + 3] === quote) {
+        parsed += quote;
+        i += 3;
+        continue;
+      }
+      return parsed;
+    }
+    parsed += rest[i];
+  }
+  return null;
+}
+function addPaneSurface(surfaceSpec, meta) {
+  const paneRef = "pane:" + (s.nextPane || 1);
+  const surfaceRef = "surface:" + (s.nextSurface || 1);
+  s.nextPane = (s.nextPane || 1) + 1;
+  s.nextSurface = (s.nextSurface || 1) + 1;
+  const type = surfaceSpec && surfaceSpec.type || "terminal";
+  const command = surfaceSpec && surfaceSpec.command || "";
+  const url = surfaceSpec && surfaceSpec.url || null;
+  const gridMatch = String(command).match(/(cmuxdash:grid:[^\s']+:slot:(cc|cdx))/);
+  const slot = gridMatch && gridMatch[2] || null;
+  const title = type === "browser" ? url : (gridMatch && gridMatch[1] || "terminal");
+  const processBySlot = { cc: "claude", cdx: "codex" };
+  s.panes.push({ ref: paneRef, workspace: wsRef, index: s.panes.filter((p) => p && p.workspace === wsRef).length, ...(meta || {}) });
+  s.surfaces.push({
+    ref: surfaceRef,
+    workspace: wsRef,
+    pane: paneRef,
+    title,
+    type,
+    url: type === "browser" ? url : null,
+    process: type === "browser" ? "browser" : (processBySlot[slot] || "zsh"),
+    cwd: parseCwd(command) || cwd || null,
+    sendText: command || null,
+    layoutPath: meta && meta.layoutPath || "",
+    layoutDirection: meta && meta.layoutDirection || null,
+    layoutSplit: meta && meta.layoutSplit || null,
+  });
+}
+function walk(node, path, inherited = {}) {
+  if (!node) return;
+  if (node.pane) {
+    const surfaces = Array.isArray(node.pane.surfaces) ? node.pane.surfaces : [];
+    addPaneSurface(surfaces[0] || { type: "terminal" }, { ...inherited, layoutPath: path });
+    return;
+  }
+  const children = Array.isArray(node.children) ? node.children : [];
+  children.forEach((child, idx) => walk(child, path ? path + "." + idx : String(idx), {
+    layoutDirection: node.direction || null,
+    layoutSplit: node.split == null ? null : node.split,
+  }));
+}
+if (layout) {
+  walk(layout, "root");
+} else {
+  const paneRef = "pane:" + (s.nextPane || 1);
+  const surfaceRef = "surface:" + (s.nextSurface || 1);
+  s.nextPane = (s.nextPane || 1) + 1;
+  s.nextSurface = (s.nextSurface || 1) + 1;
+  s.panes.push({ ref: paneRef, workspace: wsRef, index: 0 });
+  s.surfaces.push({ ref: surfaceRef, workspace: wsRef, pane: paneRef, title: "terminal", type: "terminal", process: "zsh", cwd, sendText: null, initial: true });
+}
     fs.writeFileSync(file, JSON.stringify(s) + "\n");
     process.stdout.write(wsRef + "\n");
 NODE
@@ -1269,8 +1340,8 @@ async function exerciseAllSlots(id, expectedCwd, label) {
     check("workspace YAML is parseable and contains global CC slot state", yamlHasGlobalCcOn(yaml));
 
     {
-      const gridRef = await ctl.ensureGridWorkspace();
-      const gridWs = workspaceFor("__grid__");
+      const initialGridRef = await ctl.ensureGridWorkspace();
+      const initialGridWs = workspaceFor("__grid__");
       const dashboardUrl = "http://" + (process.env.CMUX_DASH_HOST || "127.0.0.1") + ":" + (process.env.CMUX_DASH_PORT || "7799");
       const alphaStateBeforeGrid = await ctl.getProjectState("alpha");
       const alphaColumn = await ctl.addProjectColumn("alpha");
@@ -1279,28 +1350,36 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       const afterRepeatCount = surfaceCountFor("__grid__");
       const generalColumn = await ctl.addProjectColumn("cc-general");
       const gridState = await ctl.getGridState();
-      const alphaCc = rawSurface(alphaColumn.cc.surfaceRef);
-      const alphaCdx = rawSurface(alphaColumn.cdx.surfaceRef);
-      const generalCc = rawSurface(generalColumn.cc.surfaceRef);
-      const generalCdx = rawSurface(generalColumn.cdx.surfaceRef);
+      const gridWs = workspaceFor("__grid__");
+      const alphaGridColumn = gridState.columns.find((column) => column.projectId === "alpha");
+      const generalGridColumn = gridState.columns.find((column) => column.projectId === "cc-general");
+      const alphaCc = rawSurface(alphaGridColumn && alphaGridColumn.cc.surfaceRef);
+      const alphaCdx = rawSurface(alphaGridColumn && alphaGridColumn.cdx.surfaceRef);
+      const generalCc = rawSurface(generalGridColumn && generalGridColumn.cc.surfaceRef);
+      const generalCdx = rawSurface(generalGridColumn && generalGridColumn.cdx.surfaceRef);
       const browserAnchor = surfacesFor("__grid__").find((surface) => (
         surface &&
         surface.type === "browser" &&
         surface.url === dashboardUrl
       ));
       const alphaStateAfterGrid = await ctl.getProjectState("alpha");
+      const layout = gridWs && gridWs.layout || {};
+      const rightLayout = layout.children && layout.children[1] || {};
+      const firstColumnLayout = rightLayout.children && rightLayout.children[0] || {};
+      const secondColumnLayout = rightLayout.children && rightLayout.children[1] || {};
 
       check("grid C1: ensureGridWorkspace uses dedicated tag and stays out of project state", (
-        gridRef &&
-        gridWs &&
-        gridWs.ref === gridRef &&
-        gridWs.description === "cmuxdash:__grid__" &&
-        alphaStateBeforeGrid.wsRef !== gridRef &&
-        alphaStateAfterGrid.wsRef !== gridRef &&
+        initialGridRef &&
+        initialGridWs &&
+        initialGridWs.ref === initialGridRef &&
+        initialGridWs.description === "cmuxdash:__grid__" &&
+        surfacesFor("__grid__").some((surface) => surface.type === "browser") &&
+        alphaStateBeforeGrid.wsRef !== initialGridRef &&
+        alphaStateAfterGrid.wsRef !== gridState.wsRef &&
         alphaStateAfterGrid.surfaces.every((surface) => !String(surface.title || "").includes("cmuxdash:grid:"))
       ));
       check("grid C1: addProjectColumn creates ordered scoped cc/cdx columns", (
-        gridState.wsRef === gridRef &&
+        gridState.wsRef === gridWs.ref &&
         gridState.columns.length === 2 &&
         gridState.columns.map((column) => column.projectId).join(",") === "alpha,cc-general" &&
         alphaColumn.added === true &&
@@ -1318,20 +1397,50 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       ));
       check("grid C4: dashboard browser anchor points at the running dashboard URL", (
         browserAnchor &&
-        browserAnchor.title === dashboardUrl &&
-        browserAnchor.url === dashboardUrl
+          browserAnchor.title === dashboardUrl &&
+          browserAnchor.url === dashboardUrl
       ));
-      check("grid C1: columns split from explicit surface anchors in order", (
+      check("grid C1: layout JSON makes narrow dashboard plus equal full-height columns", (
         browserAnchor &&
-        alphaCc.splitFrom === browserAnchor.ref &&
-        alphaCc.direction === "right" &&
-        alphaCdx.splitFrom === alphaCc.ref &&
-        alphaCdx.direction === "down" &&
-        generalCc.splitFrom === alphaCc.ref &&
-        generalCc.direction === "right" &&
-        generalCdx.splitFrom === generalCc.ref &&
-        generalCdx.direction === "down"
+        layout.direction === "horizontal" &&
+        Math.abs(layout.split - 0.18) < 0.0001 &&
+        rightLayout.direction === "horizontal" &&
+        Math.abs(rightLayout.split - 0.5) < 0.0001 &&
+        firstColumnLayout.direction === "vertical" &&
+        Math.abs(firstColumnLayout.split - 0.5) < 0.0001 &&
+        secondColumnLayout.direction === "vertical" &&
+        Math.abs(secondColumnLayout.split - 0.5) < 0.0001 &&
+        !alphaCc.splitFrom &&
+        !generalCc.splitFrom
       ));
+      {
+        const threeColumnLayout = ctl.gridWorkspaceLayout([
+          { projectId: "ga", columnId: "ga" },
+          { projectId: "gb", columnId: "gb" },
+          { projectId: "gc", columnId: "gc" },
+        ], {
+          defaults: { slotCommands: { cc: "true", cdx: "true" } },
+          projects: [
+            { id: "ga", path: alphaDir },
+            { id: "gb", path: alphaDir },
+            { id: "gc", path: alphaDir },
+          ],
+        });
+        const threeRight = threeColumnLayout.children && threeColumnLayout.children[1] || {};
+        const threeTail = threeRight.children && threeRight.children[1] || {};
+        const ga = threeRight.children && threeRight.children[0] || {};
+        const gb = threeTail.children && threeTail.children[0] || {};
+        const gc = threeTail.children && threeTail.children[1] || {};
+        check("grid C1: three-column layout keeps equal project column proportions", (
+          threeColumnLayout.direction === "horizontal" &&
+          Math.abs(threeColumnLayout.split - 0.18) < 0.0001 &&
+          threeRight.direction === "horizontal" &&
+          Math.abs(threeRight.split - (1 / 3)) < 0.0001 &&
+          threeTail.direction === "horizontal" &&
+          Math.abs(threeTail.split - 0.5) < 0.0001 &&
+          [ga, gb, gc].every((column) => column.direction === "vertical" && Math.abs(column.split - 0.5) < 0.0001)
+        ));
+      }
       check("grid C1: duplicate addProjectColumn is idempotent", (
         repeatAlpha &&
         repeatAlpha.already === true &&
@@ -1344,15 +1453,17 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       const afterRemove = await ctl.getGridState();
       const afterRemoveCount = surfaceCountFor("__grid__");
       const repeatRemove = await ctl.removeProjectColumn("alpha");
+      const survivingGeneral = afterRemove.columns[0] || {};
       check("grid C1: removeProjectColumn closes only tracked column surfaces", (
         removedAlpha.removed === true &&
-        removedAlpha.closed >= 2 &&
+        removedAlpha.rebuilt === true &&
+        removedAlpha.closedWorkspace === gridState.wsRef &&
         afterRemove.columns.length === 1 &&
         afterRemove.columns[0].projectId === "cc-general" &&
-        !rawSurface(alphaColumn.cc.surfaceRef) &&
-        !rawSurface(alphaColumn.cdx.surfaceRef) &&
-        !!rawSurface(generalColumn.cc.surfaceRef) &&
-        !!rawSurface(generalColumn.cdx.surfaceRef)
+        !rawSurface(alphaGridColumn.cc.surfaceRef) &&
+        !rawSurface(alphaGridColumn.cdx.surfaceRef) &&
+        !!rawSurface(survivingGeneral.cc.surfaceRef) &&
+        !!rawSurface(survivingGeneral.cdx.surfaceRef)
       ));
       check("grid C1: repeated removeProjectColumn is idempotent", (
         repeatRemove &&
@@ -1362,11 +1473,11 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       ));
       {
         const raw = rawCmuxState();
-        raw.surfaces = (raw.surfaces || []).filter((surface) => surface && surface.ref !== generalColumn.cc.surfaceRef);
+        raw.surfaces = (raw.surfaces || []).filter((surface) => surface && surface.ref !== survivingGeneral.cc.surfaceRef);
         fs.writeFileSync(stateFile, JSON.stringify(raw) + "\n");
         const staleGridState = await ctl.getGridState();
         check("grid C4: getGridState drops columns with stale live surface refs", (
-          staleGridState.wsRef === gridRef &&
+          staleGridState.wsRef === afterRemove.wsRef &&
           Array.isArray(staleGridState.columns) &&
           staleGridState.columns.length === 0
         ));
@@ -2451,7 +2562,9 @@ process.exit(res.status == null ? 1 : res.status);
       "(2, '2026-06-08T00:00:02Z', 'alpha', 'claude', 'codex', 'already read', '2026-06-08T00:00:03Z'),",
       "(3, '2026-06-08T00:00:03Z', 'alpha', 'bob', 'codex', 'wrong from', NULL),",
       "(4, '2026-06-08T00:00:04Z', 'beta', 'claude', 'codex', 'wrong team', NULL),",
-      "(0, '2026-06-08T00:00:05Z', 'alpha', 'codex', 'claude', 'wrong direction', NULL);",
+      "(0, '2026-06-08T00:00:05Z', 'alpha', 'codex', 'claude', 'wrong direction', NULL),",
+      "(8, '2026-06-08T00:00:08Z', 'grid-weird', 'claude', 'codex', 'grid-only-body', NULL),",
+      "(9, '2026-06-08T00:00:09Z', 'dual', 'claude', 'codex', 'double-presence-body', NULL);",
     ].join(" "));
 
     const deliveryModule = require(path.join(repo, "collab-delivery.js"));
@@ -2558,6 +2671,106 @@ process.exit(res.status == null ? 1 : res.status);
     check("R6 delivery treats codex reply as delivered", (
       snap.pending.length === 0 &&
       snap.highWater === 6
+    ));
+
+    sends = [];
+    now += 60;
+    const gridOnlyCtl = {
+      teamName(id) { return String(id).replace(/[^A-Za-z0-9_-]/g, "-"); },
+      async getState() {
+        return {
+          projects: [],
+          globalRows: [],
+          grid: {
+            wsRef: "workspace:grid",
+            columns: [{
+              columnId: "grid/weird",
+              projectId: "grid/weird",
+              team: "wrong-grid-team",
+              cc: { surfaceRef: "surface:grid-cc" },
+              cdx: { surfaceRef: "surface:grid-cdx" },
+            }],
+          },
+        };
+      },
+      async submitToSurface(wsRef, surfaceRef, text) {
+        sends.push({ wsRef, surfaceRef, text });
+      },
+    };
+    const gridOnlyDelivery = deliveryModule.createCollabDelivery({
+      ctl: gridOnlyCtl,
+      dbPath: db,
+      sqlite3Bin: sqliteWrapper,
+      env: { ...process.env, REAL_SQLITE3: realSqlite3 },
+      intervalMs: 0,
+      retryMs: 50,
+      minWakeIntervalMs: 0,
+      now: () => now,
+    });
+    await gridOnlyDelivery.tick();
+    const gridSnap = gridOnlyDelivery.snapshot();
+    const gridKey = "grid:grid/weird:workspace:grid:surface:grid-cdx";
+    check("R6 delivery targets grid-column cdx surface using teamName(projectId)", (
+      sends.length === 1 &&
+      sends[0].wsRef === "workspace:grid" &&
+      sends[0].surfaceRef === "surface:grid-cdx" &&
+      sends[0].text === deliveryModule.DEFAULT_WAKE_TEXT &&
+      gridSnap.gridColumns[gridKey] &&
+      gridSnap.gridColumns[gridKey].pending.length === 1 &&
+      gridSnap.gridColumns[gridKey].pending[0].id === 8
+    ));
+
+    sends = [];
+    now += 60;
+    const doubleCtl = {
+      teamName(id) { return String(id).replace(/[^A-Za-z0-9_-]/g, "-"); },
+      async getState() {
+        return {
+          projects: [{
+            id: "dual",
+            team: "dual",
+            open: true,
+            wsRef: "workspace:dual",
+            slotRefs: { cc: "surface:dual-cc", cdx: "surface:dual-cdx" },
+            collab: { enabled: true, active: true },
+          }],
+          globalRows: [],
+          grid: {
+            wsRef: "workspace:grid",
+            columns: [{
+              columnId: "dual",
+              projectId: "dual",
+              cc: { surfaceRef: "surface:grid-dual-cc" },
+              cdx: { surfaceRef: "surface:grid-dual-cdx" },
+            }],
+          },
+        };
+      },
+      async submitToSurface(wsRef, surfaceRef, text) {
+        sends.push({ wsRef, surfaceRef, text });
+      },
+    };
+    const doubleDelivery = deliveryModule.createCollabDelivery({
+      ctl: doubleCtl,
+      dbPath: db,
+      sqlite3Bin: sqliteWrapper,
+      env: { ...process.env, REAL_SQLITE3: realSqlite3 },
+      intervalMs: 0,
+      retryMs: 50,
+      minWakeIntervalMs: 0,
+      now: () => now,
+    });
+    await doubleDelivery.tick();
+    const doubleSnap = doubleDelivery.snapshot();
+    const doubleGridKey = "grid:dual:workspace:grid:surface:grid-dual-cdx";
+    const doubleSurfaces = sends.map((send) => send.surfaceRef).sort().join(",");
+    check("R6 delivery double-presence wakes project and grid targets separately", (
+      sends.length === 2 &&
+      doubleSurfaces === "surface:dual-cdx,surface:grid-dual-cdx" &&
+      doubleSnap.projects.dual &&
+      doubleSnap.projects.dual.pending[0].id === 9 &&
+      doubleSnap.gridColumns[doubleGridKey] &&
+      doubleSnap.gridColumns[doubleGridKey].pending[0].id === 9
     ));
 
     sends = [];
@@ -5207,10 +5420,11 @@ run_r3_rich_checks() {
   local line
   local status
   local add_body
+  local name_only_body
   local delete_body
   local invalid_status
   local ui_check
-  mkdir -p "$phase_dir/a" "$phase_dir/b" "$phase_dir/c"
+  mkdir -p "$phase_dir/a" "$phase_dir/b" "$phase_dir/c" "$phase_dir/home/projects"
   : >"$event_log"
   cat >"$fake_cmux" <<SH
 #!/usr/bin/env bash
@@ -5269,6 +5483,7 @@ SH
 
   results="$(
     CMUX_BIN="$fake_cmux" \
+    HOME="$phase_dir/home" \
     CMUX_DASH_PROJECTS_FILE="$cfg_file" \
     CMUX_DASH_SETTLE_MS=0 \
     CMUX_DASH_READ_TIMEOUT=1000 \
@@ -5315,6 +5530,34 @@ function ids() {
   try {
     writeBaseConfig();
     const ctl = require(path.join(repo, "cmuxctl.js"));
+    const fakeHome = process.env.HOME;
+    const projectsRoot = path.join(fakeHome, "projects");
+    check("R-B project root defaults to ~/projects under current HOME", (
+      ctl.CMUX_DASH_PROJECTS_ROOT === path.resolve(projectsRoot)
+    ));
+    const unsafeInfo = ctl.rowCwdInfo({ id: "unsafe-root", name: "Unsafe Root", path: "/projects/unsafe-root" }, { create: true });
+    const unsafeExpected = path.resolve(path.join(projectsRoot, "unsafe-root"));
+    check("R-B rowCwdInfo remaps /projects path to safe root and creates directory", (
+      unsafeInfo.dir === unsafeExpected &&
+      unsafeInfo.remappedFrom === path.resolve("/projects/unsafe-root") &&
+      unsafeInfo.remappedTo === unsafeExpected &&
+      fs.statSync(unsafeExpected).isDirectory()
+    ));
+    const existingHomeDir = path.join(projectsRoot, "existing-home");
+    fs.mkdirSync(existingHomeDir, { recursive: true });
+    const existingHomeInfo = ctl.rowCwdInfo({ id: "existing-home", name: "Existing Home", path: "~/projects/existing-home" }, { create: true });
+    check("R-B existing ~/projects path is not remapped", (
+      existingHomeInfo.dir === path.resolve(existingHomeDir) &&
+      !existingHomeInfo.remappedFrom &&
+      !existingHomeInfo.remappedTo
+    ));
+    check("R-C isTransient treats EAGAIN code as retryable", (
+      ctl.isTransient(Object.assign(new Error("spawn failed"), { code: "EAGAIN" })) === true
+    ));
+    check("R-C isTransient treats ENOMEM code as retryable", (
+      ctl.isTransient(Object.assign(new Error("spawn failed"), { code: "ENOMEM" })) === true
+    ));
+
     const result = await ctl.reorderProjects(["c", "a", "b"]);
     const log = fs.readFileSync(eventLog, "utf8");
     check("R3 reorder: cmuxctl persists projects.json order", ids() === "c,a,b" && result.order.join(",") === "c,a,b");
@@ -5337,6 +5580,20 @@ function ids() {
 
     const removed = ctl.removeProject("a");
     check("R3 removeProject persists deletion", removed.removed === true && ids() === "c,b,new-project");
+
+    writeBaseConfig();
+    const remappedAdd = ctl.addProject({ name: "Bad Absolute", path: "/projects/bad-absolute", create: true });
+    const remappedAddExpected = path.resolve(path.join(projectsRoot, "bad-absolute"));
+    const cfgAfterRemappedAdd = JSON.parse(fs.readFileSync(cfgFile, "utf8"));
+    check("R-B addProject remaps invalid absolute path and persists safe path", (
+      remappedAdd.id === "bad-absolute" &&
+      remappedAdd.path === "~/projects/bad-absolute" &&
+      remappedAdd.cwd === remappedAddExpected &&
+      remappedAdd.remappedFrom === path.resolve("/projects/bad-absolute") &&
+      remappedAdd.remappedTo === remappedAddExpected &&
+      fs.statSync(remappedAddExpected).isDirectory() &&
+      cfgAfterRemappedAdd.projects.some((p) => p.id === "bad-absolute" && p.path === "~/projects/bad-absolute")
+    ));
     writeBaseConfig();
   } catch (err) {
     failed += 1;
@@ -5367,7 +5624,7 @@ EOF
     return "$rc"
   fi
 
-  (cd "$DIR" && exec env CMUX_BIN="$fake_cmux" CMUX_DASH_PORT="$api_port" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$cfg_file" CMUX_DASH_SETTLE_MS=0 CMUX_DASH_READ_TIMEOUT=1000 CMUX_DASH_READ_RETRY_BUDGET_MS=1000 CMUX_DASH_READ_RETRIES=0 "$NODE_BIN" server.js >"$api_log" 2>&1) &
+  (cd "$DIR" && exec env HOME="$phase_dir/home" CMUX_BIN="$fake_cmux" CMUX_DASH_PORT="$api_port" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$cfg_file" CMUX_DASH_SETTLE_MS=0 CMUX_DASH_READ_TIMEOUT=1000 CMUX_DASH_READ_RETRY_BUDGET_MS=1000 CMUX_DASH_READ_RETRIES=0 "$NODE_BIN" server.js >"$api_log" 2>&1) &
   BAD_SERVER_PID=$!
   for _ in $(seq 1 50); do
     body="$(curl -fsS --max-time 2 "$api_url/api/state" 2>/dev/null || true)"
@@ -5451,6 +5708,34 @@ process.exit(obj && obj.id === "api-project" && obj.name === "API Project" && ob
   else
     fail "R3 API: POST /api/projects contract failed"
     info "R3 add payload: ${add_body:-empty}"
+    return 1
+  fi
+
+  name_only_body="$(curl -fsS -X POST --max-time 10 -H 'Content-Type: application/json' --data '{"name":"Name Only API"}' "$api_url/api/projects" 2>/dev/null || true)"
+  if NAME_ONLY_BODY="$name_only_body" "$NODE_BIN" - "$phase_dir/home" "$cfg_file" <<'NODE' 2>/dev/null
+const fs = require("fs");
+const path = require("path");
+const home = process.argv[2];
+const cfgFile = process.argv[3];
+let obj;
+try { obj = JSON.parse(process.env.NAME_ONLY_BODY || ""); } catch (_) { process.exit(2); }
+const cfg = JSON.parse(fs.readFileSync(cfgFile, "utf8"));
+const expectedDir = path.join(home, "projects", "name-only-api");
+const expectedResolved = path.resolve(expectedDir);
+const ok = obj &&
+  obj.id === "name-only-api" &&
+  obj.path === "~/projects/name-only-api" &&
+  obj.cwd === expectedResolved &&
+  fs.existsSync(expectedDir) &&
+  fs.statSync(expectedDir).isDirectory() &&
+  cfg.projects.some((p) => p.id === "name-only-api" && p.path === "~/projects/name-only-api");
+process.exit(ok ? 0 : 1);
+NODE
+  then
+    pass "R-B API: POST /api/projects name-only creates default project directory"
+  else
+    fail "R-B API: POST /api/projects name-only project creation failed"
+    info "R-B name-only payload: ${name_only_body:-empty}"
     return 1
   fi
 
@@ -5697,7 +5982,7 @@ function isTransient(err) {
     err && err.code,
     err && err.signal,
   ].filter(Boolean).join(" ");
-  return /broken pipe|EPIPE|errno 32|socket|ECONNRESET|ETIMEDOUT|timeout|timed out|SIGKILL/i.test(text);
+  return /broken pipe|EPIPE|errno 32|socket|ECONNRESET|ETIMEDOUT|EAGAIN|ENOMEM|timeout|timed out|SIGKILL/i.test(text);
 }
 async function cmux(args, opts = {}) {
   const env = ctl.buildCmuxEnv(process.env);
@@ -5846,18 +6131,25 @@ async function waitFor(label, fn, timeoutMs = 20000) {
     ));
 
     const colB = await ctl.addProjectColumn(projectB);
+    const afterBState = await ctl.getGridState();
+    wsRef = afterBState.wsRef;
+    const liveColA = afterBState.columns[0] || {};
+    const liveColB = afterBState.columns[1] || {};
     const afterB = await waitFor("second grid column live refs", async () => {
-      const layout = await liveLayout(wsRef);
+      const ws = await findGridWorkspace();
+      if (!ws || !ws.ref) return { ok: false };
+      const layout = await liveLayout(ws.ref);
       return {
-        ok: refsPresent(layout, [colA.cc.surfaceRef, colA.cdx.surfaceRef, colB.cc.surfaceRef, colB.cdx.surfaceRef]),
-        value: layout,
+        ok: refsPresent(layout, [liveColA.cc.surfaceRef, liveColA.cdx.surfaceRef, liveColB.cc.surfaceRef, liveColB.cdx.surfaceRef]),
+        value: { ws, layout },
       };
     });
-    const afterBState = await ctl.getGridState();
-    check("real grid add second column: each column adds cc/cdx pair panes " + afterA.panes.length + "->" + afterB.panes.length + " surfaces " + afterA.surfaces.length + "->" + afterB.surfaces.length, (
+    const afterBLayout = afterB.layout;
+    check("real grid add second column: layout rebuild has browser anchor plus two cc/cdx columns panes " + afterA.panes.length + "->" + afterBLayout.panes.length + " surfaces " + afterA.surfaces.length + "->" + afterBLayout.surfaces.length, (
       colB.added === true &&
-      afterB.panes.length === afterA.panes.length + 2 &&
-      afterB.surfaces.length === afterA.surfaces.length + 2
+      afterBState.wsRef === afterB.ws.ref &&
+      afterBLayout.panes.length === 5 &&
+      afterBLayout.surfaces.length === 5
     ));
     check("real grid getGridState: columns ordered and refs match live list-panes/list-pane-surfaces", (
       afterBState.wsRef === wsRef &&
@@ -5865,24 +6157,30 @@ async function waitFor(label, fn, timeoutMs = 20000) {
       afterBState.columns.map((column) => column.projectId).join(",") === projectA + "," + projectB &&
       afterBState.columns[0].order === 0 &&
       afterBState.columns[1].order === 1 &&
-      stateMatchesLive(afterBState, afterB)
+      stateMatchesLive(afterBState, afterBLayout)
     ));
 
     await ctl.removeProjectColumn(projectA);
+    const afterRemoveAState = await ctl.getGridState();
+    wsRef = afterRemoveAState.wsRef;
+    const survivingB = afterRemoveAState.columns[0] || {};
     const afterRemoveA = await waitFor("first grid column removed", async () => {
-      const layout = await liveLayout(wsRef);
+      const ws = await findGridWorkspace();
+      if (!ws || !ws.ref) return { ok: false };
+      const layout = await liveLayout(ws.ref);
       return {
-        ok: refsGone(layout, [colA.cc.surfaceRef, colA.cdx.surfaceRef]) && refsPresent(layout, [colB.cc.surfaceRef, colB.cdx.surfaceRef]),
-        value: layout,
+        ok: refsGone(layout, [liveColA.cc.surfaceRef, liveColA.cdx.surfaceRef]) && refsPresent(layout, [survivingB.cc.surfaceRef, survivingB.cdx.surfaceRef]),
+        value: { ws, layout },
       };
     });
-    const afterRemoveAState = await ctl.getGridState();
-    check("real grid remove first column: A refs closed, B survives panes " + afterB.panes.length + "->" + afterRemoveA.panes.length + " surfaces " + afterB.surfaces.length + "->" + afterRemoveA.surfaces.length, (
-      afterRemoveA.surfaces.length === afterB.surfaces.length - 2 &&
+    const afterRemoveALayout = afterRemoveA.layout;
+    check("real grid remove first column: rebuilt grid drops A and keeps B panes " + afterBLayout.panes.length + "->" + afterRemoveALayout.panes.length + " surfaces " + afterBLayout.surfaces.length + "->" + afterRemoveALayout.surfaces.length, (
+      afterRemoveAState.wsRef === afterRemoveA.ws.ref &&
+      afterRemoveALayout.surfaces.length === 3 &&
       afterRemoveAState.columns.length === 1 &&
       afterRemoveAState.columns[0].projectId === projectB &&
-      refsPresent(afterRemoveA, [colB.cc.surfaceRef, colB.cdx.surfaceRef]) &&
-      stateMatchesLive(afterRemoveAState, afterRemoveA)
+      refsPresent(afterRemoveALayout, [survivingB.cc.surfaceRef, survivingB.cdx.surfaceRef]) &&
+      stateMatchesLive(afterRemoveAState, afterRemoveALayout)
     ));
 
     await ctl.removeProjectColumn(projectB);

@@ -124,6 +124,87 @@ function isPaneDeliveryActiveProject(row) {
   );
 }
 
+function targetSurfaceRef(target) {
+  return target && (
+    target.surfaceRef ||
+    (target.slotRefs && target.slotRefs.cdx) ||
+    (target.cdx && target.cdx.surfaceRef) ||
+    null
+  );
+}
+
+function normalizedTeamName(ctlRef, id) {
+  const fn = ctlRef && ctlRef.teamName ? ctlRef.teamName : ctl.teamName;
+  return fn(id);
+}
+
+function projectDeliveryTarget(row, ctlRef = ctl) {
+  if (!isPaneDeliveryActiveProject(row)) return null;
+  return {
+    key: String(row.id),
+    id: row.id,
+    projectId: row.id,
+    type: 'project',
+    team: row.team || normalizedTeamName(ctlRef, row.id),
+    wsRef: row.wsRef,
+    surfaceRef: row.slotRefs.cdx,
+    slotRefs: row.slotRefs,
+  };
+}
+
+function gridProjectDeliveryEnabled(row) {
+  return !(row && row.collab && row.collab.enabled === false);
+}
+
+function gridColumnDeliveryTarget(column, grid, rowsById, ctlRef = ctl) {
+  if (!column) return null;
+  const projectId = String(column.projectId || column.id || '').trim();
+  const wsRef = column.wsRef || (grid && grid.wsRef) || null;
+  const cdxRef = (column.cdx && column.cdx.surfaceRef) || column.bottomSurfaceRef || null;
+  if (!projectId || !wsRef || !cdxRef) return null;
+  const row = rowsById && rowsById.get(projectId) || null;
+  if (!gridProjectDeliveryEnabled(row)) return null;
+  const ccRef = (column.cc && column.cc.surfaceRef) || column.topSurfaceRef || null;
+  return {
+    key: `grid:${projectId}:${wsRef}:${cdxRef}`,
+    id: projectId,
+    projectId,
+    columnId: column.columnId || projectId,
+    type: 'grid-column',
+    team: normalizedTeamName(ctlRef, projectId),
+    wsRef,
+    surfaceRef: cdxRef,
+    slotRefs: { cc: ccRef, cdx: cdxRef },
+  };
+}
+
+function pushTarget(targets, seen, target) {
+  if (!target || !target.key || seen.has(target.key)) return;
+  seen.add(target.key);
+  targets.push(target);
+}
+
+function deliveryTargetsFromState(state, ctlRef = ctl) {
+  const targets = [];
+  const seen = new Set();
+  const rows = [
+    ...(Array.isArray(state && state.projects) ? state.projects : []),
+    ...(Array.isArray(state && state.globalRows) ? state.globalRows : []),
+  ];
+  const rowsById = new Map();
+  for (const row of rows) {
+    if (row && row.id) rowsById.set(String(row.id), row);
+    pushTarget(targets, seen, projectDeliveryTarget(row, ctlRef));
+  }
+
+  const grid = state && state.grid || {};
+  const columns = Array.isArray(grid.columns) ? grid.columns : [];
+  for (const column of columns) {
+    pushTarget(targets, seen, gridColumnDeliveryTarget(column, grid, rowsById, ctlRef));
+  }
+  return targets;
+}
+
 class CollabDelivery {
   constructor(opts = {}) {
     this.ctl = opts.ctl || ctl;
@@ -135,7 +216,7 @@ class CollabDelivery {
     this.logger = opts.logger || console;
     this.readUnread = opts.readUnreadWakeMessages || ((team) => readUnreadWakeMessages(team, opts));
     this.readStatus = opts.readDeliveryStatus || ((team, id) => readDeliveryStatus(team, id, opts));
-    this.sendWake = opts.sendWake || ((row, text) => this.ctl.submitToSurface(row.wsRef, row.slotRefs.cdx, text));
+    this.sendWake = opts.sendWake || ((target, text) => this.ctl.submitToSurface(target.wsRef, targetSurfaceRef(target), text));
     this.states = new Map();
     this.inFlight = false;
     this.timer = null;
@@ -160,13 +241,34 @@ class CollabDelivery {
   }
 
   forgetProject(id) {
-    return this.states.delete(String(id));
+    const projectId = String(id);
+    let deleted = this.states.delete(projectId);
+    for (const [key, state] of Array.from(this.states.entries())) {
+      if (
+        state &&
+        (String(state.projectId || '') === projectId || String(state.id || '') === projectId)
+      ) {
+        this.states.delete(key);
+        deleted = true;
+      }
+    }
+    return deleted;
   }
 
-  stateFor(id) {
-    const key = String(id);
+  stateKeyFor(target) {
+    if (target && typeof target === 'object') return String(target.key || target.id || '');
+    return String(target || '');
+  }
+
+  stateFor(target) {
+    const key = this.stateKeyFor(target);
     if (!this.states.has(key)) {
+      const meta = target && typeof target === 'object' ? target : { id: key, projectId: key, type: 'project' };
       this.states.set(key, {
+        id: meta.id || key,
+        projectId: meta.projectId || meta.id || key,
+        type: meta.type || 'project',
+        targetKey: key,
         pending: new Map(),
         completed: new Set(),
         highWater: 0,
@@ -178,19 +280,36 @@ class CollabDelivery {
     return this.states.get(key);
   }
 
+  pruneMissingTargets(seenKeys) {
+    for (const key of Array.from(this.states.keys())) {
+      if (!seenKeys.has(key)) this.states.delete(key);
+    }
+  }
+
+  stateSnapshot(state) {
+    return {
+      pending: Array.from(state.pending.values()).map((p) => ({ ...p })),
+      completed: Array.from(state.completed),
+      highWater: state.highWater,
+      sentHighWater: state.sentHighWater,
+      lastWakeAt: state.lastWakeAt,
+      lastError: state.lastError,
+      targetKey: state.targetKey,
+      targetType: state.type,
+    };
+  }
+
   snapshot() {
     const projects = {};
+    const gridColumns = {};
+    const targets = {};
     for (const [id, state] of this.states.entries()) {
-      projects[id] = {
-        pending: Array.from(state.pending.values()).map((p) => ({ ...p })),
-        completed: Array.from(state.completed),
-        highWater: state.highWater,
-        sentHighWater: state.sentHighWater,
-        lastWakeAt: state.lastWakeAt,
-        lastError: state.lastError,
-      };
+      const snap = this.stateSnapshot(state);
+      targets[id] = snap;
+      if (state.type === 'grid-column') gridColumns[id] = snap;
+      else projects[state.projectId || state.id || id] = snap;
     }
-    return { inFlight: this.inFlight, projects };
+    return { inFlight: this.inFlight, projects, gridColumns, targets };
   }
 
   async tick() {
@@ -198,17 +317,11 @@ class CollabDelivery {
     this.inFlight = true;
     try {
       const state = await this.ctl.getState();
-      const rows = [
-        ...(Array.isArray(state.projects) ? state.projects : []),
-        ...(Array.isArray(state.globalRows) ? state.globalRows : []),
-      ];
+      const targets = deliveryTargetsFromState(state, this.ctl);
+      this.pruneMissingTargets(new Set(targets.map((target) => target.key)));
       const results = [];
-      for (const row of rows) {
-        if (!isPaneDeliveryActiveProject(row)) {
-          if (row && row.id) this.forgetProject(row.id);
-          continue;
-        }
-        results.push(await this.processProject(row));
+      for (const target of targets) {
+        results.push(await this.processTarget(target));
       }
       return { ok: true, results };
     } finally {
@@ -216,9 +329,9 @@ class CollabDelivery {
     }
   }
 
-  async processProject(row) {
-    const projectState = this.stateFor(row.id);
-    const team = row.team || this.ctl.teamName(row.id);
+  async processTarget(target) {
+    const projectState = this.stateFor(target);
+    const team = target.team || this.ctl.teamName(target.projectId || target.id);
     try {
       const pending = Array.from(projectState.pending.values()).sort((a, b) => a.id - b.id);
       for (const item of pending) {
@@ -228,9 +341,9 @@ class CollabDelivery {
           continue;
         }
         if (this.now() >= item.nextRetryAt && this.canWake(projectState)) {
-          return await this.deliver(row, item, 'retry');
+          return await this.deliver(target, item, 'retry');
         }
-        return { id: row.id, pending: item.id, sent: false, reason: 'pending' };
+        return { id: target.id, targetKey: target.key, targetType: target.type, pending: item.id, sent: false, reason: 'pending' };
       }
 
       const messages = await this.readUnread(team);
@@ -243,14 +356,14 @@ class CollabDelivery {
         }
         if (!this.canWake(projectState)) {
           projectState.pending.set(message.id, this.pendingRecord(message, 0, projectState.lastWakeAt + this.minWakeIntervalMs));
-          return { id: row.id, pending: message.id, sent: false, reason: 'rate-limited' };
+          return { id: target.id, targetKey: target.key, targetType: target.type, pending: message.id, sent: false, reason: 'rate-limited' };
         }
-        return await this.deliver(row, message, 'new');
+        return await this.deliver(target, message, 'new');
       }
-      return { id: row.id, sent: false, reason: 'no-unread' };
+      return { id: target.id, targetKey: target.key, targetType: target.type, sent: false, reason: 'no-unread' };
     } catch (e) {
       projectState.lastError = summarizeError(e);
-      return { id: row.id, sent: false, error: projectState.lastError };
+      return { id: target.id, targetKey: target.key, targetType: target.type, sent: false, error: projectState.lastError };
     }
   }
 
@@ -269,8 +382,8 @@ class CollabDelivery {
     };
   }
 
-  async deliver(row, message, reason) {
-    const projectState = this.stateFor(row.id);
+  async deliver(target, message, reason) {
+    const projectState = this.stateFor(target);
     const current = projectState.pending.get(message.id) || this.pendingRecord(message, 0, this.now());
     const attempts = (Number(current.attempts) || 0) + 1;
     const pending = {
@@ -282,15 +395,15 @@ class CollabDelivery {
     };
     projectState.pending.set(message.id, pending);
     try {
-      await this.sendWake(row, this.wakeText);
+      await this.sendWake(target, this.wakeText);
       projectState.lastWakeAt = this.now();
       projectState.sentHighWater = Math.max(projectState.sentHighWater || 0, message.id);
       projectState.lastError = null;
-      return { id: row.id, messageId: message.id, sent: true, reason, attempts };
+      return { id: target.id, targetKey: target.key, targetType: target.type, messageId: message.id, sent: true, reason, attempts };
     } catch (e) {
       pending.lastError = summarizeError(e);
       projectState.lastError = pending.lastError;
-      return { id: row.id, messageId: message.id, sent: false, reason, attempts, error: pending.lastError };
+      return { id: target.id, targetKey: target.key, targetType: target.type, messageId: message.id, sent: false, reason, attempts, error: pending.lastError };
     }
   }
 
@@ -311,7 +424,10 @@ module.exports = {
   DEFAULT_WAKE_TEXT,
   CollabDelivery,
   createCollabDelivery,
+  deliveryTargetsFromState,
+  gridColumnDeliveryTarget,
   isPaneDeliveryActiveProject,
+  projectDeliveryTarget,
   readDeliveryStatus,
   readUnreadWakeMessages,
   sqliteJson,
