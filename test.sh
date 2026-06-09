@@ -624,8 +624,31 @@ s.nextSurface = (s.nextSurface || 1) + 1;
 s.workspaces.push({ ref: wsRef, description: desc, name, cwd, selected: false, latest_conversation_message: null, latest_submitted_at: null });
 s.panes.push({ ref: paneRef, workspace: wsRef, index: 0 });
 s.surfaces.push({ ref: surfaceRef, workspace: wsRef, pane: paneRef, title: "terminal", type: "terminal", process: "zsh", cwd, sendText: null, initial: true });
+    fs.writeFileSync(file, JSON.stringify(s) + "\n");
+    process.stdout.write(wsRef + "\n");
+NODE
+    ;;
+  close-workspace)
+    workspace=""
+    while [ "\$#" -gt 0 ]; do
+      case "\$1" in
+        --workspace) workspace="\${2:-}"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    "\$NODE_BIN" - "\$STATE" "\$workspace" <<'NODE'
+const fs = require("fs");
+const file = process.argv[2];
+const workspace = process.argv[3] || "";
+let s = { workspaces: [], panes: [], surfaces: [] };
+try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
+s.workspaces = (Array.isArray(s.workspaces) ? s.workspaces : [])
+  .filter((ws) => !(ws && ws.ref === workspace));
+s.panes = (Array.isArray(s.panes) ? s.panes : [])
+  .filter((pane) => !(pane && pane.workspace === workspace));
+s.surfaces = (Array.isArray(s.surfaces) ? s.surfaces : [])
+  .filter((surface) => !(surface && surface.workspace === workspace));
 fs.writeFileSync(file, JSON.stringify(s) + "\n");
-process.stdout.write(wsRef + "\n");
 NODE
     ;;
   list-panes)
@@ -1396,6 +1419,48 @@ process.exit(row && row.slots && row.slots[slot] === want ? 0 : 1);
     return 1
   }
 
+  r4_grid_api_and_wait() {
+    local id="$1"
+    local on_bool="$2"
+    local label="$3"
+    local body
+    local action_id
+    local line
+    local status=""
+    body="$(curl -fsS -X POST --max-time 10 -H 'Content-Type: application/json' --data "{\"on\":${on_bool}}" "$api_url/api/grid/column/$id" 2>/dev/null || true)"
+    action_id="$(printf '%s' "$body" | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+if (obj && obj.queued === true && obj.actionId && String(obj.label || "").startsWith("grid:")) process.stdout.write(String(obj.actionId));
+' 2>/dev/null || true)"
+    if [ -z "$action_id" ]; then
+      fail "R4 API: $label did not return queued grid actionId"
+      info "R4 API grid payload: ${body:-empty}"
+      return 1
+    fi
+    for _ in $(seq 1 50); do
+      line="$(curl -fsS --max-time 5 "$api_url/api/state" 2>/dev/null | "$NODE_BIN" -e '
+const fs = require("fs");
+const actionId = Number(process.argv[1]);
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+const action = (Array.isArray(obj.actions) ? obj.actions : []).find((a) => Number(a.id) === actionId);
+if (action) process.stdout.write(`${action.status}\t${action.error || ""}`);
+' "$action_id" 2>/dev/null || true)"
+      status="${line%%	*}"
+      [ "$status" = "succeeded" ] && break
+      [ "$status" = "failed" ] && break
+      sleep 0.2
+    done
+    if [ "$status" = "succeeded" ]; then
+      pass "R4 API: $label queued and succeeded"
+      return 0
+    fi
+    fail "R4 API: $label action status was ${status:-missing}"
+    return 1
+  }
+
   (cd "$DIR" && exec env CMUX_BIN="$fake_cmux" CMUX_DASH_PORT="$api_port" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$cfg_file" CMUX_DASH_SETTLE_MS=0 "$NODE_BIN" server.js >"$api_log" 2>&1) &
   BAD_SERVER_PID=$!
   for _ in $(seq 1 50); do
@@ -1411,15 +1476,30 @@ const alpha = (Array.isArray(obj.projects) ? obj.projects : []).find((p) => p &&
 const global = (Array.isArray(obj.globalRows) ? obj.globalRows : []).find((p) => p && p.id === "cc-general");
 const ok = alpha && global &&
   Array.isArray(obj.actions) &&
+  obj.grid && Array.isArray(obj.grid.columns) &&
   obj.health && obj.health.cmux &&
   obj.rowCount === 2 &&
   obj.allOpenCount >= 2;
 process.exit(ok ? 0 : 1);
 ' 2>/dev/null; then
-    pass "R4 API: GET /api/state returns projects/globalRows/actions/health contract"
+    pass "R4 API: GET /api/state returns projects/globalRows/actions/grid/health contract"
   else
     fail "R4 API: GET /api/state contract failed"
     info "R4 state payload: ${body:-empty}; log=$api_log"
+    return 1
+  fi
+
+  body="$(curl -fsS --max-time 5 "$api_url/api/grid" 2>/dev/null || true)"
+  if printf '%s' "$body" | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+process.exit(obj && Object.prototype.hasOwnProperty.call(obj, "wsRef") && Array.isArray(obj.columns) ? 0 : 1);
+' 2>/dev/null; then
+    pass "R4 API: GET /api/grid returns grid state contract"
+  else
+    fail "R4 API: GET /api/grid contract failed"
+    info "R4 grid payload: ${body:-empty}; log=$api_log"
     return 1
   fi
 
@@ -1427,6 +1507,41 @@ process.exit(ok ? 0 : 1);
   if ! r4_slot_api_and_wait "alpha" "cdx" "false" "normal project cdx OFF"; then return 1; fi
   if ! r4_slot_api_and_wait "cc-general" "yazi" "true" "global row yazi ON"; then return 1; fi
   if ! r4_slot_api_and_wait "cc-general" "yazi" "false" "global row yazi OFF"; then return 1; fi
+
+  if ! r4_grid_api_and_wait "alpha" "true" "grid alpha ON"; then return 1; fi
+  if curl -fsS --max-time 5 "$api_url/api/grid" 2>/dev/null | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+const col = (Array.isArray(obj.columns) ? obj.columns : []).find((c) => c && c.projectId === "alpha");
+process.exit(col && col.cc && col.cc.surfaceRef && col.cdx && col.cdx.surfaceRef ? 0 : 1);
+' 2>/dev/null && curl -fsS --max-time 5 "$api_url/api/state" 2>/dev/null | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+const grid = obj && obj.grid;
+const col = grid && (Array.isArray(grid.columns) ? grid.columns : []).find((c) => c && c.projectId === "alpha");
+const project = (Array.isArray(obj.projects) ? obj.projects : []).find((p) => p && p.id === "alpha");
+const action = project && project.action;
+process.exit(col && col.cc && col.cc.surfaceRef && col.cdx && col.cdx.surfaceRef && action && action.type === "grid" && action.target === "alpha" ? 0 : 1);
+' 2>/dev/null; then
+    pass "R4 API: grid ON is reflected by /api/grid and /api/state.grid with project action target"
+  else
+    fail "R4 API: grid ON did not reflect in /api/grid or /api/state.grid"
+    return 1
+  fi
+  if ! r4_grid_api_and_wait "alpha" "false" "grid alpha OFF"; then return 1; fi
+  if curl -fsS --max-time 5 "$api_url/api/grid" 2>/dev/null | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+process.exit(obj && Array.isArray(obj.columns) && obj.columns.length === 0 && !obj.wsRef ? 0 : 1);
+' 2>/dev/null; then
+    pass "R4 API: grid OFF removes column and cleans empty grid workspace"
+  else
+    fail "R4 API: grid OFF did not return empty grid state"
+    return 1
+  fi
 
   local agmsg_status
   local agmsg_body
@@ -1469,10 +1584,18 @@ const checks = [
   html.includes('id="workspaceYamlOpen"'),
   html.includes('id="workspaceYamlModal"'),
   html.includes('id="workspaceYamlBody"'),
+  html.includes('id="gridPanel"'),
+  html.includes(".grid-side"),
   html.includes('id="globalRowsSeparator"'),
   script.includes("fetch('/api/workspace-yaml'"),
   script.includes("body.textContent"),
   script.includes("function renderProjectRows(s)"),
+  script.includes("function renderGridSidePanel(s)"),
+  script.includes("function toggleGridColumn(id, on)"),
+  script.includes("/api/grid/column/"),
+  script.includes("data-grid-project-id"),
+  script.includes("data-grid-column-project"),
+  script.includes("renderGridSidePanel(s)"),
   script.includes("globalRows"),
   script.includes("data-row-kind"),
   !script.includes("window.open('/api/workspace-yaml"),
@@ -1480,9 +1603,9 @@ const checks = [
 process.exit(checks.every(Boolean) ? 0 : 1);
 NODE
   then
-    pass "R4: UI global rows and workspace YAML static contract are present"
+    pass "R4: UI global rows, workspace YAML, and grid side-panel static contract are present"
   else
-    fail "R4: UI global rows/workspace YAML static contract failed"
+    fail "R4: UI global rows/workspace YAML/grid side-panel static contract failed"
     return 1
   fi
 }

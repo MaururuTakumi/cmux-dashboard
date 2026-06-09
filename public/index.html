@@ -39,6 +39,21 @@
   .mon-item .mi-name{font-weight:600;font-size:13px;display:flex;gap:6px;align-items:center}
   .mon-item .mi-msg{color:var(--dim);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
   .mon-item .mi-time{color:var(--faint);font-size:10.5px;margin-top:1px}
+  .grid-side{border-top:1px solid var(--line);padding:10px;display:flex;flex-direction:column;gap:9px;max-height:290px;overflow:auto}
+  .grid-side-head{display:flex;justify-content:space-between;align-items:center;color:var(--faint);font-size:11px;text-transform:uppercase;letter-spacing:.12em}
+  .grid-projects,.grid-columns{display:flex;flex-direction:column;gap:5px}
+  .grid-side-row,.grid-column-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;align-items:center;padding:7px 8px;border:1px solid var(--line);border-radius:8px;background:#0f131c}
+  .grid-side-name,.grid-column-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px;font-weight:750;color:var(--ink)}
+  .grid-side-sub{font-size:10.5px;color:var(--faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .grid-toggle{height:24px;min-width:46px;border-radius:7px;border:1px solid var(--line);background:var(--panel2);color:var(--dim);font-size:10.5px;font-weight:850;cursor:pointer}
+  .grid-toggle.on{background:var(--accent);border-color:transparent;color:#041126}
+  .grid-toggle.pending{opacity:.58;cursor:progress}
+  .grid-live{border-top:1px dashed var(--line);padding-top:8px}
+  .grid-live-title{font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.1em;margin-bottom:5px}
+  .grid-badges{display:flex;gap:4px;justify-content:flex-end}
+  .grid-badge{border:1px solid var(--line);border-radius:6px;padding:2px 5px;color:var(--faint);font-size:10px;font-weight:850}
+  .grid-badge.on.cc{background:color-mix(in srgb,var(--claude) 22%,var(--bg));border-color:color-mix(in srgb,var(--claude) 60%,var(--line));color:var(--claude)}
+  .grid-badge.on.cdx{background:color-mix(in srgb,var(--codex) 20%,var(--bg));border-color:color-mix(in srgb,var(--codex) 58%,var(--line));color:var(--codex)}
   .side-foot{padding:12px 16px;border-top:1px solid var(--line);font-size:11px;color:var(--faint);display:flex;flex-direction:column;gap:6px}
   .pill{display:inline-flex;gap:6px;align-items:center;padding:3px 9px;border-radius:999px;background:var(--panel);border:1px solid var(--line);font-size:11px}
   .pill b{color:var(--ink)}
@@ -247,6 +262,7 @@
     </div>
     <div class="mon-head"><span>Projects</span><span id="monCount">—</span></div>
     <div class="mon" id="mon"></div>
+    <div class="grid-side" id="gridPanel"></div>
     <div class="side-foot">
       <div class="pill"><span class="g" id="agDot"></span>agmsg <b id="agState">…</b></div>
       <div>各プロジェクト=1チーム。上=claude が plan、下=codex が実行。</div>
@@ -630,6 +646,49 @@ function stateRows(s){
     ...(Array.isArray(s && s.globalRows) ? s.globalRows : []),
   ];
 }
+function gridState(s){ return s && s.grid && Array.isArray(s.grid.columns) ? s.grid : { wsRef:null, columns:[] }; }
+function gridColumns(s){ return gridState(s).columns || []; }
+function gridColumnForProject(s,id){ return gridColumns(s).find(c=>c && c.projectId===id) || null; }
+function renderGridSidePanel(s){
+  const root = $('#gridPanel');
+  if(!root) return;
+  const projects = Array.isArray(s && s.projects) ? s.projects : [];
+  const columns = gridColumns(s);
+  const byId = new Map(projects.map(p=>[p.id,p]));
+  const grid = gridState(s);
+  const projectRows = projects.map(p=>{
+    const col = gridColumnForProject(s,p.id);
+    const on = !!col;
+    const pending = busy.has(`${p.id}:grid`);
+    return `<div class="grid-side-row" data-grid-project-id="${esc(p.id)}">
+      <div>
+        <div class="grid-side-name">${esc(p.name || p.id)}</div>
+        <div class="grid-side-sub">${esc(p.path || p.cwd || '')}</div>
+      </div>
+      <button class="grid-toggle ${on?'on':''} ${pending?'pending':''}" title="${esc(on?'Remove from grid':'Add to grid')}" onclick="event.stopPropagation();toggleGridColumn(${jsArg(p.id)},${on?'false':'true'})">${pending?'…':'Grid'}</button>
+    </div>`;
+  }).join('');
+  const liveRows = columns.length ? columns.map((col)=>{
+    const p = byId.get(col.projectId) || { name: col.projectId };
+    const ccOn = !!(col.cc && col.cc.surfaceRef);
+    const cdxOn = !!(col.cdx && col.cdx.surfaceRef);
+    const order = Number.isFinite(Number(col.order)) ? Number(col.order) + 1 : '?';
+    return `<div class="grid-column-row" data-grid-column-project="${esc(col.projectId)}">
+      <div class="grid-column-name">${order}. ${esc(p.name || col.projectId)}</div>
+      <div class="grid-badges">
+        <span class="grid-badge cc ${ccOn?'on':''}">CC</span>
+        <span class="grid-badge cdx ${cdxOn?'on':''}">Cdx</span>
+      </div>
+    </div>`;
+  }).join('') : '<div class="thread-empty">grid empty</div>';
+  root.innerHTML = `
+    <div class="grid-side-head"><span>Grid</span><span>${columns.length}${grid.wsRef?' on':''}</span></div>
+    <div class="grid-projects">${projectRows || '<div class="thread-empty">No projects</div>'}</div>
+    <div class="grid-live">
+      <div class="grid-live-title">Columns</div>
+      <div class="grid-columns">${liveRows}</div>
+    </div>`;
+}
 function renderProjectRow(p, index){
   const isGlobal = projectKind(p) === 'global';
   const collab = collabState(p);
@@ -696,6 +755,7 @@ function render(s){
   const actionError = s.lastActionError && s.lastActionError.message ? s.lastActionError : null;
   const cmuxHealth = s.health && s.health.cmux ? s.health.cmux : null;
   renderStateLine(s, actionError, cmuxHealth);
+  renderGridSidePanel(s);
   if(cmuxHealth && (cmuxHealth.unhealthy || cmuxHealth.ok === false)){
     $('#warn').innerHTML = `⚠ cmux応答不良: サーバー再起動が必要 <button class="inline-btn" onclick="restartServer()">サーバー再起動</button><code class="copy" data-copy="./cmux-dash restart" onclick="event.stopPropagation();copyFrom(this)">./cmux-dash restart</code>`;
     $('#warn').classList.add('show');
@@ -842,6 +902,21 @@ async function toggleCollab(id, on){
     try{
       await jpost(`/api/project/${encodeURIComponent(id)}/collab`, { on: !!on });
       toast(`協業 ${on ? 'ON' : 'OFF'} を要求しました`);
+    }catch(e){
+      toast('失敗: '+(e && e.message ? e.message : e));
+    }
+  });
+  busy.delete(key);
+}
+async function toggleGridColumn(id, on){
+  const key = `${id}:grid`;
+  if(busy.has(key)) return;
+  busy.add(key);
+  try{ render(lastState); }catch(_){}
+  await withQuiet(async()=>{
+    try{
+      await jpost(`/api/grid/column/${encodeURIComponent(id)}`, { on: !!on });
+      toast(`Grid ${on ? 'ON' : 'OFF'} を要求しました`);
     }catch(e){
       toast('失敗: '+(e && e.message ? e.message : e));
     }

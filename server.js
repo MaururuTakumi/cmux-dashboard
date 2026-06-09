@@ -50,6 +50,7 @@ function actionParts(label) {
   let target = rest.join(':') || null;
   if (type === 'slot' && rest.length) target = rest[0];
   if (type === 'collab' && rest.length) target = rest[0];
+  if (type === 'grid' && rest.length) target = rest[0];
   return { type, target };
 }
 function rememberAction(label) {
@@ -160,6 +161,7 @@ async function api(req, res, urlPath) {
     const m = urlPath.match(/^\/api\/(open|close|focus)\/(.+)$/);
     const slotToggle = urlPath.match(/^\/api\/project\/([^/]+)\/slot\/([^/]+)$/);
     const collabToggle = urlPath.match(/^\/api\/project\/([^/]+)\/collab$/);
+    const gridColumnToggle = urlPath.match(/^\/api\/grid\/column\/([^/]+)$/);
     const agmsg = urlPath.match(/^\/api\/agmsg\/(.+)$/);
     if (req.method === 'GET' && urlPath === '/api/state') {
       const st = enrichState(await ctl.getState());
@@ -169,6 +171,9 @@ async function api(req, res, urlPath) {
     }
     if (req.method === 'GET' && urlPath === '/api/metrics') {
       return sendJson(res, 200, await ctl.getMetrics());
+    }
+    if (req.method === 'GET' && urlPath === '/api/grid') {
+      return sendJson(res, 200, await ctl.getGridState());
     }
     if (req.method === 'GET' && urlPath === '/api/workspace-yaml') {
       return sendText(res, 200, await ctl.getWorkspaceYaml(), 'text/yaml; charset=utf-8');
@@ -217,6 +222,14 @@ async function api(req, res, urlPath) {
         if (!on) collabDelivery.forgetProject(id);
         return result;
       }, `collab:${id}:${on ? 'on' : 'off'}`);
+    }
+    if (req.method === 'POST' && gridColumnToggle) {
+      const id = decodeURIComponent(gridColumnToggle[1]);
+      const body = await readBody(req);
+      const on = body && body.on === true;
+      return defer(res, () => (
+        on ? ctl.addProjectColumn(id) : ctl.removeProjectColumn(id)
+      ), `grid:${id}:${on ? 'on' : 'off'}`);
     }
     if (req.method === 'POST' && urlPath === '/api/reorder') {
       const body = await readBody(req);

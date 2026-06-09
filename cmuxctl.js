@@ -1790,11 +1790,18 @@ async function getState() {
   const projects = await Promise.all(configuredProjectRows(cfg).map(buildRow));
   const globalRows = await Promise.all(configuredGlobalRows(cfg).map(buildRow));
   const allRows = [...projects, ...globalRows];
+  let grid;
+  try {
+    grid = await getGridState();
+  } catch (e) {
+    grid = { wsRef: null, columns: [], error: summarizeError(e) };
+  }
   return {
     agmsgInstalled: agmsgAvailable(),
     defaults: cfg.defaults,
     projects,
     globalRows,
+    grid,
     openCount: projects.filter((p) => p.open).length,
     globalOpenCount: globalRows.filter((p) => p.open).length,
     rowCount: allRows.length,
