@@ -2210,6 +2210,13 @@ async function removeProjectColumn(projectId) {
   gridRuntimeState.columns.splice(idx, 1);
   reindexGridColumns();
   await settle(Math.min(CMUX_SETTLE_MS, 500));
+  if (gridRuntimeState.columns.length === 0 && wsRef) {
+    await cmux(['close-workspace', '--workspace', wsRef]);
+    await settle(Math.min(CMUX_SETTLE_MS, 500));
+    gridRuntimeState.wsRef = null;
+    gridRuntimeState.columns = [];
+    return { projectId, removed: true, closed, wsClosed: true, wsRef: null, columns: [] };
+  }
   const state = await getGridState();
   return { projectId, removed: true, closed, ...state };
 }

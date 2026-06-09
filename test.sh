@@ -100,6 +100,8 @@ resolve_cmux() {
 
 NODE_BIN="$(resolve_node || true)"
 CMUX_BIN="$(resolve_cmux || true)"
+REAL_CMUX_BIN="$CMUX_BIN"
+REAL_CMUX_AVAILABLE=0
 
 if [ -z "$NODE_BIN" ]; then
   fail "node executable not found"
@@ -108,6 +110,9 @@ fi
 if [ -z "$CMUX_BIN" ]; then
   fail "cmux executable not found"
   finish
+fi
+if CMUX_QUIET=1 "$REAL_CMUX_BIN" list-workspaces --json >/dev/null 2>&1; then
+  REAL_CMUX_AVAILABLE=1
 fi
 
 mkdir -p "$TEST_PROJECT_DIR"
@@ -4200,7 +4205,7 @@ SH
 if [ -z "${CMUX_WORKSPACE_ID:-}" ]; then
   info "not running as a child of a live cmux pane; using isolated fake cmux for integration checks"
   CMUX_BIN="$(create_integration_fake_cmux)"
-elif ! CMUX_QUIET=1 "$CMUX_BIN" list-workspaces --json >/dev/null 2>&1; then
+elif [ "$REAL_CMUX_AVAILABLE" -ne 1 ]; then
   info "real cmux list-workspaces failed; using isolated fake cmux for integration checks"
   CMUX_BIN="$(create_integration_fake_cmux)"
 fi
@@ -5481,6 +5486,296 @@ assert_cc_slot_toggle() {
   fi
 }
 
+run_c2_real_grid_checks() {
+  local phase_dir="$TEST_TMP_DIR/c2-real-grid"
+  local cfg_file="$phase_dir/projects.json"
+  local results
+  local rc
+  local saw_output=0
+
+  if [ "$REAL_CMUX_AVAILABLE" -ne 1 ]; then
+    pass "C2 real-cmux grid skipped: real cmux is unavailable or unhealthy"
+    return 0
+  fi
+
+  mkdir -p "$phase_dir/project-a" "$phase_dir/project-b"
+  results="$(
+    CMUX_BIN="$REAL_CMUX_BIN" \
+    CMUX_DASH_PROJECTS_FILE="$cfg_file" \
+    CMUX_DASH_SETTLE_MS=700 \
+    "$NODE_BIN" - "$DIR" "$phase_dir" "$cfg_file" "$REAL_CMUX_BIN" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const { execFile } = require("child_process");
+
+const repo = process.argv[2];
+const phaseDir = process.argv[3];
+const cfgFile = process.argv[4];
+const cmuxBin = process.argv[5];
+const gridTag = "cmuxdash:__grid__";
+const ctl = require(path.join(repo, "cmuxctl.js"));
+
+let failed = 0;
+let createdGrid = false;
+function check(label, ok) {
+  if (ok) console.log("PASS\t" + label);
+  else {
+    failed += 1;
+    console.log("FAIL\t" + label);
+  }
+}
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function isTransient(err) {
+  const text = [
+    err && err.message,
+    err && err.stderr,
+    err && err.stdout,
+    err && err.code,
+    err && err.signal,
+  ].filter(Boolean).join(" ");
+  return /broken pipe|EPIPE|errno 32|socket|ECONNRESET|ETIMEDOUT|timeout|timed out|SIGKILL/i.test(text);
+}
+async function cmux(args, opts = {}) {
+  const env = ctl.buildCmuxEnv(process.env);
+  const timeout = opts.timeout || 15000;
+  const retries = opts.retries == null ? 6 : opts.retries;
+  const deadline = Date.now() + (opts.budgetMs || 30000);
+  let lastErr = null;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await new Promise((resolve, reject) => {
+        execFile(cmuxBin, args, { env, timeout, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+          if (err) {
+            err.stdout = stdout;
+            err.stderr = stderr;
+            reject(err);
+            return;
+          }
+          resolve(String(stdout || "").trim());
+        });
+      });
+    } catch (err) {
+      lastErr = err;
+      if (!isTransient(err) || attempt === retries || Date.now() >= deadline) throw err;
+      await sleep(Math.min(3000, 200 * Math.pow(2, attempt)));
+    }
+  }
+  throw lastErr || new Error("cmux command failed");
+}
+async function cmuxJson(args) {
+  const out = await cmux([...args, "--json"]);
+  const start = out.indexOf("{");
+  return JSON.parse(start >= 0 ? out.slice(start) : out);
+}
+async function listWorkspaces() {
+  return (await cmuxJson(["list-workspaces"])).workspaces || [];
+}
+async function findGridWorkspace() {
+  return (await listWorkspaces()).find((ws) => ws && ws.description === gridTag) || null;
+}
+async function listPanes(wsRef) {
+  return (await cmuxJson(["list-panes", "--workspace", wsRef])).panes || [];
+}
+async function listSurfaces(wsRef, paneRef = null) {
+  const args = ["list-pane-surfaces", "--workspace", wsRef];
+  if (paneRef) args.push("--pane", paneRef);
+  const surfaces = (await cmuxJson(args)).surfaces || [];
+  return surfaces.map((surface) => ({
+    ...surface,
+    paneRef: surface.paneRef || surface.pane || paneRef || null,
+  }));
+}
+async function liveLayout(wsRef) {
+  const panes = await listPanes(wsRef);
+  const surfaces = [];
+  if (panes.length) {
+    for (const pane of panes) {
+      if (!pane || !pane.ref) continue;
+      surfaces.push(...await listSurfaces(wsRef, pane.ref));
+    }
+  } else {
+    surfaces.push(...await listSurfaces(wsRef));
+  }
+  return { panes, surfaces };
+}
+function surfaceByRef(layout, ref) {
+  return (layout.surfaces || []).find((surface) => surface && surface.ref === ref) || null;
+}
+function stateMatchesLive(state, layout) {
+  if (!state || !Array.isArray(state.columns)) return false;
+  for (const column of state.columns) {
+    const cc = surfaceByRef(layout, column.cc && column.cc.surfaceRef);
+    const cdx = surfaceByRef(layout, column.cdx && column.cdx.surfaceRef);
+    if (!cc || !cdx) return false;
+    if ((column.cc.paneRef || null) !== (cc.paneRef || null)) return false;
+    if ((column.cdx.paneRef || null) !== (cdx.paneRef || null)) return false;
+  }
+  return true;
+}
+function refsGone(layout, refs) {
+  return refs.every((ref) => !surfaceByRef(layout, ref));
+}
+function refsPresent(layout, refs) {
+  return refs.every((ref) => !!surfaceByRef(layout, ref));
+}
+async function waitFor(label, fn, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await fn();
+    if (last && last.ok) return last.value;
+    await sleep(500);
+  }
+  throw new Error("timed out waiting for " + label);
+}
+
+(async () => {
+  const preExisting = await findGridWorkspace();
+  if (preExisting && preExisting.ref) {
+    check("real grid skipped: pre-existing cmuxdash:__grid__ workspace left untouched (" + preExisting.ref + ")", true);
+    return;
+  }
+  check("real grid precondition: no pre-existing cmuxdash:__grid__ workspace", true);
+
+  const suffix = String(process.pid) + "-" + Date.now();
+  const projectA = "c2-grid-a-" + suffix;
+  const projectB = "c2-grid-b-" + suffix;
+  const dirA = path.join(phaseDir, "project-a");
+  const dirB = path.join(phaseDir, "project-b");
+  fs.writeFileSync(cfgFile, JSON.stringify({
+    _comment: "C2 real-cmux grid integration config generated by test.sh",
+    defaults: {
+      topCmd: "sleep 600",
+      bottomCmd: "sleep 600",
+      slotCommands: { cc: "sleep 600", cdx: "sleep 600" },
+      agmsg: { enabled: false, brief: false },
+      claudeMd: { mode: "off" },
+      collab: false,
+    },
+    projects: [
+      { id: projectA, name: "C2 Grid A", path: dirA, agmsg: { enabled: false } },
+      { id: projectB, name: "C2 Grid B", path: dirB, agmsg: { enabled: false } },
+    ],
+  }, null, 2) + "\n");
+
+  let wsRef = null;
+  try {
+    createdGrid = true;
+    const colA = await ctl.addProjectColumn(projectA);
+    const wsAfterA = await waitFor("grid workspace after first column", async () => {
+      const ws = await findGridWorkspace();
+      if (!ws || !ws.ref) return { ok: false };
+      const layout = await liveLayout(ws.ref);
+      return { ok: refsPresent(layout, [colA.cc.surfaceRef, colA.cdx.surfaceRef]), value: { ws, layout } };
+    });
+    wsRef = wsAfterA.ws.ref;
+    const afterA = wsAfterA.layout;
+    const afterAState = await ctl.getGridState();
+    check("real grid add first column: dedicated workspace " + wsRef + " has cc/cdx refs and live layout panes=" + afterA.panes.length + " surfaces=" + afterA.surfaces.length, (
+      colA.added === true &&
+      afterAState.wsRef === wsRef &&
+      afterAState.columns.length === 1 &&
+      afterAState.columns[0].projectId === projectA &&
+      afterAState.columns[0].order === 0 &&
+      refsPresent(afterA, [colA.cc.surfaceRef, colA.cdx.surfaceRef]) &&
+      stateMatchesLive(afterAState, afterA)
+    ));
+
+    const colB = await ctl.addProjectColumn(projectB);
+    const afterB = await waitFor("second grid column live refs", async () => {
+      const layout = await liveLayout(wsRef);
+      return {
+        ok: refsPresent(layout, [colA.cc.surfaceRef, colA.cdx.surfaceRef, colB.cc.surfaceRef, colB.cdx.surfaceRef]),
+        value: layout,
+      };
+    });
+    const afterBState = await ctl.getGridState();
+    check("real grid add second column: each column adds cc/cdx pair panes " + afterA.panes.length + "->" + afterB.panes.length + " surfaces " + afterA.surfaces.length + "->" + afterB.surfaces.length, (
+      colB.added === true &&
+      afterB.panes.length === afterA.panes.length + 2 &&
+      afterB.surfaces.length === afterA.surfaces.length + 2
+    ));
+    check("real grid getGridState: columns ordered and refs match live list-panes/list-pane-surfaces", (
+      afterBState.wsRef === wsRef &&
+      afterBState.columns.length === 2 &&
+      afterBState.columns.map((column) => column.projectId).join(",") === projectA + "," + projectB &&
+      afterBState.columns[0].order === 0 &&
+      afterBState.columns[1].order === 1 &&
+      stateMatchesLive(afterBState, afterB)
+    ));
+
+    await ctl.removeProjectColumn(projectA);
+    const afterRemoveA = await waitFor("first grid column removed", async () => {
+      const layout = await liveLayout(wsRef);
+      return {
+        ok: refsGone(layout, [colA.cc.surfaceRef, colA.cdx.surfaceRef]) && refsPresent(layout, [colB.cc.surfaceRef, colB.cdx.surfaceRef]),
+        value: layout,
+      };
+    });
+    const afterRemoveAState = await ctl.getGridState();
+    check("real grid remove first column: A refs closed, B survives panes " + afterB.panes.length + "->" + afterRemoveA.panes.length + " surfaces " + afterB.surfaces.length + "->" + afterRemoveA.surfaces.length, (
+      afterRemoveA.surfaces.length === afterB.surfaces.length - 2 &&
+      afterRemoveAState.columns.length === 1 &&
+      afterRemoveAState.columns[0].projectId === projectB &&
+      refsPresent(afterRemoveA, [colB.cc.surfaceRef, colB.cdx.surfaceRef]) &&
+      stateMatchesLive(afterRemoveAState, afterRemoveA)
+    ));
+
+    await ctl.removeProjectColumn(projectB);
+    await waitFor("last grid column cleanup", async () => {
+      const ws = await findGridWorkspace();
+      return { ok: !ws, value: true };
+    });
+    const finalState = await ctl.getGridState();
+    check("real grid remove last column: grid workspace cleaned up and getGridState is empty", (
+      !finalState.wsRef &&
+      Array.isArray(finalState.columns) &&
+      finalState.columns.length === 0
+    ));
+    createdGrid = false;
+  } finally {
+    if (createdGrid) {
+      try {
+        const ws = await findGridWorkspace();
+        if (ws && ws.ref) await cmux(["close-workspace", "--workspace", ws.ref]);
+      } catch (err) {
+        check("real grid cleanup: close throwaway workspace", false);
+      }
+    }
+  }
+})().catch((err) => {
+  failed += 1;
+  console.log("FAIL\treal grid runner exception: " + (err && err.message ? err.message : err));
+}).finally(() => {
+  process.exit(failed ? 1 : 0);
+});
+NODE
+  )"
+  rc=$?
+
+  while IFS="$(printf '\t')" read -r status label; do
+    [ -z "$status" ] && continue
+    saw_output=1
+    case "$status" in
+      PASS) pass "C2: $label" ;;
+      FAIL) fail "C2: $label" ;;
+      *) info "C2 output: $status $label" ;;
+    esac
+  done <<EOF
+$results
+EOF
+
+  if [ "$saw_output" -eq 0 ]; then
+    fail "C2 real-cmux grid runner produced no output"
+  fi
+  if [ "$rc" -ne 0 ]; then
+    return "$rc"
+  fi
+  return 0
+}
+
 open_and_wait() {
   local attempt=1
   local body
@@ -5560,6 +5855,10 @@ assert_no_unrecovered_socket_errors() {
   fi
   pass "server log has no unrecovered transient socket action errors"
 }
+
+if ! run_c2_real_grid_checks; then
+  finish
+fi
 
 if server_healthy; then
   if [ -n "${CMUX_DASH_PORT:-}" ]; then
