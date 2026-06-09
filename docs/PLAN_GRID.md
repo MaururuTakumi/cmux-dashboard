@@ -53,3 +53,22 @@
 2. grid データモデルを提案（list-panes が geometry を返さない前提で、cmuxctl が列順と各列 cc/cdx を確実に追跡する方法）。
 3. 既存 “project=workspace” と grid の**共存設計**（同一 project を両モードで開いた時の状態検出衝突を避ける）。
 4. 懸念・リスク・より単純な代替があれば提示。合意できたら C1 へ。
+
+---
+
+# 100点化バックログ（2026-06-09, /loop b9d50332）
+構造は完成。常用コックピットとして 100/100 にするため、Generator/Evaluator で1項目ずつ潰す。
+優先: 1 自動collab→2 資源ガード→3 collab自己回復→4 列の並べ替え/サイズ→(5 見た目/6 実エージェント検証)。
+
+## ★項目1（最優先・機能の肝）: グリッド列の自動collab
+**穴**: `collab-delivery` の `isPaneDeliveryActiveProject`/tick は `state.projects[].slotRefs.cdx` だけを起こす。**grid列(`state.grid.columns[]`)は配送対象外**＝グリッドの列内 claude↔codex が自動で会話しない。usedhonda の「複数同時に動く」が未達。
+
+**設計案（codexレビュー→実装）**:
+- delivery 対象を「project-workspace の cdx（既存）」＋「grid列の cdx（新規）」に拡張。
+- grid列の team は `teamName(column.projectId)`。各 grid列で、そのチームの未読(to=codex,from=claude,read_at NULL)を read-only で見て `column.cdx.surfaceRef` を `submitToSurface` で起こす。
+- **二重在席**（同 project が自前workspace＋grid列の両方で開）時の方針を決める（案: 両方起こし inbox.sh 先勝ち消費。HWM/pending は per-target、同一message無限再送しない）。
+- spawnしない・rate-limit・single in-flight・read-only DB peek 厳守。
+
+**受入**: grid列に入る project へ claude→codex agmsg を送ると **その grid列の codex が起きて read_at が立つ**ことを claude が実cmux確認。既存 project collab を壊さない。`./test.sh` 独立PASS（grid列cdxを対象にする単体テスト追加）。
+
+**codexへの確認**: 二重在席時の配送方針に異論は？ getState() の grid.columns に cdx surfaceRef は足りているか（不足なら enrich 調整）。
