@@ -13,6 +13,7 @@ const TAG = 'cmuxdash:';
 const GRID_ID = '__grid__';
 const GRID_TAG = TAG + GRID_ID;
 const GRID_MARK_PREFIX = `${TAG}grid:`;
+const DEFAULT_DASHBOARD_PORT = 7799;
 const PROJECTS_FILE = process.env.CMUX_DASH_PROJECTS_FILE || path.join(__dirname, 'projects.json');
 const PROJECTS_EXAMPLE_FILE = process.env.CMUX_DASH_PROJECTS_EXAMPLE_FILE || path.join(__dirname, 'projects.example.json');
 const AGMSG_DIR = path.join(os.homedir(), '.agents', 'skills', 'agmsg');
@@ -2034,6 +2035,28 @@ function reindexGridColumns() {
   });
 }
 
+function dashboardBrowserUrl() {
+  const port = parseInt(process.env.CMUX_DASH_PORT || String(DEFAULT_DASHBOARD_PORT), 10) || DEFAULT_DASHBOARD_PORT;
+  const rawHost = String(process.env.CMUX_DASH_HOST || '127.0.0.1').trim() || '127.0.0.1';
+  const host = rawHost === '0.0.0.0' || rawHost === '::' ? '127.0.0.1' : rawHost;
+  const urlHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+  return `http://${urlHost}:${port}`;
+}
+
+function surfaceType(surface) {
+  return String(surface && surface.type || '').toLowerCase();
+}
+
+function surfaceUrl(surface) {
+  return surface && (surface.url || surface.href || surface.title || null);
+}
+
+function isDashboardBrowserSurface(surface, url) {
+  if (!surface || !surface.ref || surfaceType(surface) !== 'browser') return false;
+  const current = surfaceUrl(surface);
+  return !current || String(current) === url || !/^https?:\/\//i.test(String(current));
+}
+
 async function findGridWorkspace(opts = {}) {
   return findWorkspaceByTag(GRID_ID, opts);
 }
@@ -2062,21 +2085,61 @@ async function ensureGridWorkspace() {
 
 async function ensureGridAnchorSurface(wsRef) {
   const surfaces = await listWorkspaceSurfaces(wsRef);
-  const existing = surfaces.find((surface) => surface && surface.ref);
-  if (existing) {
-    return { surfaceRef: existing.ref, paneRef: existing.paneRef || null, existing: true };
+  const url = dashboardBrowserUrl();
+  const existingBrowser = surfaces.find((surface) => isDashboardBrowserSurface(surface, url))
+    || surfaces.find((surface) => surface && surface.ref && surfaceType(surface) === 'browser');
+  if (existingBrowser) {
+    return {
+      surfaceRef: existingBrowser.ref,
+      paneRef: existingBrowser.paneRef || null,
+      type: 'browser',
+      url,
+      existing: true,
+    };
   }
 
-  const paneRef = await getDefaultPaneRef(wsRef);
-  const args = ['new-surface', '--type', 'terminal', '--workspace', wsRef, '--focus', 'false'];
+  const terminalAnchor = surfaces.find((surface) => surface && surface.ref) || null;
+  const paneRef = terminalAnchor && terminalAnchor.paneRef || await getDefaultPaneRef(wsRef);
+  const beforeRefs = new Set(surfaces.map((surface) => surface && surface.ref).filter(Boolean));
+  const args = ['new-surface', '--type', 'browser', '--url', url, '--workspace', wsRef, '--focus', 'false'];
   if (paneRef) args.push('--pane', paneRef);
-  const out = await cmux(args);
-  const surfaceRef = surfaceRefFromText(out);
-  await settle(Math.min(CMUX_SETTLE_MS, 500));
-  const nextSurfaces = await listWorkspaceSurfaces(wsRef);
-  const created = surfaceRef ? surfaceByRef(nextSurfaces, surfaceRef) : nextSurfaces.find((surface) => surface && surface.ref);
-  if (!created || !created.ref) throw new Error(`grid anchor surface was not resolved in ${wsRef}`);
-  return { surfaceRef: created.ref, paneRef: created.paneRef || paneRef || null, existing: false };
+  try {
+    const out = await cmux(args);
+    const surfaceRef = surfaceRefFromText(out);
+    await settle(Math.min(CMUX_SETTLE_MS, 500));
+    const nextSurfaces = await listWorkspaceSurfaces(wsRef);
+    let created = surfaceRef ? surfaceByRef(nextSurfaces, surfaceRef) : null;
+    if (!created) {
+      created = nextSurfaces.find((surface) => surface && surface.ref && !beforeRefs.has(surface.ref) && surfaceType(surface) === 'browser') || null;
+    }
+    if (!created) {
+      created = nextSurfaces.find((surface) => surface && surface.ref && !beforeRefs.has(surface.ref)) || null;
+    }
+    if (!created || !created.ref) throw new Error(`grid browser anchor surface was not resolved in ${wsRef}`);
+    if (terminalAnchor && terminalAnchor.ref !== created.ref && terminalAnchor.paneRef === created.paneRef) {
+      try { await cmux(['close-surface', '--workspace', wsRef, '--surface', terminalAnchor.ref]); } catch (_) {}
+    }
+    return {
+      surfaceRef: created.ref,
+      paneRef: created.paneRef || paneRef || null,
+      type: surfaceType(created) || 'browser',
+      url,
+      existing: false,
+    };
+  } catch (e) {
+    if (terminalAnchor && terminalAnchor.ref) {
+      return {
+        surfaceRef: terminalAnchor.ref,
+        paneRef: terminalAnchor.paneRef || paneRef || null,
+        type: surfaceType(terminalAnchor) || 'terminal',
+        url: null,
+        existing: true,
+        fallback: true,
+        error: summarizeError(e),
+      };
+    }
+    throw e;
+  }
 }
 
 async function createGridSplitSurface(wsRef, anchorSurfaceRef, direction) {

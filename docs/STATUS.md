@@ -1,6 +1,6 @@
 # cmux-dashboard リビルド 進捗（誰でも見られる追跡表）
 
-> 更新: 2026-06-07 / オーケストレーター: claude / 実装: codex（claude-codex-collabブリッジ経由・単一）
+> 更新: 2026-06-09 / オーケストレーター: claude / 実装: codex（claude-codex-collabブリッジ経由・単一）
 > 設計の台帳: docs/PLAN_REBUILD.md ｜ 履歴: `git log --oneline`
 
 ## フェーズ進捗
@@ -62,8 +62,17 @@
 - **独立検証(✅)**: `./test.sh` = **FINAL: PASS (253 checks)**、exit 0、FAIL 0。`CC slot ON increased surface count (1 -> 2)` / `dedicated split (1 -> 2)` / `OFF decreased (2 -> 1)` / `slot detection ignores unmarked default terminal` / R6b 全 PASS。
 - **collab follow-through も実機で確認**: codex は wake→`agmsg inbox`→実装→`./test.sh`→`agmsg send` で完走（返信に数分かかるだけで、最初の「120秒無返信」は作業中だった）。
 
+## ★完成：Phase2 グリッド化 C0-C4（2026-06-09）
+**複数プロジェクトを1つの `cmuxdash:__grid__` workspace に横並び表示する usedhonda layout が完了。**
+- C0-C4 完了: `/api/grid`、grid列ON/OFF、project action反映、実cmux C2 grid、UI side-panel static contract、最終C4 dashboard anchor を実装済み。
+- grid workspace の左端 anchor は dashboard browser surface。起動中サーバーの `CMUX_DASH_PORT`（未指定時7799）から `http://127.0.0.1:PORT` を開き、最初の project column はその右に split される。
+- `getGridState()` は live surface refs を再検証し、消えた surface を含む stale column を落とす。
+- 検証: `./test.sh` = **FINAL: PASS**（codex環境 272 / claude環境 267。差分は test.sh の C2 real-cmux フェーズが負荷時に health-gate でスキップするため。スキップは pass 扱いで FAIL は 0）。
+- **claude による実機直接検証(✅, 2026-06-09)**: 一時projectでグリッドを実cmuxに生成 → **5ペイン = browser anchor 1 + 列2×(cc/cdx terminal 4)**、列順 ga(0)/gb(1) 各 cc+cdx、surface types=[browser, terminal×4]。`remove ga`→gb生存、`remove all`→grid workspace 自動クローズ(wsRef=null)・残骸なし。**browser dashboard anchor が実cmuxで機能することを確認**。
+- 既知の軽微課題: test.sh の C2 real-cmux health-gate が負荷時に過敏（スキップしがち）。コードは正しく、claudeの直接実機検証で担保。
+
 ## 現状サマリー（2026-06-09）
 - ✅ codex pane の確実な起こし方（2段階submit）解決・実機検証・commit/push 済み。
 - ✅ slot-toggle バグ解決（Generator/Evaluator ループ）・`./test.sh` 253 PASS・独立検証済み。
 - ✅ 自動collab（claude×codex の見える2ペイン交渉）が実機で機能。
-- 残（将来の機能拡張）: Phase2（複数プロジェクトを1画面で横並び列＋小さい側パネル切替）。
+- ✅ Phase2 グリッド化 C0-C4 完成（dashboard browser side panel + project columns）・`./test.sh` PASS・claude実機直接検証済み（5ペイン/2列/anchor=browser/add-remove-cleanup）。

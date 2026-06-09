@@ -688,7 +688,7 @@ let s = { surfaces: [] };
 try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
 const surfaces = (s.surfaces || [])
   .filter((x) => (!workspace || x.workspace === workspace) && (!pane || x.pane === pane))
-  .map((x) => ({ ref: x.ref, title: x.title, type: x.type, paneRef: x.pane, cwd: x.cwd || null }));
+  .map((x) => ({ ref: x.ref, title: x.title, type: x.type, url: x.url || null, paneRef: x.pane, cwd: x.cwd || null }));
 process.stdout.write(JSON.stringify({ surfaces }) + "\n");
 NODE
     ;;
@@ -768,18 +768,24 @@ NODE
   new-surface)
     workspace=""
     pane=""
+    type="terminal"
+    url=""
     while [ "\$#" -gt 0 ]; do
       case "\$1" in
         --workspace) workspace="\${2:-}"; shift 2 ;;
         --pane) pane="\${2:-}"; shift 2 ;;
+        --type) type="\${2:-}"; shift 2 ;;
+        --url) url="\${2:-}"; shift 2 ;;
         *) shift ;;
       esac
     done
-    "\$NODE_BIN" - "\$STATE" "\$workspace" "\$pane" <<'NODE'
+    "\$NODE_BIN" - "\$STATE" "\$workspace" "\$pane" "\$type" "\$url" <<'NODE'
 const fs = require("fs");
 const file = process.argv[2];
 const workspace = process.argv[3] || "";
 let pane = process.argv[4] || "";
+const type = process.argv[5] || "terminal";
+const url = process.argv[6] || "";
 let s = { panes: [], surfaces: [], nextSurface: 1 };
 try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
 s.panes = Array.isArray(s.panes) ? s.panes : [];
@@ -790,7 +796,17 @@ if (!pane) {
 }
 const surfaceRef = "surface:" + (s.nextSurface || 1);
 s.nextSurface = (s.nextSurface || 1) + 1;
-s.surfaces.push({ ref: surfaceRef, workspace, pane, title: "terminal", type: "terminal", process: "zsh", cwd: null, sendText: null });
+s.surfaces.push({
+  ref: surfaceRef,
+  workspace,
+  pane,
+  title: type === "browser" ? url : "terminal",
+  type,
+  url: type === "browser" ? url : null,
+  process: type === "browser" ? "browser" : "zsh",
+  cwd: null,
+  sendText: null,
+});
 fs.writeFileSync(file, JSON.stringify(s) + "\n");
 process.stdout.write(surfaceRef + "\n");
 NODE
@@ -936,6 +952,8 @@ SH
   results="$(
     CMUX_BIN="$fake_cmux" \
     CMUX_DASH_PROJECTS_FILE="$cfg_file" \
+    CMUX_DASH_PORT="$api_port" \
+    CMUX_DASH_HOST="$HOST" \
     CMUX_DASH_SETTLE_MS=0 \
     CMUX_DASH_OPENALL_GAP_MS=0 \
     "$NODE_BIN" - "$DIR" "$phase_dir" "$state_file" <<'NODE'
@@ -1253,7 +1271,7 @@ async function exerciseAllSlots(id, expectedCwd, label) {
     {
       const gridRef = await ctl.ensureGridWorkspace();
       const gridWs = workspaceFor("__grid__");
-      const gridInitial = surfacesFor("__grid__").find((surface) => surface && surface.initial) || surfacesFor("__grid__")[0];
+      const dashboardUrl = "http://" + (process.env.CMUX_DASH_HOST || "127.0.0.1") + ":" + (process.env.CMUX_DASH_PORT || "7799");
       const alphaStateBeforeGrid = await ctl.getProjectState("alpha");
       const alphaColumn = await ctl.addProjectColumn("alpha");
       const afterAlphaCount = surfaceCountFor("__grid__");
@@ -1265,6 +1283,11 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       const alphaCdx = rawSurface(alphaColumn.cdx.surfaceRef);
       const generalCc = rawSurface(generalColumn.cc.surfaceRef);
       const generalCdx = rawSurface(generalColumn.cdx.surfaceRef);
+      const browserAnchor = surfacesFor("__grid__").find((surface) => (
+        surface &&
+        surface.type === "browser" &&
+        surface.url === dashboardUrl
+      ));
       const alphaStateAfterGrid = await ctl.getProjectState("alpha");
 
       check("grid C1: ensureGridWorkspace uses dedicated tag and stays out of project state", (
@@ -1293,9 +1316,14 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         !alphaCc.title.includes("cmuxdash:slot:") &&
         !generalCdx.title.includes("cmuxdash:slot:")
       ));
+      check("grid C4: dashboard browser anchor points at the running dashboard URL", (
+        browserAnchor &&
+        browserAnchor.title === dashboardUrl &&
+        browserAnchor.url === dashboardUrl
+      ));
       check("grid C1: columns split from explicit surface anchors in order", (
-        gridInitial &&
-        alphaCc.splitFrom === gridInitial.ref &&
+        browserAnchor &&
+        alphaCc.splitFrom === browserAnchor.ref &&
         alphaCc.direction === "right" &&
         alphaCdx.splitFrom === alphaCc.ref &&
         alphaCdx.direction === "down" &&
@@ -1332,6 +1360,17 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         repeatRemove.removed === false &&
         surfaceCountFor("__grid__") === afterRemoveCount
       ));
+      {
+        const raw = rawCmuxState();
+        raw.surfaces = (raw.surfaces || []).filter((surface) => surface && surface.ref !== generalColumn.cc.surfaceRef);
+        fs.writeFileSync(stateFile, JSON.stringify(raw) + "\n");
+        const staleGridState = await ctl.getGridState();
+        check("grid C4: getGridState drops columns with stale live surface refs", (
+          staleGridState.wsRef === gridRef &&
+          Array.isArray(staleGridState.columns) &&
+          staleGridState.columns.length === 0
+        ));
+      }
     }
   } catch (err) {
     failed += 1;
