@@ -589,6 +589,13 @@ const fs = require("fs");
 const file = process.argv[2];
 let s = { workspaces: [] };
 try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
+const emptyReads = Number(s.listWorkspacesEmptyReads || 0);
+if (emptyReads > 0) {
+  s.listWorkspacesEmptyReads = emptyReads - 1;
+  fs.writeFileSync(file, JSON.stringify(s) + "\n");
+  process.stdout.write(JSON.stringify({ workspaces: [] }) + "\n");
+  process.exit(0);
+}
 process.stdout.write(JSON.stringify({ workspaces: Array.isArray(s.workspaces) ? s.workspaces : [] }) + "\n");
 NODE
     ;;
@@ -760,6 +767,13 @@ const workspace = process.argv[3] || "";
 const pane = process.argv[4] || "";
 let s = { surfaces: [] };
 try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
+const failReads = Number(s.listPaneSurfacesFailReads || 0);
+if (failReads > 0) {
+  s.listPaneSurfacesFailReads = failReads - 1;
+  fs.writeFileSync(file, JSON.stringify(s) + "\n");
+  process.stderr.write("simulated list-pane-surfaces failure\n");
+  process.exit(64);
+}
 const surfaces = (s.surfaces || [])
   .filter((x) => (!workspace || x.workspace === workspace) && (!pane || x.pane === pane))
   .map((x) => ({ ref: x.ref, title: x.title, type: x.type, url: x.url || null, paneRef: x.pane, cwd: x.cwd || null }));
@@ -1088,6 +1102,9 @@ function yamlHasGlobalCcOn(yaml) {
 function rawCmuxState() {
   return JSON.parse(fs.readFileSync(stateFile, "utf8"));
 }
+function writeCmuxState(state) {
+  fs.writeFileSync(stateFile, JSON.stringify(state) + "\n");
+}
 function workspaceFor(id) {
   return (rawCmuxState().workspaces || []).find((w) => w && w.description === "cmuxdash:" + id) || null;
 }
@@ -1376,10 +1393,35 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       const alphaStateBeforeGrid = await ctl.getProjectState("alpha");
       const alphaColumn = await ctl.addProjectColumn("alpha");
       const afterAlphaCount = surfaceCountFor("__grid__");
+      const afterAlphaGridRef = workspaceFor("__grid__") && workspaceFor("__grid__").ref;
       const repeatAlpha = await ctl.addProjectColumn("alpha");
       const afterRepeatCount = surfaceCountFor("__grid__");
       const generalColumn = await ctl.addProjectColumn("cc-general");
+      const afterGeneralCount = surfaceCountFor("__grid__");
+      const afterGeneralGridWorkspaceCount = (rawCmuxState().workspaces || [])
+        .filter((ws) => ws && ws.description === "cmuxdash:__grid__").length;
       const gridState = await ctl.getGridState();
+      const gridRefs = (state) => (state.columns || [])
+        .map((column) => [
+          column.projectId,
+          column.wsRef,
+          column.cc && column.cc.surfaceRef,
+          column.cdx && column.cdx.surfaceRef,
+        ].join(":"))
+        .join("|");
+      {
+        const raw = rawCmuxState();
+        raw.listWorkspacesEmptyReads = 3;
+        writeCmuxState(raw);
+      }
+      const transientGridState = await ctl.getGridState();
+      const transientGridWs = workspaceFor("__grid__");
+      {
+        const raw = rawCmuxState();
+        raw.listPaneSurfacesFailReads = panesFor("__grid__").length + 1;
+        writeCmuxState(raw);
+      }
+      const surfaceFailureGridState = await ctl.getGridState();
       const beforeFocusCount = surfaceCountFor("__grid__");
       const focusedAlpha = await ctl.addProjectColumn("alpha", { focus: true });
       const afterFocusCount = surfaceCountFor("__grid__");
@@ -1398,9 +1440,6 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       ));
       const alphaStateAfterGrid = await ctl.getProjectState("alpha");
       const layout = gridWs && gridWs.layout || {};
-      const rightLayout = layout.children && layout.children[1] || {};
-      const firstColumnLayout = rightLayout.children && rightLayout.children[0] || {};
-      const secondColumnLayout = rightLayout.children && rightLayout.children[1] || {};
 
       check("grid C1: ensureGridWorkspace uses dedicated tag and stays out of project state", (
         initialGridRef &&
@@ -1413,11 +1452,17 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         alphaStateAfterGrid.surfaces.every((surface) => !String(surface.title || "").includes("cmuxdash:grid:"))
       ));
       check("grid C1: addProjectColumn creates ordered scoped cc/cdx columns", (
+        afterAlphaGridRef === initialGridRef &&
         gridState.wsRef === gridWs.ref &&
+        gridState.wsRef === initialGridRef &&
         gridState.columns.length === 2 &&
         gridState.columns.map((column) => column.projectId).join(",") === "alpha,cc-general" &&
         alphaColumn.added === true &&
+        alphaColumn.rebuilt === false &&
+        alphaColumn.incremental === true &&
         generalColumn.added === true &&
+        generalColumn.rebuilt === false &&
+        generalColumn.incremental === true &&
         alphaCc &&
         alphaCdx &&
         generalCc &&
@@ -1428,6 +1473,32 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         generalGridColumn.cdx.marker === generalColumn.cdx.marker &&
         !String(alphaCc.title || "").includes("cmuxdash:slot:") &&
         !String(generalCdx.title || "").includes("cmuxdash:slot:")
+      ));
+      check("grid G2: incremental second add preserves existing refs and workspace", (
+        afterAlphaCount === 3 &&
+        afterGeneralCount === 5 &&
+        afterGeneralGridWorkspaceCount === 1 &&
+        generalColumn.wsRef === initialGridRef &&
+        alphaGridColumn.wsRef === initialGridRef &&
+        generalGridColumn.wsRef === initialGridRef &&
+        alphaGridColumn.cc.surfaceRef === alphaColumn.cc.surfaceRef &&
+        alphaGridColumn.cdx.surfaceRef === alphaColumn.cdx.surfaceRef &&
+        generalGridColumn.cc.surfaceRef === generalColumn.cc.surfaceRef &&
+        generalGridColumn.cdx.surfaceRef === generalColumn.cdx.surfaceRef
+      ));
+      check("grid G3: transient empty tag lookup keeps known live wsRef and columns", (
+        transientGridState.wsRef === gridState.wsRef &&
+        transientGridWs &&
+        transientGridWs.ref === gridState.wsRef &&
+        transientGridState.columns.length === gridState.columns.length &&
+        gridRefs(transientGridState) === gridRefs(gridState) &&
+        (rawCmuxState().workspaces || []).filter((ws) => ws && ws.description === "cmuxdash:__grid__").length === 1
+      ));
+      check("grid G3: transient surface list failure keeps columns while wsRef live", (
+        surfaceFailureGridState.wsRef === gridState.wsRef &&
+        surfaceFailureGridState.columns.length === gridState.columns.length &&
+        gridRefs(surfaceFailureGridState) === gridRefs(gridState) &&
+        (rawCmuxState().workspaces || []).filter((ws) => ws && ws.description === "cmuxdash:__grid__").length === 1
       ));
       check("grid C1: deterministic refs survive overwritten grid launch titles", (
         alphaCc.title === "✳ Claude Code" &&
@@ -1450,18 +1521,18 @@ async function exerciseAllSlots(id, expectedCwd, label) {
           browserAnchor.title === dashboardUrl &&
           browserAnchor.url === dashboardUrl
       ));
-      check("grid C1: layout JSON makes narrow dashboard plus equal full-height columns", (
+      check("grid G2: incremental split anchors keep browser anchor and add cc right/cdx down", (
         browserAnchor &&
-        layout.direction === "horizontal" &&
-        Math.abs(layout.split - 0.18) < 0.0001 &&
-        rightLayout.direction === "horizontal" &&
-        Math.abs(rightLayout.split - 0.5) < 0.0001 &&
-        firstColumnLayout.direction === "vertical" &&
-        Math.abs(firstColumnLayout.split - 0.5) < 0.0001 &&
-        secondColumnLayout.direction === "vertical" &&
-        Math.abs(secondColumnLayout.split - 0.5) < 0.0001 &&
-        !alphaCc.splitFrom &&
-        !generalCc.splitFrom
+        layout.pane &&
+        !layout.children &&
+        alphaCc.splitFrom === browserAnchor.ref &&
+        alphaCc.direction === "right" &&
+        alphaCdx.splitFrom === alphaGridColumn.cc.surfaceRef &&
+        alphaCdx.direction === "down" &&
+        generalCc.splitFrom === alphaGridColumn.cc.surfaceRef &&
+        generalCc.direction === "right" &&
+        generalCdx.splitFrom === generalGridColumn.cc.surfaceRef &&
+        generalCdx.direction === "down"
       ));
       {
         const threeColumnLayout = ctl.gridWorkspaceLayout([
@@ -1514,12 +1585,18 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       const afterRemoveCount = surfaceCountFor("__grid__");
       const repeatRemove = await ctl.removeProjectColumn("alpha");
       const survivingGeneral = afterRemove.columns[0] || {};
-      check("grid C1: removeProjectColumn closes only tracked column surfaces", (
+      check("grid G2: removeProjectColumn closes only target column and preserves survivor refs/workspace", (
         removedAlpha.removed === true &&
-        removedAlpha.rebuilt === true &&
-        removedAlpha.closedWorkspace === gridState.wsRef &&
+        removedAlpha.rebuilt === false &&
+        removedAlpha.incremental === true &&
+        removedAlpha.closedWorkspace === null &&
+        removedAlpha.wsRef === gridState.wsRef &&
+        afterRemove.wsRef === gridState.wsRef &&
+        afterRemoveCount === afterGeneralCount - 2 &&
         afterRemove.columns.length === 1 &&
         afterRemove.columns[0].projectId === "cc-general" &&
+        survivingGeneral.cc.surfaceRef === generalGridColumn.cc.surfaceRef &&
+        survivingGeneral.cdx.surfaceRef === generalGridColumn.cdx.surfaceRef &&
         !rawSurface(alphaGridColumn.cc.surfaceRef) &&
         !rawSurface(alphaGridColumn.cdx.surfaceRef) &&
         !!rawSurface(survivingGeneral.cc.surfaceRef) &&
@@ -3630,8 +3707,8 @@ async function waitForHttp(port, requestPath, timeoutMs = 5000) {
 	function waitForExit(child, timeoutMs) {
 	  return new Promise((resolve) => {
 	    if (child.exitCode !== null || child.signalCode !== null) {
-	      resolve({ code: child.exitCode, signal: child.signalCode });
-	      return;
+      resolve({ code: child.exitCode, signal: child.signalCode });
+      return;
 	    }
     const timer = setTimeout(() => resolve(null), timeoutMs);
     child.once("exit", (code, signal) => {
@@ -3814,7 +3891,7 @@ function runCommand(command, args, opts = {}, timeoutMs = 5000) {
   try {
     const projectsFile = path.join(phaseDir, "projects.json");
     fs.writeFileSync(projectsFile, JSON.stringify({
-	      _comment: "Phase5c isolated test config",
+      _comment: "Phase5c isolated test config",
       defaults: { agmsg: { enabled: false }, claudeMd: { mode: "off" }, collab: false },
       projects: [],
     }) + "\n");
@@ -3877,76 +3954,76 @@ function runCommand(command, args, opts = {}, timeoutMs = 5000) {
 	    fs.writeFileSync(modeFile, "healthy");
 	    await startStateServer(statePort, modeFile);
 	    const watchdogBaseEnv = {
-	      ...process.env,
-	      NODE_BIN: nodeBin,
-	      CMUX_DASH_URL: "http://" + host + ":" + statePort + "/api/state",
-	      CMUX_DASH_WATCHDOG_CURL_TIMEOUT: "1",
-	      CMUX_DASH_WATCHDOG_FAILURE_THRESHOLD: "3",
+      ...process.env,
+      NODE_BIN: nodeBin,
+      CMUX_DASH_URL: "http://" + host + ":" + statePort + "/api/state",
+      CMUX_DASH_WATCHDOG_CURL_TIMEOUT: "1",
+      CMUX_DASH_WATCHDOG_FAILURE_THRESHOLD: "3",
 	    };
 	    const healthyCheck = await runCommand("/bin/bash", [watchdog, "check"], {
-	      cwd: repo,
-	      env: watchdogBaseEnv,
+      cwd: repo,
+      env: watchdogBaseEnv,
 	    }, 5000);
 	    check("watchdog check treats healthy state as ok", healthyCheck.status === 0 && !/unhealthy|NOT RESPONDING|invalid/.test(healthyCheck.stdout + healthyCheck.stderr));
 
 	    fs.writeFileSync(modeFile, "unhealthy");
 	    const noRestartOnce = await runCommand("/bin/bash", [watchdog, "once"], {
-	      cwd: repo,
-	      env: watchdogBaseEnv,
+      cwd: repo,
+      env: watchdogBaseEnv,
 	    }, 5000);
 	    check("watchdog default prompts foreground server instead of detached restart", (
-	      noRestartOnce.status === 0 &&
-	      /foreground server required/.test(noRestartOnce.stdout) &&
-	      /not restarted: detached watchdog restarts cannot restore/.test(noRestartOnce.stdout) &&
-	      /\.\/cmux-dash server/.test(noRestartOnce.stdout)
+      noRestartOnce.status === 0 &&
+      /foreground server required/.test(noRestartOnce.stdout) &&
+      /not restarted: detached watchdog restarts cannot restore/.test(noRestartOnce.stdout) &&
+      /\.\/cmux-dash server/.test(noRestartOnce.stdout)
 	    ));
 	
 	    const unhealthyRestartLog = path.join(phaseDir, "watchdog-unhealthy-restart.log");
 	    fs.writeFileSync(modeFile, "unhealthy");
 	    const unhealthyOnce = await runCommand("/bin/bash", [watchdog, "once"], {
-	      cwd: repo,
-	      env: {
-	        ...watchdogBaseEnv,
-	        CMUX_DASH_WATCHDOG_RESTART_CMD: "printf '%s\\n' restarted >> " + shDoubleQuote(unhealthyRestartLog) + "; printf '%s' healthy > " + shDoubleQuote(modeFile),
-	      },
+      cwd: repo,
+      env: {
+        ...watchdogBaseEnv,
+        CMUX_DASH_WATCHDOG_RESTART_CMD: "printf '%s\\n' restarted >> " + shDoubleQuote(unhealthyRestartLog) + "; printf '%s' healthy > " + shDoubleQuote(modeFile),
+      },
 	    }, 5000);
 	    const unhealthyRestarted = fs.existsSync(unhealthyRestartLog) ? fs.readFileSync(unhealthyRestartLog, "utf8") : "";
 	    check("watchdog once restarts on unhealthy cmux health", (
-	      unhealthyOnce.status === 0 &&
-	      /restarted/.test(unhealthyRestarted) &&
-	      /cmux unhealthy/.test(unhealthyOnce.stdout) &&
-	      /restarted; cmux ok=true/.test(unhealthyOnce.stdout)
+      unhealthyOnce.status === 0 &&
+      /restarted/.test(unhealthyRestarted) &&
+      /cmux unhealthy/.test(unhealthyOnce.stdout) &&
+      /restarted; cmux ok=true/.test(unhealthyOnce.stdout)
 	    ));
 	
 	    const deadPort = await findFreePort(statePort + 1);
 	    const unreachableRestartLog = path.join(phaseDir, "watchdog-unreachable-restart.log");
 	    const unreachableOnce = await runCommand("/bin/bash", [watchdog, "once"], {
-	      cwd: repo,
-	      env: {
-	        ...watchdogBaseEnv,
-	        CMUX_DASH_URL: "http://" + host + ":" + deadPort + "/api/state",
-	        CMUX_DASH_WATCHDOG_RESTART_CMD: "printf '%s\\n' restarted >> " + shDoubleQuote(unreachableRestartLog),
-	      },
+      cwd: repo,
+      env: {
+        ...watchdogBaseEnv,
+        CMUX_DASH_URL: "http://" + host + ":" + deadPort + "/api/state",
+        CMUX_DASH_WATCHDOG_RESTART_CMD: "printf '%s\\n' restarted >> " + shDoubleQuote(unreachableRestartLog),
+      },
 	    }, 5000);
 	    const unreachableRestarted = fs.existsSync(unreachableRestartLog) ? fs.readFileSync(unreachableRestartLog, "utf8") : "";
 	    check("watchdog once restarts when /api/state is unreachable", (
-	      unreachableOnce.status === 0 &&
-	      /restarted/.test(unreachableRestarted) &&
-	      /server NOT RESPONDING/.test(unreachableOnce.stdout)
+      unreachableOnce.status === 0 &&
+      /restarted/.test(unreachableRestarted) &&
+      /server NOT RESPONDING/.test(unreachableOnce.stdout)
 	    ));
 	
 	    const help = spawnSync("/bin/bash", [path.join(repo, "cmux-dash"), "help"], {
-	      cwd: repo,
-	      env: { ...process.env, NODE_BIN: nodeBin },
-	      encoding: "utf8",
+      cwd: repo,
+      env: { ...process.env, NODE_BIN: nodeBin },
+      encoding: "utf8",
 	    });
 	    check("cmux-dash help documents stable in-pane server mode", (
-	      help.status === 0 &&
-	      /Stable in-pane mode/.test(help.stdout) &&
-	      /cmuxdash:__server__/.test(help.stdout) &&
-	      /\.\/cmux-dash up/.test(help.stdout) &&
-	      /\.\/cmux-dash server/.test(help.stdout) &&
-	      /exec node server\.js/.test(help.stdout)
+      help.status === 0 &&
+      /Stable in-pane mode/.test(help.stdout) &&
+      /cmuxdash:__server__/.test(help.stdout) &&
+      /\.\/cmux-dash up/.test(help.stdout) &&
+      /\.\/cmux-dash server/.test(help.stdout) &&
+      /exec node server\.js/.test(help.stdout)
 	    ));
 
 	    const fakeCmux = path.join(phaseDir, "cmux-in-pane");
@@ -3957,9 +4034,9 @@ function runCommand(command, args, opts = {}, timeoutMs = 5000) {
 	    fs.writeFileSync(fakeCmuxState, JSON.stringify({ workspaces: [], panes: [], surfaces: [], serverPids: [], nextWorkspace: 1, nextPane: 1, nextSurface: 1 }) + "\n");
 	    fs.writeFileSync(fakeCmuxLog, "");
 	    fs.writeFileSync(fakeProjects, JSON.stringify({
-	      _comment: "Phase5c in-pane startup isolated config",
-	      defaults: { agmsg: { enabled: false }, claudeMd: { mode: "off" }, collab: false },
-	      projects: [],
+      _comment: "Phase5c in-pane startup isolated config",
+      defaults: { agmsg: { enabled: false }, claudeMd: { mode: "off" }, collab: false },
+      projects: [],
 	    }) + "\n");
 	    writeExecutable(fakeCmux, "#!/usr/bin/env node\n" + `
 const fs = require("fs");
@@ -4128,29 +4205,29 @@ console.log("{}");
 	    const upPort = await findFreePort(deadPort + 1);
 	    const inPanePidFile = path.join(phaseDir, "in-pane-server.pid");
 	    const upEnv = {
-	      ...process.env,
-	      NODE_BIN: nodeBin,
-	      CMUX_BIN: fakeCmux,
-	      CMUX_DASH_PORT: String(upPort),
-	      CMUX_DASH_HOST: host,
-	      CMUX_DASH_PROJECTS_FILE: fakeProjects,
-	      CMUX_DASH_SERVER_PIDFILE: inPanePidFile,
-	      CMUX_DASH_STATE_CURL_TIMEOUT: "1",
-	      CMUX_DASH_SERVER_SURFACE_READY_DELAY_MS: "250",
-	      CMUX_DASH_SERVER_SURFACE_READY_TIMEOUT_MS: "1200",
-	      CMUX_DASH_SERVER_SURFACE_READY_INTERVAL_MS: "50",
-	      CMUX_DASH_SERVER_REACHABLE_TIMEOUT_MS: "3000",
-	      CMUX_DASH_SERVER_REACHABLE_INTERVAL_MS: "100",
-	      CMUX_DASH_SERVER_HEALTH_TIMEOUT_MS: "3000",
-	      CMUX_DASH_SERVER_HEALTH_INTERVAL_MS: "100",
-	      CMUX_DASH_SERVER_PORT_RELEASE_TIMEOUT_MS: "3000",
-	      CMUX_DASH_SERVER_PORT_RELEASE_INTERVAL_MS: "100",
-	      FAKE_CMUX_SURFACE_READY_DELAY_MS: "150",
-	      FAKE_CMUX_SERVER_START_DELAY_MS: "600",
-	      CMUX_DASH_SETTLE_MS: "0",
-	      CMUX_DASH_READ_TIMEOUT: "500",
-	      CMUX_DASH_READ_RETRY_BUDGET_MS: "500",
-	      CMUX_DASH_READ_RETRIES: "0",
+      ...process.env,
+      NODE_BIN: nodeBin,
+      CMUX_BIN: fakeCmux,
+      CMUX_DASH_PORT: String(upPort),
+      CMUX_DASH_HOST: host,
+      CMUX_DASH_PROJECTS_FILE: fakeProjects,
+      CMUX_DASH_SERVER_PIDFILE: inPanePidFile,
+      CMUX_DASH_STATE_CURL_TIMEOUT: "1",
+      CMUX_DASH_SERVER_SURFACE_READY_DELAY_MS: "250",
+      CMUX_DASH_SERVER_SURFACE_READY_TIMEOUT_MS: "1200",
+      CMUX_DASH_SERVER_SURFACE_READY_INTERVAL_MS: "50",
+      CMUX_DASH_SERVER_REACHABLE_TIMEOUT_MS: "3000",
+      CMUX_DASH_SERVER_REACHABLE_INTERVAL_MS: "100",
+      CMUX_DASH_SERVER_HEALTH_TIMEOUT_MS: "3000",
+      CMUX_DASH_SERVER_HEALTH_INTERVAL_MS: "100",
+      CMUX_DASH_SERVER_PORT_RELEASE_TIMEOUT_MS: "3000",
+      CMUX_DASH_SERVER_PORT_RELEASE_INTERVAL_MS: "100",
+      FAKE_CMUX_SURFACE_READY_DELAY_MS: "150",
+      FAKE_CMUX_SERVER_START_DELAY_MS: "600",
+      CMUX_DASH_SETTLE_MS: "0",
+      CMUX_DASH_READ_TIMEOUT: "500",
+      CMUX_DASH_READ_RETRY_BUDGET_MS: "500",
+      CMUX_DASH_READ_RETRIES: "0",
 	    };
 	    const up = await runCommand("/bin/bash", [path.join(repo, "cmux-dash"), "up"], { cwd: repo, env: upEnv }, 12000);
 	    const upStateResp = await request(upPort, "/api/state").catch(() => null);
@@ -4163,53 +4240,53 @@ console.log("{}");
 	    const serverSurfaceCreate = logs.find((item) => item.event === "new-surface");
 	    const browserPanes = logs.filter((item) => item.event === "new-pane" && item.type === "browser" && item.url === "http://" + host + ":" + upPort);
 	    const upContractOk = (
-	      up.status === 0 &&
-	      serverWorkspaceCreates.length === 1 &&
-	      serverSends.length === 1 &&
-	      /CMUX_DASH_PORT=/.test(serverSends[0].text) &&
-	      browserPanes.length === 1 &&
-	      !logs.some((item) => item.event === "open")
+      up.status === 0 &&
+      serverWorkspaceCreates.length === 1 &&
+      serverSends.length === 1 &&
+      /CMUX_DASH_PORT=/.test(serverSends[0].text) &&
+      browserPanes.length === 1 &&
+      !logs.some((item) => item.event === "open")
 	    );
 	    if (!upContractOk) console.log("INFO\tPhase5c in-pane up debug " + JSON.stringify({
-	      status: up.status,
-	      stdout: (up.stdout || "").slice(0, 200),
-	      stderr: (up.stderr || "").slice(0, 200),
-	      serverWorkspaceCreates: serverWorkspaceCreates.length,
-	      serverSends: serverSends.length,
-	      browserPanes: browserPanes.length,
-	      events: logs.map((item) => item.event + ":" + (item.description || item.type || item.count || "")).slice(0, 20),
+      status: up.status,
+      stdout: (up.stdout || "").slice(0, 200),
+      stderr: (up.stderr || "").slice(0, 200),
+      serverWorkspaceCreates: serverWorkspaceCreates.length,
+      serverSends: serverSends.length,
+      browserPanes: browserPanes.length,
+      events: logs.map((item) => item.event + ":" + (item.description || item.type || item.count || "")).slice(0, 20),
 	    }));
 	    check("cmux-dash up creates server workspace, sends server command, and opens browser pane", upContractOk);
 	    const launchCommandOk = (
-	      serverSends.length === 1 &&
-	      /CMUX_DASH_PORT=/.test(serverSends[0].text) &&
-	      /CMUX_DASH_HOST=/.test(serverSends[0].text) &&
-	      /server\.js/.test(serverSends[0].text) &&
-	      !/\bexec\b[\s\S]*server\.js/.test(serverSends[0].text) &&
-	      serverSurfaceCreate &&
-	      serverSends[0].at - serverSurfaceCreate.at >= 120 &&
-	      !logs.some((item) => item.event === "send-before-ready")
+      serverSends.length === 1 &&
+      /CMUX_DASH_PORT=/.test(serverSends[0].text) &&
+      /CMUX_DASH_HOST=/.test(serverSends[0].text) &&
+      /server\.js/.test(serverSends[0].text) &&
+      !/\bexec\b[\s\S]*server\.js/.test(serverSends[0].text) &&
+      serverSurfaceCreate &&
+      serverSends[0].at - serverSurfaceCreate.at >= 120 &&
+      !logs.some((item) => item.event === "send-before-ready")
 	    );
 	    if (!launchCommandOk) console.log("INFO\tPhase5c in-pane command/ready debug " + JSON.stringify({
-	      sendText: serverSends[0] && serverSends[0].text,
-	      newSurfaceAt: serverSurfaceCreate && serverSurfaceCreate.at,
-	      sendAt: serverSends[0] && serverSends[0].at,
-	      sendBeforeReady: logs.filter((item) => item.event === "send-before-ready").length,
+      sendText: serverSends[0] && serverSends[0].text,
+      newSurfaceAt: serverSurfaceCreate && serverSurfaceCreate.at,
+      sendAt: serverSends[0] && serverSends[0].at,
+      sendBeforeReady: logs.filter((item) => item.event === "send-before-ready").length,
 	    }));
 	    check("cmux-dash waits for server surface readiness and sends non-exec node command", launchCommandOk);
 	    const upHealthOk = (
-	      upStateResp && upStateResp.status === 200 &&
-	      upState && upState.health && upState.health.cmux && upState.health.cmux.ok === true &&
-	      /server reachable/.test(up.stdout + up.stderr) &&
-	      /health\.cmux ok/.test(up.stdout + up.stderr) &&
-	      fs.existsSync(fakeServerLog) &&
-	      fs.readFileSync(fakeServerLog, "utf8").includes("http://" + host + ":" + upPort)
+      upStateResp && upStateResp.status === 200 &&
+      upState && upState.health && upState.health.cmux && upState.health.cmux.ok === true &&
+      /server reachable/.test(up.stdout + up.stderr) &&
+      /health\.cmux ok/.test(up.stdout + up.stderr) &&
+      fs.existsSync(fakeServerLog) &&
+      fs.readFileSync(fakeServerLog, "utf8").includes("http://" + host + ":" + upPort)
 	    );
 	    if (!upHealthOk) console.log("INFO\tPhase5c in-pane health debug " + JSON.stringify({
-	      respStatus: upStateResp && upStateResp.status,
-	      respBody: (upStateResp && upStateResp.body || "").slice(0, 160),
-	      serverLogExists: fs.existsSync(fakeServerLog),
-	      serverLog: fs.existsSync(fakeServerLog) ? fs.readFileSync(fakeServerLog, "utf8").slice(0, 160) : "",
+      respStatus: upStateResp && upStateResp.status,
+      respBody: (upStateResp && upStateResp.body || "").slice(0, 160),
+      serverLogExists: fs.existsSync(fakeServerLog),
+      serverLog: fs.existsSync(fakeServerLog) ? fs.readFileSync(fakeServerLog, "utf8").slice(0, 160) : "",
 	    }));
 	    check("cmux-dash in-pane server is reachable with health.cmux ok", upHealthOk);
 	    const firstServerPid = fakeState.serverPids && fakeState.serverPids[0];
@@ -4219,21 +4296,21 @@ console.log("{}");
 	    const sendsAfterReuse = logs.filter((item) => item.event === "send" && /server\.js/.test(item.text || ""));
 	    const browserAfterReuse = logs.filter((item) => item.event === "new-pane" && item.type === "browser");
 	    const reuseOk = (
-	      upAgain.status === 0 &&
-	      /server already running in cmux workspace/.test(upAgain.stdout + upAgain.stderr) &&
-	      /dashboard workspace already open/.test(upAgain.stdout + upAgain.stderr) &&
-	      sendsAfterReuse.length === 1 &&
-	      browserAfterReuse.length === 1 &&
-	      fakeState.serverPids[0] === firstServerPid
+      upAgain.status === 0 &&
+      /server already running in cmux workspace/.test(upAgain.stdout + upAgain.stderr) &&
+      /dashboard workspace already open/.test(upAgain.stdout + upAgain.stderr) &&
+      sendsAfterReuse.length === 1 &&
+      browserAfterReuse.length === 1 &&
+      fakeState.serverPids[0] === firstServerPid
 	    );
 	    if (!reuseOk) console.log("INFO\tPhase5c in-pane reuse debug " + JSON.stringify({
-	      status: upAgain.status,
-	      stdout: (upAgain.stdout || "").slice(0, 200),
-	      stderr: (upAgain.stderr || "").slice(0, 200),
-	      sendsAfterReuse: sendsAfterReuse.length,
-	      browserAfterReuse: browserAfterReuse.length,
-	      firstServerPid,
-	      serverPids: fakeState.serverPids,
+      status: upAgain.status,
+      stdout: (upAgain.stdout || "").slice(0, 200),
+      stderr: (upAgain.stderr || "").slice(0, 200),
+      sendsAfterReuse: sendsAfterReuse.length,
+      browserAfterReuse: browserAfterReuse.length,
+      firstServerPid,
+      serverPids: fakeState.serverPids,
 	    }));
 	    check("cmux-dash reuses existing __server__ workspace and does not double-start", reuseOk);
 	    const restart = await runCommand("/bin/bash", [path.join(repo, "cmux-dash"), "restart"], { cwd: repo, env: upEnv }, 12000);
@@ -4241,17 +4318,17 @@ console.log("{}");
 	    logs = readFakeLog();
 	    const sendsAfterRestart = logs.filter((item) => item.event === "send" && /server\.js/.test(item.text || ""));
 	    const restartOk = (
-	      restart.status === 0 &&
-	      sendsAfterRestart.length === 2 &&
-	      restartStateResp && restartStateResp.status === 200 &&
-	      /health\.cmux ok/.test(restart.stdout + restart.stderr)
+      restart.status === 0 &&
+      sendsAfterRestart.length === 2 &&
+      restartStateResp && restartStateResp.status === 200 &&
+      /health\.cmux ok/.test(restart.stdout + restart.stderr)
 	    );
 	    if (!restartOk) console.log("INFO\tPhase5c in-pane restart debug " + JSON.stringify({
-	      status: restart.status,
-	      stdout: (restart.stdout || "").slice(0, 240),
-	      stderr: (restart.stderr || "").slice(0, 240),
-	      sendsAfterRestart: sendsAfterRestart.length,
-	      restartRespStatus: restartStateResp && restartStateResp.status,
+      status: restart.status,
+      stdout: (restart.stdout || "").slice(0, 240),
+      stderr: (restart.stderr || "").slice(0, 240),
+      sendsAfterRestart: sendsAfterRestart.length,
+      restartRespStatus: restartStateResp && restartStateResp.status,
 	    }));
 	    check("cmux-dash restart restarts through cmux pane and health-checks state", restartOk);
 	    await runCommand("/bin/bash", [path.join(repo, "cmux-dash"), "stop"], { cwd: repo, env: upEnv }, 5000);
@@ -4261,32 +4338,32 @@ console.log("{}");
 	    const failPort = await findFreePort(upPort + 10);
 	    const failServerLog = path.join(phaseDir, "in-pane-start-failure.log");
 	    const failEnv = {
-	      ...upEnv,
-	      CMUX_DASH_PORT: String(failPort),
-	      CMUX_DASH_SERVER_LOG: failServerLog,
-	      CMUX_DASH_SERVER_PIDFILE: path.join(phaseDir, "in-pane-start-failure.pid"),
-	      CMUX_DASH_SERVER_REACHABLE_TIMEOUT_MS: "500",
-	      CMUX_DASH_SERVER_REACHABLE_INTERVAL_MS: "100",
-	      CMUX_DASH_SERVER_SURFACE_READY_DELAY_MS: "20",
-	      FAKE_CMUX_SERVER_NO_START: "1",
-	      FAKE_CMUX_SERVER_START_DELAY_MS: "0",
-	      FAKE_CMUX_SURFACE_READY_DELAY_MS: "0",
+      ...upEnv,
+      CMUX_DASH_PORT: String(failPort),
+      CMUX_DASH_SERVER_LOG: failServerLog,
+      CMUX_DASH_SERVER_PIDFILE: path.join(phaseDir, "in-pane-start-failure.pid"),
+      CMUX_DASH_SERVER_REACHABLE_TIMEOUT_MS: "500",
+      CMUX_DASH_SERVER_REACHABLE_INTERVAL_MS: "100",
+      CMUX_DASH_SERVER_SURFACE_READY_DELAY_MS: "20",
+      FAKE_CMUX_SERVER_NO_START: "1",
+      FAKE_CMUX_SERVER_START_DELAY_MS: "0",
+      FAKE_CMUX_SURFACE_READY_DELAY_MS: "0",
 	    };
 	    const failedUp = await runCommand("/bin/bash", [path.join(repo, "cmux-dash"), "up"], { cwd: repo, env: failEnv }, 4000);
 	    const failedOutput = failedUp.stdout + failedUp.stderr;
 	    const failedDiagnosticOk = (
-	      failedUp.status !== 0 &&
-	      /server failed to become reachable/.test(failedOutput) &&
-	      /startup diagnostics/.test(failedOutput) &&
-	      /workspace=workspace:/.test(failedOutput) &&
-	      /surface=surface:/.test(failedOutput) &&
-	      failedOutput.includes(failServerLog)
+      failedUp.status !== 0 &&
+      /server failed to become reachable/.test(failedOutput) &&
+      /startup diagnostics/.test(failedOutput) &&
+      /workspace=workspace:/.test(failedOutput) &&
+      /surface=surface:/.test(failedOutput) &&
+      failedOutput.includes(failServerLog)
 	    );
 	    if (!failedDiagnosticOk) console.log("INFO\tPhase5c failed-start diagnostics debug " + JSON.stringify({
-	      status: failedUp.status,
-	      stdout: (failedUp.stdout || "").slice(0, 500),
-	      stderr: (failedUp.stderr || "").slice(0, 1200),
-	      expectedLog: failServerLog,
+      status: failedUp.status,
+      stdout: (failedUp.stdout || "").slice(0, 500),
+      stderr: (failedUp.stderr || "").slice(0, 1200),
+      expectedLog: failServerLog,
 	    }));
 	    check("cmux-dash failed in-pane start prints workspace/surface diagnostics", failedDiagnosticOk);
 
@@ -4295,24 +4372,24 @@ console.log("{}");
 	    const sticky = await startStickyListener(stickyPort, stickyPidFile, 800);
 	    const stickyStartedAt = Date.now();
 	    const stickyStop = await runCommand("/bin/bash", [path.join(repo, "cmux-dash"), "stop"], {
-	      cwd: repo,
-	      env: {
-	        ...process.env,
-	        NODE_BIN: nodeBin,
-	        CMUX_DASH_PORT: String(stickyPort),
-	        CMUX_DASH_HOST: host,
-	        CMUX_DASH_SERVER_PIDFILE: stickyPidFile,
-	        CMUX_DASH_START_WATCHDOG: "0",
-	        CMUX_DASH_SERVER_PORT_RELEASE_TIMEOUT_MS: "3000",
-	        CMUX_DASH_SERVER_PORT_RELEASE_INTERVAL_MS: "100",
-	      },
+      cwd: repo,
+      env: {
+        ...process.env,
+        NODE_BIN: nodeBin,
+        CMUX_DASH_PORT: String(stickyPort),
+        CMUX_DASH_HOST: host,
+        CMUX_DASH_SERVER_PIDFILE: stickyPidFile,
+        CMUX_DASH_START_WATCHDOG: "0",
+        CMUX_DASH_SERVER_PORT_RELEASE_TIMEOUT_MS: "3000",
+        CMUX_DASH_SERVER_PORT_RELEASE_INTERVAL_MS: "100",
+      },
 	    }, 5000);
 	    const stickyElapsed = Date.now() - stickyStartedAt;
 	    await waitForExit(sticky, 2000);
 	    check("cmux-dash stop waits for TCP LISTEN release after /api/state drops", (
-	      stickyStop.status === 0 &&
-	      stickyElapsed >= 650 &&
-	      await canListen(stickyPort)
+      stickyStop.status === 0 &&
+      stickyElapsed >= 650 &&
+      await canListen(stickyPort)
 	    ));
 	
 	    const stopPidFile = path.join(phaseDir, "stop-watchdog.pid");
@@ -4321,63 +4398,63 @@ console.log("{}");
 	    fs.writeFileSync(stopPidFile, String(sleeper.pid));
 	    const stopPort = await findFreePort(upPort + 1);
 	    const stop = await runCommand("/bin/bash", [path.join(repo, "cmux-dash"), "stop"], {
-	      cwd: repo,
-	      env: {
-	        ...process.env,
-	        CMUX_DASH_PORT: String(stopPort),
-	        CMUX_DASH_HOST: host,
-	        CMUX_DASH_WATCHDOG_PIDFILE: stopPidFile,
-	        CMUX_DASH_SERVER_PIDFILE: path.join(phaseDir, "stop-server.pid"),
-	        CMUX_DASH_SERVER_LOG: path.join(phaseDir, "stop-server.log"),
-	      },
+      cwd: repo,
+      env: {
+        ...process.env,
+        CMUX_DASH_PORT: String(stopPort),
+        CMUX_DASH_HOST: host,
+        CMUX_DASH_WATCHDOG_PIDFILE: stopPidFile,
+        CMUX_DASH_SERVER_PIDFILE: path.join(phaseDir, "stop-server.pid"),
+        CMUX_DASH_SERVER_LOG: path.join(phaseDir, "stop-server.log"),
+      },
 	    }, 5000);
 	    const stopped = await waitForExit(sleeper, 1500);
 	    check("cmux-dash stop stops the in-session watchdog", (
-	      stop.status === 0 &&
-	      !!stopped &&
-	      !fs.existsSync(stopPidFile) &&
-	      /stopped watchdog/.test(stop.stdout + stop.stderr) &&
-	      /no running server/.test(stop.stdout + stop.stderr)
+      stop.status === 0 &&
+      !!stopped &&
+      !fs.existsSync(stopPidFile) &&
+      /stopped watchdog/.test(stop.stdout + stop.stderr) &&
+      /no running server/.test(stop.stdout + stop.stderr)
 	    ));
 	
 	    const fakeLaunchctlLog = path.join(phaseDir, "launchctl.log");
 	    const fakeLaunchctl = path.join(phaseDir, "launchctl");
 	    writeExecutable(fakeLaunchctl, [
-	      "#!/usr/bin/env bash",
-	      "printf '%s\\n' \"$*\" >> " + shDoubleQuote(fakeLaunchctlLog),
-	      "exit 0",
+      "#!/usr/bin/env bash",
+      "printf '%s\\n' \"$*\" >> " + shDoubleQuote(fakeLaunchctlLog),
+      "exit 0",
 	    ].join("\n") + "\n");
 	    const label = "com.cmux-dashboard.server.test." + process.pid;
 	    const plistPath = path.join(phaseDir, label + ".plist");
 	    const launchEnv = {
-	      ...process.env,
-	      HOME: path.join(phaseDir, "home"),
-	      NODE_BIN: nodeBin,
-	      CMUX_DASH_PORT: String(stopPort),
-	      CMUX_DASH_HOST: host,
-	      CMUX_DASH_SERVER_LABEL: label,
-	      CMUX_DASH_SERVER_PLIST_PATH: plistPath,
-	      CMUX_DASH_LAUNCHCTL_BIN: fakeLaunchctl,
+      ...process.env,
+      HOME: path.join(phaseDir, "home"),
+      NODE_BIN: nodeBin,
+      CMUX_DASH_PORT: String(stopPort),
+      CMUX_DASH_HOST: host,
+      CMUX_DASH_SERVER_LABEL: label,
+      CMUX_DASH_SERVER_PLIST_PATH: plistPath,
+      CMUX_DASH_LAUNCHCTL_BIN: fakeLaunchctl,
 	    };
 	    const install = spawnSync("/bin/bash", [path.join(repo, "cmux-dash"), "install-server"], {
-	      cwd: repo,
-	      env: launchEnv,
-	      encoding: "utf8",
+      cwd: repo,
+      env: launchEnv,
+      encoding: "utf8",
 	    });
 	    const launchLogAfterInstall = fs.existsSync(fakeLaunchctlLog) ? fs.readFileSync(fakeLaunchctlLog, "utf8") : "";
 	    check("install-server is disabled for launchd-managed dashboard servers", (
-	      install.status !== 0 &&
-	      /install-server is disabled/.test(install.stderr) &&
-	      /session context/.test(install.stderr) &&
-	      !fs.existsSync(plistPath)
+      install.status !== 0 &&
+      /install-server is disabled/.test(install.stderr) &&
+      /session context/.test(install.stderr) &&
+      !fs.existsSync(plistPath)
 	    ));
 	    check("install-server does not write plist or call launchctl", !fs.existsSync(plistPath) && launchLogAfterInstall === "");
 	
 	    fs.writeFileSync(plistPath, "legacy plist");
 	    const uninstall = spawnSync("/bin/bash", [path.join(repo, "cmux-dash"), "uninstall-server"], {
-	      cwd: repo,
-	      env: launchEnv,
-	      encoding: "utf8",
+      cwd: repo,
+      env: launchEnv,
+      encoding: "utf8",
 	    });
 	    const launchLogAfterUninstall = fs.existsSync(fakeLaunchctlLog) ? fs.readFileSync(fakeLaunchctlLog, "utf8") : "";
 	    check("uninstall-server remains as legacy launchd cleanup", uninstall.status === 0 && !fs.existsSync(plistPath) && /bootout /.test(launchLogAfterUninstall));
@@ -4386,7 +4463,7 @@ console.log("{}");
 	    console.log("FAIL\tPhase5c runner exception: " + (err && err.message ? err.message : err));
   } finally {
     for (const child of children) {
-	      if (child.exitCode === null && child.signalCode === null) {
+      if (child.exitCode === null && child.signalCode === null) {
         child.kill("SIGTERM");
         await waitForExit(child, 1000);
       }
@@ -4405,9 +4482,9 @@ NODE
     [ -z "$status" ] && continue
     saw_output=1
     case "$status" in
-	      PASS) pass "Phase5c: $label" ;;
-	      FAIL) fail "Phase5c: $label" ;;
-	      *) info "Phase5c output: $status $label" ;;
+      PASS) pass "Phase5c: $label" ;;
+      FAIL) fail "Phase5c: $label" ;;
+      *) info "Phase5c output: $status $label" ;;
     esac
   done <<EOF
 $results
@@ -6262,6 +6339,8 @@ async function waitFor(label, fn, timeoutMs = 20000) {
     const afterAState = await ctl.getGridState();
     check("real grid add first column: dedicated workspace " + wsRef + " has cc/cdx refs and live layout panes=" + afterA.panes.length + " surfaces=" + afterA.surfaces.length, (
       colA.added === true &&
+      colA.rebuilt === false &&
+      colA.incremental === true &&
       afterAState.wsRef === wsRef &&
       afterAState.columns.length === 1 &&
       afterAState.columns[0].projectId === projectA &&
@@ -6270,9 +6349,10 @@ async function waitFor(label, fn, timeoutMs = 20000) {
       stateMatchesLive(afterAState, afterA)
     ));
 
+    const wsRefAfterA = wsRef;
+    const colARefs = [colA.cc.surfaceRef, colA.cdx.surfaceRef];
     const colB = await ctl.addProjectColumn(projectB);
     const afterBState = await ctl.getGridState();
-    wsRef = afterBState.wsRef;
     const liveColA = afterBState.columns[0] || {};
     const liveColB = afterBState.columns[1] || {};
     const afterB = await waitFor("second grid column live refs", async () => {
@@ -6285,12 +6365,20 @@ async function waitFor(label, fn, timeoutMs = 20000) {
       };
     });
     const afterBLayout = afterB.layout;
-    check("real grid add second column: layout rebuild has browser anchor plus two cc/cdx columns panes " + afterA.panes.length + "->" + afterBLayout.panes.length + " surfaces " + afterA.surfaces.length + "->" + afterBLayout.surfaces.length, (
+    check("real grid add second column: incremental add preserves workspace and A refs panes " + afterA.panes.length + "->" + afterBLayout.panes.length + " surfaces " + afterA.surfaces.length + "->" + afterBLayout.surfaces.length, (
       colB.added === true &&
-      afterBState.wsRef === afterB.ws.ref &&
+      colB.rebuilt === false &&
+      colB.incremental === true &&
+      afterBState.wsRef === wsRefAfterA &&
+      afterB.ws.ref === wsRefAfterA &&
+      liveColA.cc.surfaceRef === colARefs[0] &&
+      liveColA.cdx.surfaceRef === colARefs[1] &&
+      liveColB.cc.surfaceRef === colB.cc.surfaceRef &&
+      liveColB.cdx.surfaceRef === colB.cdx.surfaceRef &&
       afterBLayout.panes.length === 5 &&
       afterBLayout.surfaces.length === 5
     ));
+    wsRef = afterBState.wsRef;
     check("real grid getGridState: columns ordered and refs match live list-panes/list-pane-surfaces", (
       afterBState.wsRef === wsRef &&
       afterBState.columns.length === 2 &&
@@ -6300,9 +6388,8 @@ async function waitFor(label, fn, timeoutMs = 20000) {
       stateMatchesLive(afterBState, afterBLayout)
     ));
 
-    await ctl.removeProjectColumn(projectA);
+    const removedA = await ctl.removeProjectColumn(projectA);
     const afterRemoveAState = await ctl.getGridState();
-    wsRef = afterRemoveAState.wsRef;
     const survivingB = afterRemoveAState.columns[0] || {};
     const afterRemoveA = await waitFor("first grid column removed", async () => {
       const ws = await findGridWorkspace();
@@ -6314,9 +6401,19 @@ async function waitFor(label, fn, timeoutMs = 20000) {
       };
     });
     const afterRemoveALayout = afterRemoveA.layout;
-    check("real grid remove first column: rebuilt grid drops A and keeps B panes " + afterBLayout.panes.length + "->" + afterRemoveALayout.panes.length + " surfaces " + afterBLayout.surfaces.length + "->" + afterRemoveALayout.surfaces.length, (
-      afterRemoveAState.wsRef === afterRemoveA.ws.ref &&
+    check("real grid remove first column: incremental remove drops only A and preserves B refs panes " + afterBLayout.panes.length + "->" + afterRemoveALayout.panes.length + " surfaces " + afterBLayout.surfaces.length + "->" + afterRemoveALayout.surfaces.length, (
+      removedA.removed === true &&
+      removedA.rebuilt === false &&
+      removedA.incremental === true &&
+      removedA.wsRef === wsRef &&
+      removedA.wsClosed === false &&
+      afterRemoveAState.wsRef === wsRef &&
+      afterRemoveA.ws.ref === wsRef &&
+      survivingB.cc.surfaceRef === liveColB.cc.surfaceRef &&
+      survivingB.cdx.surfaceRef === liveColB.cdx.surfaceRef &&
+      refsGone(afterRemoveALayout, [liveColA.cc.surfaceRef, liveColA.cdx.surfaceRef]) &&
       afterRemoveALayout.surfaces.length === 3 &&
+      afterRemoveALayout.panes.length === 3 &&
       afterRemoveAState.columns.length === 1 &&
       afterRemoveAState.columns[0].projectId === projectB &&
       refsPresent(afterRemoveALayout, [survivingB.cc.surfaceRef, survivingB.cdx.surfaceRef]) &&
