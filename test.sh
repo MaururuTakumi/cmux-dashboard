@@ -834,6 +834,7 @@ let s = { panes: [], surfaces: [], nextPane: 1, nextSurface: 1 };
 try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
 s.panes = Array.isArray(s.panes) ? s.panes : [];
 s.surfaces = Array.isArray(s.surfaces) ? s.surfaces : [];
+s.commands = Array.isArray(s.commands) ? s.commands : [];
 const anchor = s.surfaces.find((item) => item && item.ref === anchorSurface && (!workspace || item.workspace === workspace));
 const anchorPaneRef = anchor && anchor.pane || "";
 const anchorPane = s.panes.find((pane) => pane && pane.ref === anchorPaneRef && (!workspace || pane.workspace === workspace));
@@ -841,7 +842,10 @@ const paneRef = "pane:" + (s.nextPane || 1);
 const surfaceRef = "surface:" + (s.nextSurface || 1);
 s.nextPane = (s.nextPane || 1) + 1;
 s.nextSurface = (s.nextSurface || 1) + 1;
-const insertAt = anchorPane && Number.isFinite(anchorPane.index) ? anchorPane.index + 1 : s.panes.filter((p) => !workspace || p.workspace === workspace).length;
+const beforeAnchor = direction === "left" || direction === "up";
+const insertAt = anchorPane && Number.isFinite(anchorPane.index)
+  ? anchorPane.index + (beforeAnchor ? 0 : 1)
+  : s.panes.filter((p) => !workspace || p.workspace === workspace).length;
 for (const pane of s.panes) {
   if (pane && (!workspace || pane.workspace === workspace) && Number.isFinite(pane.index) && pane.index >= insertAt) {
     pane.index += 1;
@@ -849,6 +853,7 @@ for (const pane of s.panes) {
 }
 s.panes.push({ ref: paneRef, workspace, index: insertAt, direction, splitFrom: anchorSurface, parentPane: anchorPaneRef });
 s.surfaces.push({ ref: surfaceRef, workspace, pane: paneRef, title: "terminal", type: "terminal", process: "zsh", cwd: anchor && anchor.cwd || null, sendText: null, splitFrom: anchorSurface, direction });
+s.commands.push({ cmd: "new-split", direction, workspace, surface: anchorSurface, resultPane: paneRef, resultSurface: surfaceRef });
 fs.writeFileSync(file, JSON.stringify(s) + "\n");
 process.stdout.write("OK " + surfaceRef + " " + paneRef + " " + workspace + "\n");
 NODE
@@ -1433,11 +1438,28 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       const alphaCdx = rawSurface(alphaGridColumn && alphaGridColumn.cdx.surfaceRef);
       const generalCc = rawSurface(generalGridColumn && generalGridColumn.cc.surfaceRef);
       const generalCdx = rawSurface(generalGridColumn && generalGridColumn.cdx.surfaceRef);
+      const columnSurfaceRefs = new Set([
+        alphaGridColumn && alphaGridColumn.cc && alphaGridColumn.cc.surfaceRef,
+        alphaGridColumn && alphaGridColumn.cdx && alphaGridColumn.cdx.surfaceRef,
+        generalGridColumn && generalGridColumn.cc && generalGridColumn.cc.surfaceRef,
+        generalGridColumn && generalGridColumn.cdx && generalGridColumn.cdx.surfaceRef,
+      ].filter(Boolean));
       const browserAnchor = surfacesFor("__grid__").find((surface) => (
         surface &&
         surface.type === "browser" &&
         surface.url === dashboardUrl
       ));
+      const rightAnchor = surfacesFor("__grid__").find((surface) => (
+        surface &&
+        surface.type !== "browser" &&
+        !columnSurfaceRefs.has(surface.ref)
+      ));
+      const gridSplitCommands = (rawCmuxState().commands || [])
+        .filter((item) => item && item.cmd === "new-split" && item.workspace === initialGridRef);
+      const firstCcSplit = gridSplitCommands[0] || {};
+      const firstCdxSplit = gridSplitCommands[1] || {};
+      const secondCcSplit = gridSplitCommands[2] || {};
+      const secondCdxSplit = gridSplitCommands[3] || {};
       const alphaStateAfterGrid = await ctl.getProjectState("alpha");
       const layout = gridWs && gridWs.layout || {};
 
@@ -1475,8 +1497,8 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         !String(generalCdx.title || "").includes("cmuxdash:slot:")
       ));
       check("grid G2: incremental second add preserves existing refs and workspace", (
-        afterAlphaCount === 3 &&
-        afterGeneralCount === 5 &&
+        afterAlphaCount === 4 &&
+        afterGeneralCount === 6 &&
         afterGeneralGridWorkspaceCount === 1 &&
         generalColumn.wsRef === initialGridRef &&
         alphaGridColumn.wsRef === initialGridRef &&
@@ -1521,18 +1543,33 @@ async function exerciseAllSlots(id, expectedCwd, label) {
           browserAnchor.title === dashboardUrl &&
           browserAnchor.url === dashboardUrl
       ));
-      check("grid G2: incremental split anchors keep browser anchor and add cc right/cdx down", (
+      check("grid G2: incremental split anchors keep right anchor and add cc left/cdx down", (
         browserAnchor &&
-        layout.pane &&
-        !layout.children &&
-        alphaCc.splitFrom === browserAnchor.ref &&
-        alphaCc.direction === "right" &&
+        rightAnchor &&
+        layout.direction === "horizontal" &&
+        Array.isArray(layout.children) &&
+        alphaCc.splitFrom === rightAnchor.ref &&
+        alphaCc.direction === "left" &&
         alphaCdx.splitFrom === alphaGridColumn.cc.surfaceRef &&
         alphaCdx.direction === "down" &&
-        generalCc.splitFrom === alphaGridColumn.cc.surfaceRef &&
-        generalCc.direction === "right" &&
+        generalCc.splitFrom === rightAnchor.ref &&
+        generalCc.direction === "left" &&
         generalCdx.splitFrom === generalGridColumn.cc.surfaceRef &&
         generalCdx.direction === "down"
+      ));
+      check("grid G2: second column cc split is issued as left split from right anchor command", (
+        rightAnchor &&
+        gridSplitCommands.length === 4 &&
+        firstCcSplit.direction === "left" &&
+        firstCcSplit.surface === rightAnchor.ref &&
+        firstCcSplit.resultSurface === alphaGridColumn.cc.surfaceRef &&
+        firstCdxSplit.direction === "down" &&
+        firstCdxSplit.surface === alphaGridColumn.cc.surfaceRef &&
+        secondCcSplit.direction === "left" &&
+        secondCcSplit.surface === rightAnchor.ref &&
+        secondCcSplit.resultSurface === generalGridColumn.cc.surfaceRef &&
+        secondCdxSplit.direction === "down" &&
+        secondCdxSplit.surface === generalGridColumn.cc.surfaceRef
       ));
       {
         const threeColumnLayout = ctl.gridWorkspaceLayout([
@@ -1547,14 +1584,19 @@ async function exerciseAllSlots(id, expectedCwd, label) {
             { id: "gc", path: alphaDir },
           ],
         });
-        const threeRight = threeColumnLayout.children && threeColumnLayout.children[1] || {};
+        const threeMain = threeColumnLayout.children && threeColumnLayout.children[0] || {};
+        const threeAnchor = threeColumnLayout.children && threeColumnLayout.children[1] || {};
+        const threeRight = threeMain.children && threeMain.children[1] || {};
         const threeTail = threeRight.children && threeRight.children[1] || {};
         const ga = threeRight.children && threeRight.children[0] || {};
         const gb = threeTail.children && threeTail.children[0] || {};
         const gc = threeTail.children && threeTail.children[1] || {};
-        check("grid C1: three-column layout keeps equal project column proportions", (
+        check("grid C1: three-column layout keeps equal project column proportions with right anchor", (
           threeColumnLayout.direction === "horizontal" &&
-          Math.abs(threeColumnLayout.split - 0.18) < 0.0001 &&
+          Math.abs(threeColumnLayout.split - 0.94) < 0.0001 &&
+          threeAnchor.pane &&
+          threeMain.direction === "horizontal" &&
+          Math.abs(threeMain.split - 0.18) < 0.0001 &&
           threeRight.direction === "horizontal" &&
           Math.abs(threeRight.split - (1 / 3)) < 0.0001 &&
           threeTail.direction === "horizontal" &&
@@ -1600,7 +1642,9 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         !rawSurface(alphaGridColumn.cc.surfaceRef) &&
         !rawSurface(alphaGridColumn.cdx.surfaceRef) &&
         !!rawSurface(survivingGeneral.cc.surfaceRef) &&
-        !!rawSurface(survivingGeneral.cdx.surfaceRef)
+        !!rawSurface(survivingGeneral.cdx.surfaceRef) &&
+        rightAnchor &&
+        !!rawSurface(rightAnchor.ref)
       ));
       check("grid C1: repeated removeProjectColumn is idempotent", (
         repeatRemove &&
@@ -6375,8 +6419,8 @@ async function waitFor(label, fn, timeoutMs = 20000) {
       liveColA.cdx.surfaceRef === colARefs[1] &&
       liveColB.cc.surfaceRef === colB.cc.surfaceRef &&
       liveColB.cdx.surfaceRef === colB.cdx.surfaceRef &&
-      afterBLayout.panes.length === 5 &&
-      afterBLayout.surfaces.length === 5
+      afterBLayout.panes.length === 6 &&
+      afterBLayout.surfaces.length === 6
     ));
     wsRef = afterBState.wsRef;
     check("real grid getGridState: columns ordered and refs match live list-panes/list-pane-surfaces", (
@@ -6412,8 +6456,8 @@ async function waitFor(label, fn, timeoutMs = 20000) {
       survivingB.cc.surfaceRef === liveColB.cc.surfaceRef &&
       survivingB.cdx.surfaceRef === liveColB.cdx.surfaceRef &&
       refsGone(afterRemoveALayout, [liveColA.cc.surfaceRef, liveColA.cdx.surfaceRef]) &&
-      afterRemoveALayout.surfaces.length === 3 &&
-      afterRemoveALayout.panes.length === 3 &&
+      afterRemoveALayout.surfaces.length === 4 &&
+      afterRemoveALayout.panes.length === 4 &&
       afterRemoveAState.columns.length === 1 &&
       afterRemoveAState.columns[0].projectId === projectB &&
       refsPresent(afterRemoveALayout, [survivingB.cc.surfaceRef, survivingB.cdx.surfaceRef]) &&
