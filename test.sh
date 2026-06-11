@@ -2082,6 +2082,43 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         ));
       }
       {
+        const raw = rawCmuxState();
+        raw.gridBoundaries = raw.gridBoundaries && typeof raw.gridBoundaries === "object" ? raw.gridBoundaries : {};
+        raw.gridBoundaries[initialGridRef] = [228, 735, 1265];
+        writeCmuxState(raw);
+        const resizeCountBeforeSliver = (rawCmuxState().commands || [])
+          .filter((item) => item && item.cmd === "resize-pane" && item.workspace === initialGridRef).length;
+        const sliverResult = await ctl.rebalanceGridColumns(initialGridRef);
+        const sliverCommands = (rawCmuxState().commands || [])
+          .filter((item) => item && item.cmd === "resize-pane" && item.workspace === initialGridRef)
+          .slice(resizeCountBeforeSliver);
+        const sliverOps = sliverResult && Array.isArray(sliverResult.operations)
+          ? sliverResult.operations.filter((item) => item && item.resized)
+          : [];
+        const sliverMeasurements = (sliverResult && Array.isArray(sliverResult.passes) ? sliverResult.passes : [])
+          .flatMap((pass) => Array.isArray(pass.measurements) ? pass.measurements : []);
+        const sliverBoundaries = (sliverResult && Array.isArray(sliverResult.passes) ? sliverResult.passes : [])
+          .flatMap((pass) => Array.isArray(pass.boundaries) ? pass.boundaries : []);
+        check("grid right anchor: sliver width is re-read before tolerance and corrected with resize", (
+          rightAnchorPaneRef &&
+          sliverCommands.length >= 1 &&
+          sliverMeasurements.some((item) => (
+            item &&
+            item.name === "rightAnchor" &&
+            item.sliver === true &&
+            item.frameSource === "pane_frame_re_read" &&
+            Number(item.actualPx) < Number(item.sliverThresholdPx)
+          )) &&
+          sliverBoundaries.some((item) => item && item.anchorSliver === true && item.withinTolerance === false) &&
+          sliverOps.some((item) => (
+            item &&
+            /rightAnchor$/.test(String(item.name || "")) &&
+            item.paneRef === rightAnchorPaneRef &&
+            item.direction === "-L"
+          ))
+        ));
+      }
+      {
         const forceDivergentGridBoundaries = () => {
           const raw = rawCmuxState();
           raw.gridBoundaries = raw.gridBoundaries && typeof raw.gridBoundaries === "object" ? raw.gridBoundaries : {};

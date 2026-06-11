@@ -1199,6 +1199,7 @@ const GRID_REBALANCE_MAX_PASSES = 8;
 const GRID_REBALANCE_TOLERANCE = 0.05;
 const GRID_REBALANCE_REPAIR_TOLERANCE = 0.10;
 const GRID_RESIZE_FALLBACK_PX_PER_AMOUNT = 0.5;
+const GRID_RIGHT_ANCHOR_SLIVER_RATIO = 0.01;
 const GRID_REBALANCE_REPAIR_THROTTLE_MS = 3000;
 const GRID_REBALANCE_PANE_READ_ATTEMPTS = 5;
 const GRID_REBALANCE_PANE_READ_DELAY_MS = 600;
@@ -1324,6 +1325,18 @@ function panePixelFrame(pane) {
     pane.framePixels ||
     pane.pixelFramePx ||
     (pane.frame && (pane.frame.pixel || pane.frame.pixels || pane.frame.pixel_frame))
+  );
+}
+
+function surfacePixelFrame(surface) {
+  if (!surface) return null;
+  return normalizeFrame(
+    surface.pixel_frame ||
+    surface.pixelFrame ||
+    surface.frame_pixels ||
+    surface.framePixels ||
+    surface.pixelFramePx ||
+    (surface.frame && (surface.frame.pixel || surface.frame.pixels || surface.frame.pixel_frame))
   );
 }
 
@@ -3253,6 +3266,9 @@ function gridRebalanceBoundarySummary(boundaries) {
     diffPx: item.diffPx,
     tolerancePx: item.tolerancePx,
     withinTolerance: item.withinTolerance,
+    ...(item.anchorSliver ? { anchorSliver: true } : {}),
+    ...(item.sliverThresholdPx != null ? { sliverThresholdPx: item.sliverThresholdPx } : {}),
+    ...(item.frameSource ? { frameSource: item.frameSource } : {}),
     ...(item.index != null ? { index: item.index } : {}),
   }));
 }
@@ -3390,7 +3406,11 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
     .map(cleanRef)
     .filter((paneRef) => paneRef && geometry.byRef.has(paneRef));
   const browserFrame = paneBoundsForRefs(geometry.byRef, leftAreaPaneRefs) || geometry.byRef.get(browserPaneRef);
-  const anchorFrame = geometry.byRef.get(anchorPaneRef);
+  const anchorSurfaceFrame = surfacePixelFrame(anchorSurface);
+  const anchorFrame = anchorSurfaceFrame || geometry.byRef.get(anchorPaneRef);
+  const anchorFrameSource = anchorSurfaceFrame ? 'surface_frame' : 'pane_frame_re_read';
+  const anchorSliverThresholdPx = Math.max(1, container.width * GRID_RIGHT_ANCHOR_SLIVER_RATIO);
+  const anchorSliver = !!(anchorFrame && anchorFrame.width < anchorSliverThresholdPx);
   const measurements = [
     gridRebalanceMetric('browser', browserFrame.width, target.browserWidth, geometry.cellWidthPx, { paneRef: browserPaneRef }),
     ...orderedColumns.map((item, idx) => gridRebalanceMetric(
@@ -3400,7 +3420,12 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
       geometry.cellWidthPx,
       { paneRef: item.resizePaneRef, index: idx },
     )),
-    gridRebalanceMetric('rightAnchor', anchorFrame.width, target.anchorWidth, geometry.cellWidthPx, { paneRef: anchorPaneRef }),
+    gridRebalanceMetric('rightAnchor', anchorFrame.width, target.anchorWidth, geometry.cellWidthPx, {
+      paneRef: anchorPaneRef,
+      frameSource: anchorFrameSource,
+      sliver: anchorSliver,
+      sliverThresholdPx: Math.round(anchorSliverThresholdPx),
+    }),
   ];
   const boundarySpecs = [
     {
@@ -3423,6 +3448,16 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
     }),
   ];
   const boundaries = boundarySpecs.map((boundary) => gridRebalanceBoundaryRecord(boundary, geometry, geometry.cellWidthPx));
+  if (anchorSliver && boundaries.length) {
+    const last = boundaries[boundaries.length - 1];
+    boundaries[boundaries.length - 1] = {
+      ...last,
+      withinTolerance: false,
+      anchorSliver: true,
+      sliverThresholdPx: Math.round(anchorSliverThresholdPx),
+      frameSource: anchorFrameSource,
+    };
+  }
   return {
     ok: true,
     geometry,
@@ -3430,7 +3465,15 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
     target,
     measurements,
     boundaries,
-    withinTolerance: boundaries.every((item) => item.withinTolerance),
+    rightAnchor: {
+      paneRef: anchorPaneRef,
+      surfaceRef: anchorSurface && anchorSurface.ref || null,
+      widthPx: Math.round(anchorFrame.width),
+      sliver: anchorSliver,
+      sliverThresholdPx: Math.round(anchorSliverThresholdPx),
+      frameSource: anchorFrameSource,
+    },
+    withinTolerance: boundaries.every((item) => item.withinTolerance) && !anchorSliver,
   };
 }
 
