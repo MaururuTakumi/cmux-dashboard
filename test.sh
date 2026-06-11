@@ -779,6 +779,23 @@ function withGridFrames() {
   const totalWidth = 1266;
   const totalHeight = 900;
   const cellWidth = 7;
+  function defaultBoundaries() {
+    let right = columns.length ? 1100 : 1190;
+    const values = [right];
+    columns.forEach((column, idx) => {
+      right += idx === 0 ? 70 : 35;
+      values.push(right);
+    });
+    return values;
+  }
+  function gridBoundaries() {
+    const defaults = defaultBoundaries();
+    const stored = s.gridBoundaries && Array.isArray(s.gridBoundaries[workspace])
+      ? s.gridBoundaries[workspace].map((value) => Number(value))
+      : [];
+    if (stored.length !== defaults.length || !stored.every(Number.isFinite)) return defaults;
+    return stored;
+  }
   function setFrame(ref, x, y, width, height) {
     if (!ref) return;
     frames.set(ref, {
@@ -792,15 +809,17 @@ function withGridFrames() {
       cell_width_px: cellWidth,
     });
   }
+  const boundaries = gridBoundaries();
   let x = 0;
-  const browserWidth = columns.length ? 1100 : 1190;
-  setFrame(browserPane, x, 0, browserWidth, totalHeight);
-  x += browserWidth;
+  const browserRight = boundaries[0] == null ? (columns.length ? 1100 : 1190) : boundaries[0];
+  setFrame(browserPane, x, 0, Math.max(1, browserRight - x), totalHeight);
+  x = browserRight;
   columns.forEach((column, idx) => {
-    const width = idx === 0 ? 70 : 35;
+    const nextX = boundaries[idx + 1] == null ? x + (idx === 0 ? 70 : 35) : boundaries[idx + 1];
+    const width = Math.max(1, nextX - x);
     setFrame(column.cc, x, 0, width, totalHeight / 2);
     setFrame(column.cdx, x, totalHeight / 2, width, totalHeight / 2);
-    x += width;
+    x = nextX;
   });
   if (anchorPane && anchorPane.ref) setFrame(anchorPane.ref, x, 0, Math.max(20, totalWidth - x), totalHeight);
   return panes.map((pane) => {
@@ -953,6 +972,73 @@ s.commands.push({
   direction,
   amount,
 });
+function gridMarker(surface) {
+  const text = [surface && surface.sendText, surface && surface.title].filter(Boolean).join(" ");
+  const match = text.match(/(cmuxdash:grid:[^\s']+):slot:(cc|cdx)/);
+  return match ? { columnKey: match[1], slot: match[2] } : null;
+}
+function paneOrder(workspaceRef, ref) {
+  const paneRec = (s.panes || []).find((item) => item && item.ref === ref && (!workspaceRef || item.workspace === workspaceRef));
+  return paneRec && Number.isFinite(paneRec.index) ? paneRec.index : 9999;
+}
+function gridParts(workspaceRef) {
+  const workspacePanes = (s.panes || []).filter((item) => item && (!workspaceRef || item.workspace === workspaceRef));
+  const workspaceSurfaces = (s.surfaces || []).filter((item) => item && (!workspaceRef || item.workspace === workspaceRef));
+  const browserSurface = workspaceSurfaces.find((surface) => surface && surface.type === "browser");
+  const browserPane = browserSurface && browserSurface.pane || "";
+  const columnMap = new Map();
+  for (const surface of workspaceSurfaces) {
+    const marker = gridMarker(surface);
+    if (!marker || !surface || !surface.pane) continue;
+    const rec = columnMap.get(marker.columnKey) || { columnKey: marker.columnKey, order: 9999, cc: "", cdx: "" };
+    rec[marker.slot] = surface.pane;
+    rec.order = Math.min(rec.order, paneOrder(workspaceRef, surface.pane));
+    columnMap.set(marker.columnKey, rec);
+  }
+  const columns = Array.from(columnMap.values()).sort((a, b) => a.order - b.order);
+  const columnPaneRefs = new Set(columns.flatMap((column) => [column.cc, column.cdx]).filter(Boolean));
+  const anchorPane = workspacePanes
+    .filter((item) => item && item.ref !== browserPane && !columnPaneRefs.has(item.ref))
+    .sort((a, b) => paneOrder(workspaceRef, b.ref) - paneOrder(workspaceRef, a.ref))[0];
+  return { browserPane, columns, anchorPaneRef: anchorPane && anchorPane.ref || "" };
+}
+function defaultGridBoundaries(columns) {
+  let right = columns.length ? 1100 : 1190;
+  const values = [right];
+  columns.forEach((column, idx) => {
+    right += idx === 0 ? 70 : 35;
+    values.push(right);
+  });
+  return values;
+}
+function boundaryIndexForPane(parts, paneRef, dir) {
+  if (!parts || !paneRef) return null;
+  if (paneRef === parts.browserPane && dir === "R") return 0;
+  if (paneRef === parts.anchorPaneRef && dir === "L") return parts.columns.length;
+  for (let idx = 0; idx < parts.columns.length; idx += 1) {
+    const column = parts.columns[idx];
+    if (paneRef !== column.cc && paneRef !== column.cdx) continue;
+    if (dir === "L") return idx;
+    if (dir === "R") return idx + 1;
+  }
+  return null;
+}
+const gridWorkspace = target && target.workspace || workspace || "";
+const scale = Number(process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT || s.gridResizePxPerAmount || "0");
+if (gridWorkspace && Number.isFinite(scale) && scale > 0 && Number.isFinite(amount) && amount > 0 && (direction === "L" || direction === "R")) {
+  const parts = gridParts(gridWorkspace);
+  const idx = boundaryIndexForPane(parts, pane, direction);
+  if (idx != null) {
+    s.gridBoundaries = s.gridBoundaries && typeof s.gridBoundaries === "object" ? s.gridBoundaries : {};
+    const defaults = defaultGridBoundaries(parts.columns);
+    const current = Array.isArray(s.gridBoundaries[gridWorkspace]) && s.gridBoundaries[gridWorkspace].length === defaults.length
+      ? s.gridBoundaries[gridWorkspace].map((value) => Number(value))
+      : defaults;
+    const delta = amount * scale * (direction === "R" ? 1 : -1);
+    current[idx] = Number(current[idx] || defaults[idx] || 0) + delta;
+    s.gridBoundaries[gridWorkspace] = current;
+  }
+}
 fs.writeFileSync(file, JSON.stringify(s) + "\n");
 NODE
     ;;
@@ -1489,6 +1575,7 @@ async function exerciseAllSlots(id, expectedCwd, label) {
 
     {
       process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE = "1";
+      process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT = "0.25";
       try {
       const initialGridRef = await ctl.ensureGridWorkspace();
       const initialGridWs = workspaceFor("__grid__");
@@ -1566,6 +1653,14 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       const rightAnchorPaneRef = rightAnchor && rightAnchor.pane || null;
       const alphaResizePaneRef = alphaGridColumn && alphaGridColumn.cc && alphaGridColumn.cc.paneRef || null;
       const generalResizePaneRef = generalGridColumn && generalGridColumn.cc && generalGridColumn.cc.paneRef || null;
+      const generalRebalancePasses = generalColumn && generalColumn.rebalance && Array.isArray(generalColumn.rebalance.passes)
+        ? generalColumn.rebalance.passes
+        : [];
+      const generalRebalancePass = (n) => generalRebalancePasses.find((pass) => pass && pass.pass === n) || {};
+      const alphaLeftResizeForPass = (n) => ((generalRebalancePass(n).operations || [])
+        .find((item) => item && item.paneRef === alphaResizePaneRef && item.direction === "-L" && item.resized)) || null;
+      const alphaLeftPass1 = alphaLeftResizeForPass(1);
+      const alphaLeftPass2 = alphaLeftResizeForPass(2);
 
       check("grid C1: ensureGridWorkspace uses dedicated tag and stays out of project state", (
         initialGridRef &&
@@ -1705,6 +1800,41 @@ async function exerciseAllSlots(id, expectedCwd, label) {
           item.direction === "R"
         ))
       ));
+      check("grid G2: rebalance calibrates second-pass resize amount from observed movement", (
+        alphaLeftPass1 &&
+        alphaLeftPass2 &&
+        Math.abs(Number(alphaLeftPass1.pxPerAmount) - 0.5) < 0.0001 &&
+        Number(alphaLeftPass2.pxPerAmount) > 0.20 &&
+        Number(alphaLeftPass2.pxPerAmount) < 0.30 &&
+        Number(alphaLeftPass2.amount) >= Math.floor(Number(alphaLeftPass1.amount) * 0.9)
+      ));
+      {
+        const forceDivergentGridBoundaries = () => {
+          const raw = rawCmuxState();
+          raw.gridBoundaries = raw.gridBoundaries && typeof raw.gridBoundaries === "object" ? raw.gridBoundaries : {};
+          raw.gridBoundaries[initialGridRef] = [1100, 1170, 1205];
+          writeCmuxState(raw);
+        };
+        const resizeCount = () => (rawCmuxState().commands || [])
+          .filter((item) => item && item.cmd === "resize-pane" && item.workspace === initialGridRef).length;
+        forceDivergentGridBoundaries();
+        await new Promise((resolve) => setTimeout(resolve, 3100));
+        const beforeRepairResizeCount = resizeCount();
+        const repairedGridState = await ctl.getGridState();
+        const afterRepairResizeCount = resizeCount();
+        forceDivergentGridBoundaries();
+        const beforeThrottleResizeCount = resizeCount();
+        const throttledGridState = await ctl.getGridState();
+        const afterThrottleResizeCount = resizeCount();
+        check("grid G2: getGridState self-repairs divergent grid once and throttles repeats", (
+          afterRepairResizeCount > beforeRepairResizeCount &&
+          repairedGridState.lastRebalance &&
+          repairedGridState.lastRebalance.autoRepair === true &&
+          beforeThrottleResizeCount === afterThrottleResizeCount &&
+          throttledGridState.lastRebalance &&
+          throttledGridState.lastRebalance.autoRepair === true
+        ));
+      }
       {
         const threeColumnLayout = ctl.gridWorkspaceLayout([
           { projectId: "ga", columnId: "ga" },
@@ -1799,6 +1929,7 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       }
       } finally {
         delete process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE;
+        delete process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT;
       }
     }
   } catch (err) {
@@ -1969,7 +2100,7 @@ if (action) process.stdout.write(`${action.status}\t${action.error || ""}`);
     return 1
   }
 
-  (cd "$DIR" && exec env CMUX_BIN="$fake_cmux" CMUX_DASH_PORT="$api_port" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$cfg_file" CMUX_DASH_SETTLE_MS=0 "$NODE_BIN" server.js >"$api_log" 2>&1) &
+  (cd "$DIR" && exec env CMUX_BIN="$fake_cmux" CMUX_DASH_PORT="$api_port" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$cfg_file" CMUX_DASH_SETTLE_MS=0 CMUX_FAKE_RESIZE_PX_PER_AMOUNT=0.25 "$NODE_BIN" server.js >"$api_log" 2>&1) &
   BAD_SERVER_PID=$!
   for _ in $(seq 1 50); do
     body="$(curl -fsS --max-time 2 "$api_url/api/state" 2>/dev/null || true)"
