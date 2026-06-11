@@ -4084,21 +4084,6 @@ async function submitToSurface(wsRef, surfaceRef, text) {
   return cmux(['send', '--workspace', wsRef, '--surface', surfaceRef, '\\r']);
 }
 
-async function sendToProjectCc(id, text) {
-  const slot = await ensureSlot(id, 'cc', true);
-  const wsRef = cleanRef(slot && slot.wsRef);
-  const surfaceRef = cleanRef(slot && (slot.ref || slot.surfaceRef));
-  await submitToSurface(wsRef, surfaceRef, text);
-  return {
-    sent: true,
-    id,
-    slot: 'cc',
-    wsRef,
-    surfaceRef,
-    paneRef: slot && slot.paneRef || null,
-  };
-}
-
 async function openAll() {
   const cfg = loadConfig();
   const results = [];
@@ -4234,7 +4219,7 @@ module.exports = {
   ensureCollab, ensureProjectCollab, ensureCollabPair, isCollabRunning, projectCollabEnabled, projectCollabEnabledById,
   agmsgDbPath, getTeamMessages,
   createCmuxHealthTracker, getCmuxHealth, pingCmuxForRecovery,
-  getState, getWorkspaceYaml, getProjectState, ensureSlot, ensureCollabSlots, sendToSurface, submitToSurface, sendToProjectCc, loadConfig, saveConfig, openProject, closeProject, focusProject,
+  getState, getWorkspaceYaml, getProjectState, ensureSlot, ensureCollabSlots, sendToSurface, submitToSurface, loadConfig, saveConfig, openProject, closeProject, focusProject,
   workspaceRefExists, ensureGridWorkspace, ensureConciergeSurface, conciergeAsk, focusGridWorkspace, addProjectColumn, removeProjectColumn, rebalanceGridColumns, getGridState, gridWorkspaceLayout,
   openAll, closeAll, reorderProjects, addProject, removeProject, expandHome, rowCwd, rowCwdInfo, normalizeCollabProjectDir, normalizeCollabProjectDirInfo,
   projectKind, isGlobalProject, configuredRows, configuredProjectRows, configuredGlobalRows,

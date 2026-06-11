@@ -162,7 +162,6 @@ async function api(req, res, urlPath) {
     const slotToggle = urlPath.match(/^\/api\/project\/([^/]+)\/slot\/([^/]+)$/);
     const collabToggle = urlPath.match(/^\/api\/project\/([^/]+)\/collab$/);
     const gridColumnToggle = urlPath.match(/^\/api\/grid\/column\/([^/]+)$/);
-    const projectSend = urlPath.match(/^\/api\/send\/([^/]+)$/);
     const agmsg = urlPath.match(/^\/api\/agmsg\/(.+)$/);
     if (req.method === 'GET' && urlPath === '/api/state') {
       const st = enrichState(await ctl.getState());
@@ -238,11 +237,6 @@ async function api(req, res, urlPath) {
       return defer(res, () => (
         on ? ctl.addProjectColumn(id, { focus: body.focus !== false }) : ctl.removeProjectColumn(id)
       ), `grid:${id}:${on ? 'on' : 'off'}`);
-    }
-    if (req.method === 'POST' && projectSend) {
-      const id = decodeURIComponent(projectSend[1]);
-      const body = await readBody(req);
-      return defer(res, () => ctl.sendToProjectCc(id, body && body.text), `send:${id}:cc`);
     }
     if (req.method === 'POST' && urlPath === '/api/reorder') {
       const body = await readBody(req);
