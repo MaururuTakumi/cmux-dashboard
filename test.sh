@@ -874,7 +874,8 @@ function withGridFrames() {
     setFrame(column.cdx, x, totalHeight / 2, width, totalHeight / 2);
     x = nextX;
   });
-  if (anchorPane && anchorPane.ref) setFrame(anchorPane.ref, x, 0, Math.max(20, totalWidth - x), totalHeight);
+  const minAnchorWidth = process.env.CMUX_FAKE_ALLOW_GRID_ANCHOR_SLIVER === "1" ? 1 : 20;
+  if (anchorPane && anchorPane.ref) setFrame(anchorPane.ref, x, 0, Math.max(minAnchorWidth, totalWidth - x), totalHeight);
   return panes.map((pane) => {
     const frame = pane && frames.get(pane.ref);
     return frame ? { ...pane, ...frame } : pane;
@@ -909,7 +910,7 @@ if (failReads > 0) {
 }
 const surfaces = (s.surfaces || [])
   .filter((x) => (!workspace || x.workspace === workspace) && (!pane || x.pane === pane))
-  .map((x) => ({ ref: x.ref, title: x.title, type: x.type, url: x.url || null, paneRef: x.pane, cwd: x.cwd || null, process: x.process || null, command: x.sendText || null }));
+  .map((x) => ({ ref: x.ref, title: x.title, type: x.type, url: x.url || null, paneRef: x.pane, cwd: x.cwd || null, process: x.process || null, description: x.sendText || null }));
 process.stdout.write(JSON.stringify({ surfaces }) + "\n");
 NODE
     ;;
@@ -1752,7 +1753,7 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         raw.panes.push({
           ref: orphanPaneRef,
           workspace: ws && ws.ref,
-          index: (raw.panes || []).filter((pane) => pane && pane.workspace === (ws && ws.ref)).length + 20,
+          index: 2.5,
         });
         raw.surfaces.push({
           ref: orphanSurfaceRef,
@@ -2088,7 +2089,15 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         writeCmuxState(raw);
         const resizeCountBeforeSliver = (rawCmuxState().commands || [])
           .filter((item) => item && item.cmd === "resize-pane" && item.workspace === initialGridRef).length;
-        const sliverResult = await ctl.rebalanceGridColumns(initialGridRef);
+        const previousSliverEnv = process.env.CMUX_FAKE_ALLOW_GRID_ANCHOR_SLIVER;
+        let sliverResult = null;
+        try {
+          process.env.CMUX_FAKE_ALLOW_GRID_ANCHOR_SLIVER = "1";
+          sliverResult = await ctl.rebalanceGridColumns(initialGridRef);
+        } finally {
+          if (previousSliverEnv == null) delete process.env.CMUX_FAKE_ALLOW_GRID_ANCHOR_SLIVER;
+          else process.env.CMUX_FAKE_ALLOW_GRID_ANCHOR_SLIVER = previousSliverEnv;
+        }
         const sliverCommands = (rawCmuxState().commands || [])
           .filter((item) => item && item.cmd === "resize-pane" && item.workspace === initialGridRef)
           .slice(resizeCountBeforeSliver);
@@ -2099,7 +2108,7 @@ async function exerciseAllSlots(id, expectedCwd, label) {
           .flatMap((pass) => Array.isArray(pass.measurements) ? pass.measurements : []);
         const sliverBoundaries = (sliverResult && Array.isArray(sliverResult.passes) ? sliverResult.passes : [])
           .flatMap((pass) => Array.isArray(pass.boundaries) ? pass.boundaries : []);
-        check("grid right anchor: sliver width is re-read before tolerance and corrected with resize", (
+        const sliverOk = (
           rightAnchorPaneRef &&
           sliverCommands.length >= 1 &&
           sliverMeasurements.some((item) => (
@@ -2116,6 +2125,9 @@ async function exerciseAllSlots(id, expectedCwd, label) {
             item.paneRef === rightAnchorPaneRef &&
             item.direction === "-L"
           ))
+        );
+        check("grid right anchor: sliver width is re-read before tolerance and corrected with resize", (
+          sliverOk
         ));
       }
       {
@@ -2493,6 +2505,8 @@ process.exit(col && col.cc && col.cc.surfaceRef && col.cdx && col.cdx.surfaceRef
     pass "R4 API: grid ON is reflected by /api/grid and /api/state.grid with project action target"
   else
     fail "R4 API: grid ON did not reflect in /api/grid or /api/state.grid"
+    info "R4 API grid debug: grid=$(curl -fsS --max-time 5 "$api_url/api/grid" 2>/dev/null || true)"
+    info "R4 API state debug: state=$(curl -fsS --max-time 5 "$api_url/api/state" 2>/dev/null || true)"
     return 1
   fi
   if "$NODE_BIN" - "$state_file" <<'NODE' 2>/dev/null
@@ -2506,6 +2520,110 @@ NODE
     pass "R4 API: grid ON auto-focus selects the grid workspace"
   else
     fail "R4 API: grid ON did not auto-focus the grid workspace"
+    return 1
+  fi
+  "$NODE_BIN" - "$state_file" <<'NODE' 2>/dev/null
+const fs = require("fs");
+let s;
+try { s = JSON.parse(fs.readFileSync(process.argv[2], "utf8")); } catch (_) { process.exit(2); }
+const gridWs = (Array.isArray(s.workspaces) ? s.workspaces : []).find((ws) => ws && ws.description === "cmuxdash:__grid__");
+if (!gridWs) process.exit(3);
+s.panes = (Array.isArray(s.panes) ? s.panes : []).filter((pane) => pane && pane.ref !== "pane:api-grid-orphan");
+s.surfaces = (Array.isArray(s.surfaces) ? s.surfaces : []).filter((surface) => surface && surface.ref !== "surface:api-grid-orphan");
+s.panes.push({
+  ref: "pane:api-grid-orphan",
+  workspace: gridWs.ref,
+  index: (Array.isArray(s.panes) ? s.panes : []).filter((pane) => pane && pane.workspace === gridWs.ref).length + 20,
+});
+s.surfaces.push({
+  ref: "surface:api-grid-orphan",
+  workspace: gridWs.ref,
+  pane: "pane:api-grid-orphan",
+  title: "terminal",
+  type: "terminal",
+  process: "zsh",
+  sendText: null,
+});
+fs.writeFileSync(process.argv[2], JSON.stringify(s) + "\n");
+NODE
+  body="$(curl -fsS -X POST --max-time 20 -H 'Content-Type: application/json' --data '{"projectIds":[]}' "$api_url/api/grid/rebuild" 2>/dev/null || true)"
+  if printf '%s' "$body" | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+const alpha = (Array.isArray(obj.columns) ? obj.columns : []).find((c) => c && c.projectId === "alpha");
+process.exit(obj && obj.requiresConfirm === true && obj.destructive === true && alpha ? 0 : 1);
+' 2>/dev/null && "$NODE_BIN" - "$state_file" <<'NODE' 2>/dev/null
+const fs = require("fs");
+let s;
+try { s = JSON.parse(fs.readFileSync(process.argv[2], "utf8")); } catch (_) { process.exit(2); }
+const surfaces = Array.isArray(s.surfaces) ? s.surfaces : [];
+const alphaLive = surfaces.some((surface) => surface && /cmuxdash:grid:__grid__:column:alpha:slot:cc/.test(String(surface.sendText || "")));
+const orphanLive = surfaces.some((surface) => surface && surface.ref === "surface:api-grid-orphan");
+process.exit(alphaLive && orphanLive ? 0 : 1);
+NODE
+  then
+    pass "R4 API: POST /api/grid/rebuild returns requiresConfirm before closing live columns"
+  else
+    fail "R4 API: rebuild confirm preflight failed"
+    info "R4 API rebuild preflight payload: ${body:-empty}"
+    return 1
+  fi
+
+  body="$(curl -fsS -X POST --max-time 30 -H 'Content-Type: application/json' --data '{"projectIds":["alpha","cc-general"]}' "$api_url/api/grid/rebuild" 2>/dev/null || true)"
+  if printf '%s' "$body" | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+const ids = (Array.isArray(obj.columns) ? obj.columns : []).map((c) => c && c.projectId).join(",");
+const closedOrphan = (Array.isArray(obj.closedOrphans) ? obj.closedOrphans : []).some((item) => item && item.ref === "surface:api-grid-orphan");
+const addedGeneral = (Array.isArray(obj.addedColumns) ? obj.addedColumns : []).some((item) => item && item.projectId === "cc-general");
+process.exit(obj && obj.requiresConfirm === false && obj.safe === true && ids === "alpha,cc-general" && closedOrphan && addedGeneral ? 0 : 1);
+' 2>/dev/null && "$NODE_BIN" - "$state_file" <<'NODE' 2>/dev/null
+const fs = require("fs");
+let s;
+try { s = JSON.parse(fs.readFileSync(process.argv[2], "utf8")); } catch (_) { process.exit(2); }
+const surfaces = Array.isArray(s.surfaces) ? s.surfaces : [];
+const orphanLive = surfaces.some((surface) => surface && surface.ref === "surface:api-grid-orphan");
+const generalLive = surfaces.some((surface) => surface && /cmuxdash:grid:__grid__:column:cc-general:slot:cc/.test(String(surface.sendText || "")));
+process.exit(!orphanLive && generalLive ? 0 : 1);
+NODE
+  then
+    pass "R4 API: POST /api/grid/rebuild safely closes orphans and adds missing columns"
+  else
+    fail "R4 API: rebuild safe orphan/missing-column path failed"
+    info "R4 API rebuild safe payload: ${body:-empty}"
+    return 1
+  fi
+
+  body="$(curl -fsS -X POST --max-time 20 -H 'Content-Type: application/json' --data '{"projectIds":["alpha"]}' "$api_url/api/grid/rebuild" 2>/dev/null || true)"
+  if printf '%s' "$body" | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+const ids = (Array.isArray(obj.columns) ? obj.columns : []).map((c) => c && c.projectId).join(",");
+process.exit(obj && obj.requiresConfirm === true && /cc-general/.test(JSON.stringify(obj.detail || {})) && ids === "alpha,cc-general" ? 0 : 1);
+' 2>/dev/null; then
+    pass "R4 API: rebuild refuses live-column removal without confirm"
+  else
+    fail "R4 API: rebuild should require confirm before removing cc-general"
+    info "R4 API rebuild remove preflight payload: ${body:-empty}"
+    return 1
+  fi
+
+  body="$(curl -fsS -X POST --max-time 30 -H 'Content-Type: application/json' --data '{"projectIds":["alpha"],"confirm":true}' "$api_url/api/grid/rebuild" 2>/dev/null || true)"
+  if printf '%s' "$body" | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+const ids = (Array.isArray(obj.columns) ? obj.columns : []).map((c) => c && c.projectId).join(",");
+const removedGeneral = (Array.isArray(obj.removedColumns) ? obj.removedColumns : []).some((item) => item && item.projectId === "cc-general" && item.removed === true);
+process.exit(obj && obj.requiresConfirm === false && obj.destructive === true && ids === "alpha" && removedGeneral ? 0 : 1);
+' 2>/dev/null; then
+    pass "R4 API: rebuild confirm=true removes live columns only after confirmation"
+  else
+    fail "R4 API: rebuild confirm=true removal failed"
+    info "R4 API rebuild confirm payload: ${body:-empty}"
     return 1
   fi
   if ! r4_grid_focus_api_and_wait "grid focus endpoint"; then return 1; fi
@@ -2553,6 +2671,7 @@ NODE
   fi
 
   body="$(curl -fsS -X POST --max-time 10 -H 'Content-Type: application/json' --data '{"text":"テスト用プロジェクトを作りたい"}' "$api_url/api/concierge/ask" 2>/dev/null || true)"
+  action_id=""
   if printf '%s' "$body" | "$NODE_BIN" -e '
 const fs = require("fs");
 let obj;
@@ -2560,10 +2679,37 @@ try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2
 process.exit(obj && obj.queued === true && obj.actionId && obj.label === "concierge:ask" ? 0 : 1);
 ' 2>/dev/null; then
     pass "R4 API: POST /api/concierge/ask returns queued concierge action"
+    action_id="$(printf '%s' "$body" | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+if (obj && obj.actionId) process.stdout.write(String(obj.actionId));
+' 2>/dev/null || true)"
   else
     fail "R4 API: POST /api/concierge/ask queued contract failed"
     info "R4 concierge ask payload: ${body:-empty}"
     return 1
+  fi
+  if [ -n "$action_id" ]; then
+    status=""
+    for _ in $(seq 1 50); do
+      line="$(curl -fsS --max-time 5 "$api_url/api/state" 2>/dev/null | "$NODE_BIN" -e '
+const fs = require("fs");
+const actionId = Number(process.argv[1]);
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+const action = (Array.isArray(obj.actions) ? obj.actions : []).find((a) => Number(a.id) === actionId);
+if (action) process.stdout.write(`${action.status}\t${action.error || ""}`);
+' "$action_id" 2>/dev/null || true)"
+      status="${line%%	*}"
+      [ "$status" = "succeeded" ] && break
+      [ "$status" = "failed" ] && break
+      sleep 0.2
+    done
+    if [ "$status" != "succeeded" ]; then
+      fail "R4 API: concierge ask action status was ${status:-missing}"
+      return 1
+    fi
   fi
 
   body="$(curl -fsS --max-time 2 -D "$header_file" "$api_url/api/workspace-yaml" 2>/dev/null || true)"

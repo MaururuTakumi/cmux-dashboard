@@ -3497,8 +3497,9 @@ async function resizeGridBoundary(wsRef, boundaryOrPaneRef, targetRightPx, cellW
   const actualBoundaryPx = gridBoundaryActualPx(leftFrame, rightFrame);
   if (!Number.isFinite(actualBoundaryPx)) return { resized: false, reason: 'missing boundary measurement', leftPaneRef, rightPaneRef };
   const diffPx = target - actualBoundaryPx;
-  const resizeTolerancePx = Math.max(1, Number(boundary.tolerancePx) || Number(opts.tolerancePx) || cellWidthPx);
-  if (Math.abs(diffPx) <= resizeTolerancePx) {
+  const forceResize = !!(opts.forceResize || boundary.anchorSliver);
+  const resizeTolerancePx = forceResize ? 0 : Math.max(1, Number(boundary.tolerancePx) || Number(opts.tolerancePx) || cellWidthPx);
+  if (!forceResize && Math.abs(diffPx) <= resizeTolerancePx) {
     return {
       resized: false,
       reason: 'within tolerance',
@@ -3980,6 +3981,114 @@ async function closeGridColumnSurfaces(wsRef, column) {
   return {
     surfaceRefs: closed,
     paneRefs: uniquePaneRefs,
+  };
+}
+
+async function closeGridOrphanSurfaces(wsRef, orphans) {
+  const refs = [];
+  for (const orphan of Array.isArray(orphans) ? orphans : []) {
+    const ref = cleanRef(orphan && (orphan.surfaceRef || orphan.ref));
+    const paneRef = cleanRef(orphan && orphan.paneRef);
+    if (ref) refs.push({ ref, kind: 'surface' });
+    else if (paneRef) refs.push({ ref: paneRef, kind: 'pane' });
+  }
+  const seen = new Set();
+  const closed = [];
+  for (const item of refs) {
+    if (!item.ref || seen.has(item.ref)) continue;
+    seen.add(item.ref);
+    try {
+      await cmux(['close-surface', '--workspace', wsRef, '--surface', item.ref]);
+      closed.push(item);
+    } catch (err) {
+      closed.push({ ...item, error: summarizeError(err) });
+    }
+  }
+  return closed;
+}
+
+function normalizeGridRebuildProjectIds(value, currentColumns, cfg) {
+  if (Array.isArray(value)) {
+    const ids = [];
+    const seen = new Set();
+    for (const item of value) {
+      const id = cleanRef(item);
+      if (!id || seen.has(id)) continue;
+      if (!findConfiguredRow(cfg, id)) throw new Error('unknown project: ' + id);
+      seen.add(id);
+      ids.push(id);
+    }
+    return ids;
+  }
+  return (Array.isArray(currentColumns) ? currentColumns : [])
+    .map((column) => cleanRef(column && column.projectId))
+    .filter(Boolean);
+}
+
+async function rebuildGridSafely(opts = {}) {
+  const cfg = loadConfig();
+  const confirm = opts && opts.confirm === true;
+  const state = await validateGridRuntimeState();
+  const desiredIds = normalizeGridRebuildProjectIds(opts && opts.projectIds, state.columns, cfg);
+  const currentIds = (Array.isArray(gridRuntimeState.columns) ? gridRuntimeState.columns : [])
+    .map((column) => cleanRef(column && column.projectId))
+    .filter(Boolean);
+  const desiredSet = new Set(desiredIds);
+  const liveColumnsToClose = currentIds.filter((id) => !desiredSet.has(id));
+  if (liveColumnsToClose.length && !confirm) {
+    return {
+      requiresConfirm: true,
+      safe: false,
+      destructive: true,
+      strategy: 'adopt-close-orphans-add-missing',
+      detail: {
+        reason: 'rebuild would close live grid column surfaces',
+        projectIds: liveColumnsToClose,
+        confirmHint: 'repeat with confirm:true to close live grid columns',
+      },
+      ...gridStateSnapshot(state.wsRef),
+    };
+  }
+
+  const result = {
+    requiresConfirm: false,
+    safe: true,
+    rebuilt: false,
+    destructive: liveColumnsToClose.length > 0,
+    strategy: 'adopt-close-orphans-add-missing',
+    moveSupported: false,
+    closedOrphans: [],
+    removedColumns: [],
+    addedColumns: [],
+  };
+
+  for (const projectId of liveColumnsToClose) {
+    const removed = await removeProjectColumn(projectId);
+    result.removedColumns.push({ projectId, ...removed });
+  }
+
+  let next = await validateGridRuntimeState();
+  const wsRef = cleanRef(next.wsRef || gridRuntimeState.wsRef);
+  const orphans = Array.isArray(gridRuntimeState.orphans) ? gridRuntimeState.orphans.slice() : [];
+  if (wsRef && orphans.length) {
+    result.closedOrphans = await closeGridOrphanSurfaces(wsRef, orphans);
+    next = await validateGridRuntimeState();
+  }
+
+  const liveAfterClose = new Set((Array.isArray(gridRuntimeState.columns) ? gridRuntimeState.columns : [])
+    .map((column) => cleanRef(column && column.projectId))
+    .filter(Boolean));
+  for (const projectId of desiredIds) {
+    if (liveAfterClose.has(projectId)) continue;
+    const added = await addProjectColumn(projectId, { focus: false });
+    result.addedColumns.push({ projectId, ...added });
+    liveAfterClose.add(projectId);
+  }
+
+  next = await getGridState();
+  return {
+    ...result,
+    ...next,
   };
 }
 
@@ -4676,7 +4785,7 @@ module.exports = {
   agmsgDbPath, getTeamMessages,
   createCmuxHealthTracker, getCmuxHealth, pingCmuxForRecovery,
   getState, getWorkspaceYaml, getProjectState, ensureSlot, ensureCollabSlots, sendToSurface, submitToSurface, loadConfig, saveConfig, openProject, closeProject, focusProject,
-  workspaceRefExists, ensureGridWorkspace, ensureConciergeSurface, conciergeAsk, focusGridWorkspace, addProjectColumn, removeProjectColumn, rebalanceGridColumns, getGridState, gridWorkspaceLayout,
+  workspaceRefExists, ensureGridWorkspace, ensureConciergeSurface, conciergeAsk, focusGridWorkspace, addProjectColumn, removeProjectColumn, rebalanceGridColumns, getGridState, gridWorkspaceLayout, rebuildGridSafely,
   openAll, closeAll, reorderProjects, addProject, removeProject, expandHome, rowCwd, rowCwdInfo, normalizeCollabProjectDir, normalizeCollabProjectDirInfo,
   projectKind, isGlobalProject, configuredRows, configuredProjectRows, configuredGlobalRows,
 };
