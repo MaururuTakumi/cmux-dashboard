@@ -2381,6 +2381,34 @@ NODE
     return 1
   fi
 
+  body="$(curl -fsS -X POST --max-time 10 -H 'Content-Type: application/json' --data '{"text":"テスト用プロジェクトを作りたい"}' "$api_url/api/concierge/ask" 2>/dev/null || true)"
+  if printf '%s' "$body" | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+process.exit(obj && obj.queued === true && obj.actionId && obj.label === "concierge:ask" ? 0 : 1);
+' 2>/dev/null; then
+    pass "R4 API: POST /api/concierge/ask returns queued concierge action"
+  else
+    fail "R4 API: POST /api/concierge/ask queued contract failed"
+    info "R4 concierge ask payload: ${body:-empty}"
+    return 1
+  fi
+
+  body="$(curl -fsS -X POST --max-time 10 -H 'Content-Type: application/json' --data '{"text":"CCへ送るテスト"}' "$api_url/api/send/alpha" 2>/dev/null || true)"
+  if printf '%s' "$body" | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+process.exit(obj && obj.queued === true && obj.actionId && obj.label === "send:alpha:cc" ? 0 : 1);
+' 2>/dev/null; then
+    pass "R4 API: POST /api/send/:id returns queued CC send action"
+  else
+    fail "R4 API: POST /api/send/:id queued contract failed"
+    info "R4 project send payload: ${body:-empty}"
+    return 1
+  fi
+
   body="$(curl -fsS --max-time 2 -D "$header_file" "$api_url/api/workspace-yaml" 2>/dev/null || true)"
   kill "$BAD_SERVER_PID" >/dev/null 2>&1 || true
   wait "$BAD_SERVER_PID" >/dev/null 2>&1 || true
@@ -2437,6 +2465,68 @@ NODE
     pass "R4: UI global rows, workspace YAML, and grid side-panel static contract are present"
   else
     fail "R4: UI global rows/workspace YAML/grid side-panel static contract failed"
+    return 1
+  fi
+
+  if "$NODE_BIN" - "$DIR" <<'NODE' 2>/dev/null
+const fs = require("fs");
+const path = require("path");
+const repo = process.argv[2];
+const htmlPath = path.join(repo, "public", "index.html");
+const serverPath = path.join(repo, "server.js");
+const ctlPath = path.join(repo, "cmuxctl.js");
+const templatePath = path.join(repo, "templates", "CONCIERGE.md");
+const html = fs.readFileSync(htmlPath, "utf8");
+const server = fs.readFileSync(serverPath, "utf8");
+const ctl = fs.readFileSync(ctlPath, "utf8");
+const template = fs.existsSync(templatePath) ? fs.readFileSync(templatePath, "utf8") : "";
+const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+if (!scriptMatch) process.exit(2);
+const script = scriptMatch[1];
+const onendDirectFetch = /voiceRecognition\.onend[\s\S]{0,700}fetch\s*\(/.test(script);
+const stopDirectSend = /function stopVoiceCapture\(\)[\s\S]{0,500}sendComposer\s*\(/.test(script);
+const checks = [
+  server.includes("urlPath === '/api/concierge/ask'"),
+  server.includes("ctl.conciergeAsk(body && body.text)"),
+  server.includes("const projectSend = urlPath.match(/^\\/api\\/send\\/([^/]+)$/)"),
+  server.includes("ctl.sendToProjectCc(id, body && body.text)"),
+  ctl.includes("async function sendToProjectCc(id, text)"),
+  ctl.includes("await ensureSlot(id, 'cc', true)"),
+  ctl.includes("await submitToSurface(wsRef, surfaceRef, text)"),
+  ctl.includes("sendToProjectCc, loadConfig"),
+  html.includes('id="conciergeProjectButton"') && html.includes('🤖 AIで新規プロジェクト'),
+  html.includes('id="voiceComposer"'),
+  html.includes('id="voiceMic"') && html.includes('🎤'),
+  html.includes('id="voiceInterim"'),
+  html.includes('id="composerText"'),
+  html.includes('id="composerTarget"'),
+  html.includes('<option value="concierge">コンシェルジュ</option>'),
+  script.includes("new webkitSpeechRecognition()"),
+  script.includes("voiceRecognition.lang = 'ja-JP'"),
+  script.includes("voiceRecognition.interimResults = true"),
+  script.includes("voiceRecognition.continuous = true"),
+  script.includes("if(result && result.isFinal) appendComposerText(transcript)"),
+  script.includes("setComposerState('review')"),
+  script.includes("jpost('/api/concierge/ask', { text })"),
+  script.includes("/api/send/${encodeURIComponent(target)}"),
+  script.includes("function updateComposerTargets(s)"),
+  !onendDirectFetch,
+  !stopDirectSend,
+  fs.existsSync(templatePath),
+  template.includes("プロジェクト作成の窓口AI"),
+  template.includes("CMUX_DASH_PROJECTS_ROOT"),
+  template.includes("CMUX_DASH_PORT"),
+  template.includes("curl -X POST"),
+  template.includes("/api/projects"),
+  template.includes("/api/grid/column/<id>"),
+  template.includes("既存ディレクトリ") && template.includes("不可逆操作"),
+];
+process.exit(checks.every(Boolean) ? 0 : 1);
+NODE
+  then
+    pass "R4: concierge S2 and voice composer static contract is present"
+  else
+    fail "R4: concierge S2/voice composer static contract failed"
     return 1
   fi
 }
