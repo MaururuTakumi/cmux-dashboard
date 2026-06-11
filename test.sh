@@ -909,7 +909,7 @@ if (failReads > 0) {
 }
 const surfaces = (s.surfaces || [])
   .filter((x) => (!workspace || x.workspace === workspace) && (!pane || x.pane === pane))
-  .map((x) => ({ ref: x.ref, title: x.title, type: x.type, url: x.url || null, paneRef: x.pane, cwd: x.cwd || null, process: x.process || null }));
+  .map((x) => ({ ref: x.ref, title: x.title, type: x.type, url: x.url || null, paneRef: x.pane, cwd: x.cwd || null, process: x.process || null, command: x.sendText || null }));
 process.stdout.write(JSON.stringify({ surfaces }) + "\n");
 NODE
     ;;
@@ -1742,6 +1742,40 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         writeCmuxState(raw);
       }
       const surfaceFailureGridState = await ctl.getGridState();
+      const startupResyncState = await (async () => {
+        const raw = rawCmuxState();
+        const ws = workspaceFor("__grid__");
+        const orphanPaneRef = "pane:grid-orphan-resync";
+        const orphanSurfaceRef = "surface:grid-orphan-resync";
+        raw.panes = (raw.panes || []).filter((pane) => pane && pane.ref !== orphanPaneRef);
+        raw.surfaces = (raw.surfaces || []).filter((surface) => surface && surface.ref !== orphanSurfaceRef);
+        raw.panes.push({
+          ref: orphanPaneRef,
+          workspace: ws && ws.ref,
+          index: (raw.panes || []).filter((pane) => pane && pane.workspace === (ws && ws.ref)).length + 20,
+        });
+        raw.surfaces.push({
+          ref: orphanSurfaceRef,
+          workspace: ws && ws.ref,
+          pane: orphanPaneRef,
+          title: "terminal",
+          type: "terminal",
+          process: "zsh",
+          cwd: null,
+          sendText: null,
+        });
+        writeCmuxState(raw);
+        const ctlPath = require.resolve(path.join(repo, "cmuxctl.js"));
+        delete require.cache[ctlPath];
+        const freshCtl = require(ctlPath);
+        const resynced = await freshCtl.getGridState();
+        const orphanStillLive = !!rawSurface(orphanSurfaceRef);
+        const cleaned = rawCmuxState();
+        cleaned.surfaces = (cleaned.surfaces || []).filter((surface) => surface && surface.ref !== orphanSurfaceRef);
+        cleaned.panes = (cleaned.panes || []).filter((pane) => pane && pane.ref !== orphanPaneRef);
+        writeCmuxState(cleaned);
+        return { resynced, orphanStillLive, orphanSurfaceRef };
+      })();
       const beforeFocusCount = surfaceCountFor("__grid__");
       const focusedAlpha = await ctl.addProjectColumn("alpha", { focus: true });
       const afterFocusCount = surfaceCountFor("__grid__");
@@ -1903,6 +1937,21 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         surfaceFailureGridState.columns.length === gridState.columns.length &&
         gridRefs(surfaceFailureGridState) === gridRefs(gridState) &&
         (rawCmuxState().workspaces || []).filter((ws) => ws && ws.description === "cmuxdash:__grid__").length === 1
+      ));
+      check("grid resync: fresh runtime adopts marker columns in projects.json order and only lists unmanaged terminals as orphans", (
+        startupResyncState &&
+        startupResyncState.resynced &&
+        startupResyncState.resynced.wsRef === gridState.wsRef &&
+        startupResyncState.resynced.columns.length === gridState.columns.length &&
+        startupResyncState.resynced.columns.map((column) => column.projectId).join(",") === "alpha,cc-general" &&
+        gridRefs(startupResyncState.resynced) === gridRefs(gridState) &&
+        Array.isArray(startupResyncState.resynced.orphans) &&
+        startupResyncState.resynced.orphans.some((orphan) => (
+          orphan &&
+          orphan.surfaceRef === startupResyncState.orphanSurfaceRef &&
+          orphan.reason === "unmanaged_grid_terminal"
+        )) &&
+        startupResyncState.orphanStillLive === true
       ));
       check("grid C1: deterministic refs survive overwritten grid launch titles", (
         alphaCc.title === "✳ Claude Code" &&
