@@ -1185,6 +1185,9 @@ const GRID_DASHBOARD_SPLIT = (() => {
 const GRID_RIGHT_ANCHOR_SPLIT = 0.94;
 const GRID_REBALANCE_MAX_PASSES = 4;
 const GRID_REBALANCE_TOLERANCE = 0.10;
+const GRID_REBALANCE_PANE_READ_ATTEMPTS = 5;
+const GRID_REBALANCE_PANE_READ_DELAY_MS = 600;
+const GRID_REBALANCE_BEST_EFFORT_RETRY_DELAY_MS = 1000;
 const GRID_WORKSPACE_LOOKUP_ATTEMPTS = 3;
 
 function cleanRef(value) {
@@ -2720,6 +2723,108 @@ function gridRebalanceMetric(name, actualPx, targetPx, cellWidthPx, extra = {}) 
   };
 }
 
+function gridRebalanceExpectedPaneRefs(columns, surfaces) {
+  const refs = [];
+  const push = (role, ref, extra = {}) => {
+    const clean = cleanRef(ref);
+    if (clean) refs.push({ role, ref: clean, ...extra });
+  };
+  for (const [index, column] of (Array.isArray(columns) ? columns : []).entries()) {
+    const projectId = column && (column.projectId || column.columnId) || null;
+    push('column.cc', column && column.cc && column.cc.paneRef, { index, slot: 'cc', projectId });
+    push('column.cdx', column && column.cdx && column.cdx.paneRef, { index, slot: 'cdx', projectId });
+  }
+  const browserSurface = gridBrowserAnchorSurface(surfaces);
+  const anchorSurface = gridRightAnchorSurface(surfaces, columns);
+  push('browser', browserSurface && browserSurface.paneRef, { surfaceRef: browserSurface && browserSurface.ref || null });
+  push('rightAnchor', anchorSurface && anchorSurface.paneRef, { surfaceRef: anchorSurface && anchorSurface.ref || null });
+
+  const seen = new Set();
+  return refs.filter((item) => {
+    if (!item.ref || seen.has(item.ref)) return false;
+    seen.add(item.ref);
+    return true;
+  });
+}
+
+function gridRebalancePaneReadInfo(read) {
+  const expectedPaneRefs = Array.isArray(read && read.expectedRefs) ? read.expectedRefs : [];
+  const missingPaneRefs = Array.isArray(read && read.missingRefs) ? read.missingRefs : [];
+  return {
+    attempts: Number(read && read.attempt) || 0,
+    maxAttempts: Number(read && read.attempts) || GRID_REBALANCE_PANE_READ_ATTEMPTS,
+    delayMs: Number(read && read.delayMs) || GRID_REBALANCE_PANE_READ_DELAY_MS,
+    frameCount: read && read.geometry && Array.isArray(read.geometry.frames) ? read.geometry.frames.length : 0,
+    expectedPaneRefs,
+    missingPaneRefs,
+    ...(read && read.error ? { error: read.error } : {}),
+  };
+}
+
+async function readGridRebalancePanesWithRetry(wsRef, columns, surfaces, opts = {}) {
+  const attempts = Math.max(1, Number(opts.attempts) || GRID_REBALANCE_PANE_READ_ATTEMPTS);
+  const delayMs = Math.max(0, Number(opts.delayMs) || GRID_REBALANCE_PANE_READ_DELAY_MS);
+  const expectedRefs = gridRebalanceExpectedPaneRefs(columns, surfaces);
+  let last = {
+    panes: [],
+    geometry: paneGeometryIndex([]),
+    expectedRefs,
+    missingRefs: expectedRefs,
+    attempt: 0,
+    attempts,
+    delayMs,
+    error: null,
+  };
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    let panes = [];
+    let error = null;
+    try {
+      panes = await readWorkspacePanes(wsRef);
+    } catch (err) {
+      error = summarizeError(err);
+    }
+    const geometry = paneGeometryIndex(panes);
+    const missingRefs = expectedRefs.filter((item) => item && item.ref && !geometry.byRef.has(item.ref));
+    last = { panes, geometry, expectedRefs, missingRefs, attempt, attempts, delayMs, error };
+    if (geometry.frames.length && !missingRefs.length) return last;
+    if (attempt < attempts) await sleep(delayMs);
+  }
+  return last;
+}
+
+function gridRebalanceMeasurementSummary(measurements) {
+  return (Array.isArray(measurements) ? measurements : []).map((item) => ({
+    name: item.name,
+    actualPx: item.actualPx,
+    targetPx: item.targetPx,
+    diffPx: item.diffPx,
+    tolerancePx: item.tolerancePx,
+    withinTolerance: item.withinTolerance,
+    ...(item.paneRef ? { paneRef: item.paneRef } : {}),
+    ...(item.index != null ? { index: item.index } : {}),
+  }));
+}
+
+function gridRebalancePassRecord(pass, snapshot, extra = {}) {
+  const record = { pass, ...extra };
+  if (snapshot && snapshot.paneRead) record.paneRead = snapshot.paneRead;
+  if (!snapshot || !snapshot.ok) {
+    return {
+      ...record,
+      rebalanced: false,
+      error: snapshot && (snapshot.reason || snapshot.error) || 'snapshot unavailable',
+    };
+  }
+  return {
+    ...record,
+    rebalanced: snapshot.withinTolerance,
+    withinTolerance: snapshot.withinTolerance,
+    measurements: snapshot.measurements,
+    summary: gridRebalanceMeasurementSummary(snapshot.measurements),
+    target: snapshot.target,
+  };
+}
+
 function gridRebalanceTargets(container, columnCount) {
   const browserWidth = Math.max(1, Math.round(container.width * GRID_DASHBOARD_SPLIT));
   const maxAnchorWidth = Math.max(1, container.width - browserWidth - columnCount);
@@ -2737,9 +2842,10 @@ function gridRebalanceTargets(container, columnCount) {
 }
 
 async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
-  const panes = await readWorkspacePanes(wsRef);
-  const geometry = paneGeometryIndex(panes);
-  if (!geometry.frames.length) return { ok: false, reason: 'missing pixel frames' };
+  const paneRead = await readGridRebalancePanesWithRetry(wsRef, columns, surfaces);
+  const geometry = paneRead.geometry;
+  const paneReadInfo = gridRebalancePaneReadInfo(paneRead);
+  if (!geometry.frames.length) return { ok: false, reason: 'missing pixel frames', paneRead: paneReadInfo };
 
   const browserSurface = gridBrowserAnchorSurface(surfaces);
   const anchorSurface = gridRightAnchorSurface(surfaces, columns);
@@ -2753,7 +2859,7 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
     browserPaneRef = fallbackPaneRefByPosition(geometry.frames, excludedForBrowser, 'left');
   }
   if (!browserPaneRef || !geometry.byRef.has(browserPaneRef)) {
-    return { ok: false, reason: 'missing browser pane frame' };
+    return { ok: false, reason: 'missing browser pane frame', paneRead: paneReadInfo };
   }
 
   let anchorPaneRef = anchorPaneRefFromSurface;
@@ -2763,7 +2869,7 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
     anchorPaneRef = fallbackPaneRefByPosition(geometry.frames, excludedForAnchor, 'right');
   }
   if (!anchorPaneRef || !geometry.byRef.has(anchorPaneRef)) {
-    return { ok: false, reason: 'missing right anchor pane frame' };
+    return { ok: false, reason: 'missing right anchor pane frame', paneRead: paneReadInfo };
   }
 
   const orderedColumns = columns
@@ -2780,13 +2886,13 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
     .filter((item) => item.bounds && item.resizePaneRef)
     .sort((a, b) => a.bounds.x - b.bounds.x);
   if (orderedColumns.length !== columns.length) {
-    return { ok: false, reason: 'missing column pane frames' };
+    return { ok: false, reason: 'missing column pane frames', paneRead: paneReadInfo };
   }
 
   const container = boundsForFrames(geometry.frames);
-  if (!container || container.width <= 0) return { ok: false, reason: 'missing container frame' };
+  if (!container || container.width <= 0) return { ok: false, reason: 'missing container frame', paneRead: paneReadInfo };
   const target = gridRebalanceTargets(container, orderedColumns.length);
-  if (!target) return { ok: false, reason: 'insufficient container width' };
+  if (!target) return { ok: false, reason: 'insufficient container width', paneRead: paneReadInfo };
 
   const browserFrame = geometry.byRef.get(browserPaneRef);
   const anchorFrame = geometry.byRef.get(anchorPaneRef);
@@ -2811,6 +2917,7 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
   return {
     ok: true,
     geometry,
+    paneRead: paneReadInfo,
     target,
     measurements,
     boundaries,
@@ -2851,16 +2958,20 @@ async function rebalanceGridColumns(wsRef) {
   let snapshot = null;
   for (let pass = 1; pass <= GRID_REBALANCE_MAX_PASSES; pass += 1) {
     snapshot = await readGridRebalanceSnapshot(ref, columns, surfaces);
-    if (!snapshot.ok) return { rebalanced: false, error: snapshot.reason, pass, passes };
+    if (!snapshot.ok) {
+      const failedPasses = passes.concat(gridRebalancePassRecord(pass, snapshot));
+      return { rebalanced: false, error: snapshot.reason, pass, passes: failedPasses };
+    }
     if (snapshot.withinTolerance) {
-      const operations = passes.reduce((acc, item) => acc.concat(item.operations || []), []);
+      const finalPasses = passes.concat(gridRebalancePassRecord(pass, snapshot, { operations: [], converged: true }));
+      const operations = finalPasses.reduce((acc, item) => acc.concat(item.operations || []), []);
       return {
         rebalanced: true,
         changed,
         converged: true,
-        passCount: passes.length,
+        passCount: finalPasses.length,
         operations,
-        passes,
+        passes: finalPasses,
         measurements: snapshot.measurements,
         target: snapshot.target,
       };
@@ -2873,24 +2984,25 @@ async function rebalanceGridColumns(wsRef) {
     const passChanged = operations.some((item) => item && item.resized);
     changed = changed || passChanged;
     passes.push({
-      pass,
+      ...gridRebalancePassRecord(pass, snapshot),
       operations,
-      measurements: snapshot.measurements,
-      target: snapshot.target,
+      changed: passChanged,
     });
     if (!passChanged) break;
   }
 
   snapshot = await readGridRebalanceSnapshot(ref, columns, surfaces);
-  if (!snapshot.ok) return { rebalanced: false, error: snapshot.reason, passes };
-  const operations = passes.reduce((acc, item) => acc.concat(item.operations || []), []);
+  const finalPass = (passes.length ? Math.max(...passes.map((item) => Number(item.pass) || 0)) : 0) + 1;
+  const finalPasses = passes.concat(gridRebalancePassRecord(finalPass, snapshot, { operations: [], final: true }));
+  if (!snapshot.ok) return { rebalanced: false, error: snapshot.reason, passes: finalPasses };
+  const operations = finalPasses.reduce((acc, item) => acc.concat(item.operations || []), []);
   return {
     rebalanced: snapshot.withinTolerance,
     changed,
     converged: snapshot.withinTolerance,
     operations,
-    passes,
-    passCount: passes.length,
+    passes: finalPasses,
+    passCount: finalPasses.length,
     measurements: snapshot.measurements,
     target: snapshot.target,
     ...(snapshot.withinTolerance ? {} : { error: `grid rebalance did not converge within ${GRID_REBALANCE_MAX_PASSES} passes` }),
@@ -2899,7 +3011,28 @@ async function rebalanceGridColumns(wsRef) {
 
 async function rebalanceGridColumnsBestEffort(wsRef) {
   try {
-    const result = await rebalanceGridColumns(wsRef);
+    let result = await rebalanceGridColumns(wsRef);
+    if (result && result.rebalanced === false) {
+      const firstResult = result;
+      await settle(GRID_REBALANCE_BEST_EFFORT_RETRY_DELAY_MS);
+      try {
+        result = await rebalanceGridColumns(wsRef);
+        result = {
+          ...result,
+          retried: true,
+          retryDelayMs: GRID_REBALANCE_BEST_EFFORT_RETRY_DELAY_MS,
+          firstResult,
+        };
+      } catch (retryErr) {
+        result = {
+          rebalanced: false,
+          retried: true,
+          retryDelayMs: GRID_REBALANCE_BEST_EFFORT_RETRY_DELAY_MS,
+          firstResult,
+          error: summarizeError(retryErr),
+        };
+      }
+    }
     gridRuntimeState.lastRebalance = { ...result, checkedAt: new Date().toISOString() };
     return gridRuntimeState.lastRebalance;
   }
