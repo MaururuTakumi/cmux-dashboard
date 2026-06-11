@@ -795,6 +795,10 @@ function gridMarker(surface) {
   const match = text.match(/(cmuxdash:grid:[^\s']+):slot:(cc|cdx)/);
   return match ? { columnKey: match[1], slot: match[2] } : null;
 }
+function isConcierge(surface) {
+  const text = [surface && surface.sendText, surface && surface.title].filter(Boolean).join(" ");
+  return /cmuxdash:grid:__grid__:concierge/.test(text);
+}
 function paneOrder(ref) {
   const pane = panes.find((item) => item && item.ref === ref);
   return pane && Number.isFinite(pane.index) ? pane.index : 9999;
@@ -802,6 +806,8 @@ function paneOrder(ref) {
 function withGridFrames() {
   const browserSurface = surfaces.find((surface) => surface && surface.type === "browser");
   const browserPane = browserSurface && browserSurface.pane || "";
+  const conciergeSurface = surfaces.find((surface) => surface && isConcierge(surface));
+  const conciergePane = conciergeSurface && conciergeSurface.pane || "";
   const columnMap = new Map();
   for (const surface of surfaces) {
     const marker = gridMarker(surface);
@@ -815,7 +821,7 @@ function withGridFrames() {
   if (!browserPane && !columns.length) return panes;
   const columnPaneRefs = new Set(columns.flatMap((column) => [column.cc, column.cdx]).filter(Boolean));
   const anchorPane = panes
-    .filter((pane) => pane && pane.ref !== browserPane && !columnPaneRefs.has(pane.ref))
+    .filter((pane) => pane && pane.ref !== browserPane && pane.ref !== conciergePane && !columnPaneRefs.has(pane.ref))
     .sort((a, b) => paneOrder(b.ref) - paneOrder(a.ref))[0];
   const frames = new Map();
   const totalWidth = 1266;
@@ -854,7 +860,12 @@ function withGridFrames() {
   const boundaries = gridBoundaries();
   let x = 0;
   const browserRight = boundaries[0] == null ? (columns.length ? 1100 : 1190) : boundaries[0];
-  setFrame(browserPane, x, 0, Math.max(1, browserRight - x), totalHeight);
+  if (conciergePane) {
+    setFrame(browserPane, x, 0, Math.max(1, browserRight - x), totalHeight / 2);
+    setFrame(conciergePane, x, totalHeight / 2, Math.max(1, browserRight - x), totalHeight / 2);
+  } else {
+    setFrame(browserPane, x, 0, Math.max(1, browserRight - x), totalHeight);
+  }
   x = browserRight;
   columns.forEach((column, idx) => {
     const nextX = boundaries[idx + 1] == null ? x + (idx === 0 ? 70 : 35) : boundaries[idx + 1];
@@ -898,7 +909,7 @@ if (failReads > 0) {
 }
 const surfaces = (s.surfaces || [])
   .filter((x) => (!workspace || x.workspace === workspace) && (!pane || x.pane === pane))
-  .map((x) => ({ ref: x.ref, title: x.title, type: x.type, url: x.url || null, paneRef: x.pane, cwd: x.cwd || null }));
+  .map((x) => ({ ref: x.ref, title: x.title, type: x.type, url: x.url || null, paneRef: x.pane, cwd: x.cwd || null, process: x.process || null }));
 process.stdout.write(JSON.stringify({ surfaces }) + "\n");
 NODE
     ;;
@@ -1019,6 +1030,10 @@ function gridMarker(surface) {
   const match = text.match(/(cmuxdash:grid:[^\s']+):slot:(cc|cdx)/);
   return match ? { columnKey: match[1], slot: match[2] } : null;
 }
+function isConcierge(surface) {
+  const text = [surface && surface.sendText, surface && surface.title].filter(Boolean).join(" ");
+  return /cmuxdash:grid:__grid__:concierge/.test(text);
+}
 function paneOrder(workspaceRef, ref) {
   const paneRec = (s.panes || []).find((item) => item && item.ref === ref && (!workspaceRef || item.workspace === workspaceRef));
   return paneRec && Number.isFinite(paneRec.index) ? paneRec.index : 9999;
@@ -1028,6 +1043,8 @@ function gridParts(workspaceRef) {
   const workspaceSurfaces = (s.surfaces || []).filter((item) => item && (!workspaceRef || item.workspace === workspaceRef));
   const browserSurface = workspaceSurfaces.find((surface) => surface && surface.type === "browser");
   const browserPane = browserSurface && browserSurface.pane || "";
+  const conciergeSurface = workspaceSurfaces.find((surface) => surface && isConcierge(surface));
+  const conciergePane = conciergeSurface && conciergeSurface.pane || "";
   const columnMap = new Map();
   for (const surface of workspaceSurfaces) {
     const marker = gridMarker(surface);
@@ -1040,7 +1057,7 @@ function gridParts(workspaceRef) {
   const columns = Array.from(columnMap.values()).sort((a, b) => a.order - b.order);
   const columnPaneRefs = new Set(columns.flatMap((column) => [column.cc, column.cdx]).filter(Boolean));
   const anchorPane = workspacePanes
-    .filter((item) => item && item.ref !== browserPane && !columnPaneRefs.has(item.ref))
+    .filter((item) => item && item.ref !== browserPane && item.ref !== conciergePane && !columnPaneRefs.has(item.ref))
     .sort((a, b) => paneOrder(workspaceRef, b.ref) - paneOrder(workspaceRef, a.ref))[0];
   return { browserPane, columns, anchorPaneRef: anchorPane && anchorPane.ref || "" };
 }
@@ -1149,14 +1166,17 @@ const workspace = process.argv[4] || "";
 const text = process.argv[5] || "";
 let s = { surfaces: [] };
 try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
+s.commands = Array.isArray(s.commands) ? s.commands : [];
+s.commands.push({ cmd: "send", surface, workspace, text });
 const match = text.match(/cmuxdash:slot:(cc|cdx|yazi|term)/);
 const gridMatch = text.match(/(cmuxdash:grid:[^\s']+:slot:(cc|cdx))/);
-const slot = gridMatch && gridMatch[2] || match && match[1];
-const title = gridMatch && gridMatch[1] || (slot ? "cmuxdash:slot:" + slot : null);
+const conciergeMatch = text.match(/(cmuxdash:grid:__grid__:concierge)/);
+const slot = conciergeMatch ? "concierge" : (gridMatch && gridMatch[2] || match && match[1]);
+const title = conciergeMatch && conciergeMatch[1] || gridMatch && gridMatch[1] || (slot ? "cmuxdash:slot:" + slot : null);
 const overwrittenGridTitle = process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE === "1" && gridMatch
   ? (slot === "cc" ? "✳ Claude Code" : "Codex")
   : null;
-const processBySlot = { cc: "claude", cdx: "codex", yazi: "yazi", term: "zsh" };
+const processBySlot = { cc: "claude", cdx: "codex", yazi: "yazi", term: "zsh", concierge: "claude" };
 const cdMarker = "cd " + String.fromCharCode(39);
 const cdStart = text.indexOf(cdMarker);
 let cwd = null;
@@ -1360,6 +1380,10 @@ function rawSurface(ref) {
 }
 function surfaceCountFor(id) {
   return surfacesFor(id).length;
+}
+function isConciergeSurface(surface) {
+  const text = [surface && surface.title, surface && surface.sendText].filter(Boolean).join("\n");
+  return text.includes("cmuxdash:grid:__grid__:concierge");
 }
 function stateHasSlotMarker(state, slot) {
   const marker = "cmuxdash:slot:" + slot;
@@ -1622,6 +1646,43 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       const initialGridRef = await ctl.ensureGridWorkspace();
       const initialGridWs = workspaceFor("__grid__");
       const dashboardUrl = "http://" + (process.env.CMUX_DASH_HOST || "127.0.0.1") + ":" + (process.env.CMUX_DASH_PORT || "7799");
+      const initialGridState = await ctl.getGridState();
+      const initialLayout = initialGridWs && initialGridWs.layout || {};
+      const initialMain = initialLayout.children && initialLayout.children[0] || {};
+      const initialMainChildren = Array.isArray(initialMain.children) ? initialMain.children : [];
+      const initialTopSurfaceSpec = initialMainChildren[0] &&
+        initialMainChildren[0].pane &&
+        Array.isArray(initialMainChildren[0].pane.surfaces) &&
+        initialMainChildren[0].pane.surfaces[0] || null;
+      const initialBottomSurfaceSpec = initialMainChildren[1] &&
+        initialMainChildren[1].pane &&
+        Array.isArray(initialMainChildren[1].pane.surfaces) &&
+        initialMainChildren[1].pane.surfaces[0] || null;
+      const initialBrowserAnchor = surfacesFor("__grid__").find((surface) => (
+        surface &&
+        surface.type === "browser" &&
+        surface.url === dashboardUrl
+      ));
+      const initialConcierge = initialGridState.concierge || {};
+      const initialConciergeSurface = rawSurface(initialConcierge.surfaceRef);
+      const initialConciergePane = initialConciergeSurface && paneForRef(initialConciergeSurface.pane) || null;
+      {
+        const raw = rawCmuxState();
+        raw.surfaces = (raw.surfaces || []).filter((surface) => surface && surface.ref !== initialConcierge.surfaceRef);
+        raw.panes = (raw.panes || []).filter((pane) => pane && pane.ref !== (initialConciergeSurface && initialConciergeSurface.pane));
+        writeCmuxState(raw);
+      }
+      const repairSplitCountBefore = (rawCmuxState().commands || []).filter((item) => item && item.cmd === "new-split").length;
+      const repairSendCountBefore = (rawCmuxState().commands || []).filter((item) => item && item.cmd === "send").length;
+      const conciergeAskResult = await ctl.conciergeAsk("テスト用プロジェクトを作りたい");
+      const conciergeAfterAsk = rawSurface(conciergeAskResult.surfaceRef);
+      const repairSplitCommands = (rawCmuxState().commands || []).filter((item) => item && item.cmd === "new-split").slice(repairSplitCountBefore);
+      const askSendCommands = (rawCmuxState().commands || [])
+        .filter((item) => item && item.cmd === "send")
+        .slice(repairSendCountBefore)
+        .filter((item) => item && item.surface === conciergeAskResult.surfaceRef);
+      const askBodySend = askSendCommands.find((item) => item && String(item.text || "").includes("テスト用プロジェクトを作りたい")) || null;
+      const askEnterSend = askSendCommands[askSendCommands.length - 1] || null;
       const alphaStateBeforeGrid = await ctl.getProjectState("alpha");
       const alphaColumn = await ctl.addProjectColumn("alpha");
       const afterAlphaCount = surfaceCountFor("__grid__");
@@ -1679,16 +1740,19 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       const rightAnchor = surfacesFor("__grid__").find((surface) => (
         surface &&
         surface.type !== "browser" &&
+        !isConciergeSurface(surface) &&
         !columnSurfaceRefs.has(surface.ref)
       ));
       const gridSplitCommands = (rawCmuxState().commands || [])
         .filter((item) => item && item.cmd === "new-split" && item.workspace === initialGridRef);
+      const gridColumnSplitCommands = gridSplitCommands
+        .filter((item) => item && columnSurfaceRefs.has(item.resultSurface));
       const gridResizeCommands = (rawCmuxState().commands || [])
         .filter((item) => item && item.cmd === "resize-pane" && item.workspace === initialGridRef);
-      const firstCcSplit = gridSplitCommands[0] || {};
-      const firstCdxSplit = gridSplitCommands[1] || {};
-      const secondCcSplit = gridSplitCommands[2] || {};
-      const secondCdxSplit = gridSplitCommands[3] || {};
+      const firstCcSplit = gridColumnSplitCommands[0] || {};
+      const firstCdxSplit = gridColumnSplitCommands[1] || {};
+      const secondCcSplit = gridColumnSplitCommands[2] || {};
+      const secondCdxSplit = gridColumnSplitCommands[3] || {};
       const alphaStateAfterGrid = await ctl.getProjectState("alpha");
       const layout = gridWs && gridWs.layout || {};
       const browserPaneRef = browserAnchor && browserAnchor.pane || null;
@@ -1714,6 +1778,39 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         alphaStateAfterGrid.wsRef !== gridState.wsRef &&
         alphaStateAfterGrid.surfaces.every((surface) => !String(surface.title || "").includes("cmuxdash:grid:"))
       ));
+      check("grid concierge A: initial grid layout creates browser/concierge vertical pair", (
+        initialLayout.direction === "horizontal" &&
+        Math.abs(initialLayout.split - 0.94) < 0.0001 &&
+        initialMain.direction === "vertical" &&
+        Math.abs(initialMain.split - 0.5) < 0.0001 &&
+        initialTopSurfaceSpec &&
+        initialTopSurfaceSpec.type === "browser" &&
+        initialBottomSurfaceSpec &&
+        initialBottomSurfaceSpec.type === "terminal" &&
+        initialConciergeSurface &&
+        initialConciergePane &&
+        initialConciergeSurface.process === "claude" &&
+        initialConciergeSurface.cwd === ctl.CMUX_DASH_PROJECTS_ROOT
+      ));
+      check("grid concierge B/C: conciergeAsk repairs dead concierge and submits kickoff to that surface", (
+        initialBrowserAnchor &&
+        conciergeAfterAsk &&
+        conciergeAfterAsk.ref === conciergeAskResult.surfaceRef &&
+        conciergeAfterAsk.process === "claude" &&
+        repairSplitCommands.some((item) => (
+          item &&
+          item.direction === "down" &&
+          item.surface === initialBrowserAnchor.ref &&
+          item.resultSurface === conciergeAskResult.surfaceRef
+        )) &&
+        askSendCommands.length >= 3 &&
+        askBodySend &&
+        String(askBodySend.text || "").includes("templates/CONCIERGE.md") &&
+        String(askBodySend.text || "").includes("対話") &&
+        String(askBodySend.text || "").includes("API") &&
+        askEnterSend &&
+        askEnterSend.text === "\\r"
+      ));
       check("grid C1: addProjectColumn creates ordered scoped cc/cdx columns", (
         afterAlphaGridRef === initialGridRef &&
         gridState.wsRef === gridWs.ref &&
@@ -1738,8 +1835,8 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         !String(generalCdx.title || "").includes("cmuxdash:slot:")
       ));
       check("grid G2: incremental second add preserves existing refs and workspace", (
-        afterAlphaCount === 4 &&
-        afterGeneralCount === 6 &&
+        afterAlphaCount === 5 &&
+        afterGeneralCount === 7 &&
         afterGeneralGridWorkspaceCount === 1 &&
         generalColumn.wsRef === initialGridRef &&
         alphaGridColumn.wsRef === initialGridRef &&
@@ -1800,7 +1897,7 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       ));
       check("grid G2: second column cc split is issued as left split from right anchor command", (
         rightAnchor &&
-        gridSplitCommands.length === 4 &&
+        gridColumnSplitCommands.length === 4 &&
         firstCcSplit.direction === "left" &&
         firstCcSplit.surface === rightAnchor.ref &&
         firstCcSplit.resultSurface === alphaGridColumn.cc.surfaceRef &&
@@ -1892,17 +1989,33 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         });
         const threeMain = threeColumnLayout.children && threeColumnLayout.children[0] || {};
         const threeAnchor = threeColumnLayout.children && threeColumnLayout.children[1] || {};
+        const threeLeftPair = threeMain.children && threeMain.children[0] || {};
         const threeRight = threeMain.children && threeMain.children[1] || {};
         const threeTail = threeRight.children && threeRight.children[1] || {};
         const ga = threeRight.children && threeRight.children[0] || {};
         const gb = threeTail.children && threeTail.children[0] || {};
         const gc = threeTail.children && threeTail.children[1] || {};
+        const threeLeftChildren = Array.isArray(threeLeftPair.children) ? threeLeftPair.children : [];
+        const threeLeftTop = threeLeftChildren[0] &&
+          threeLeftChildren[0].pane &&
+          Array.isArray(threeLeftChildren[0].pane.surfaces) &&
+          threeLeftChildren[0].pane.surfaces[0] || null;
+        const threeLeftBottom = threeLeftChildren[1] &&
+          threeLeftChildren[1].pane &&
+          Array.isArray(threeLeftChildren[1].pane.surfaces) &&
+          threeLeftChildren[1].pane.surfaces[0] || null;
         check("grid C1: three-column layout keeps equal project column proportions with right anchor", (
           threeColumnLayout.direction === "horizontal" &&
           Math.abs(threeColumnLayout.split - 0.94) < 0.0001 &&
           threeAnchor.pane &&
           threeMain.direction === "horizontal" &&
           Math.abs(threeMain.split - 0.18) < 0.0001 &&
+          threeLeftPair.direction === "vertical" &&
+          Math.abs(threeLeftPair.split - 0.5) < 0.0001 &&
+          threeLeftTop &&
+          threeLeftTop.type === "browser" &&
+          threeLeftBottom &&
+          threeLeftBottom.type === "terminal" &&
           threeRight.direction === "horizontal" &&
           Math.abs(threeRight.split - (1 / 3)) < 0.0001 &&
           threeTail.direction === "horizontal" &&
@@ -6729,8 +6842,8 @@ async function waitFor(label, fn, timeoutMs = 20000) {
       liveColA.cdx.surfaceRef === colARefs[1] &&
       liveColB.cc.surfaceRef === colB.cc.surfaceRef &&
       liveColB.cdx.surfaceRef === colB.cdx.surfaceRef &&
-      afterBLayout.panes.length === 6 &&
-      afterBLayout.surfaces.length === 6
+      afterBLayout.panes.length === 7 &&
+      afterBLayout.surfaces.length === 7
     ));
     wsRef = afterBState.wsRef;
     check("real grid getGridState: columns ordered and refs match live list-panes/list-pane-surfaces", (
@@ -6766,8 +6879,8 @@ async function waitFor(label, fn, timeoutMs = 20000) {
       survivingB.cc.surfaceRef === liveColB.cc.surfaceRef &&
       survivingB.cdx.surfaceRef === liveColB.cdx.surfaceRef &&
       refsGone(afterRemoveALayout, [liveColA.cc.surfaceRef, liveColA.cdx.surfaceRef]) &&
-      afterRemoveALayout.surfaces.length === 4 &&
-      afterRemoveALayout.panes.length === 4 &&
+      afterRemoveALayout.surfaces.length === 5 &&
+      afterRemoveALayout.panes.length === 5 &&
       afterRemoveAState.columns.length === 1 &&
       afterRemoveAState.columns[0].projectId === projectB &&
       refsPresent(afterRemoveALayout, [survivingB.cc.surfaceRef, survivingB.cdx.surfaceRef]) &&

@@ -13,6 +13,7 @@ const TAG = 'cmuxdash:';
 const GRID_ID = '__grid__';
 const GRID_TAG = TAG + GRID_ID;
 const GRID_MARK_PREFIX = `${TAG}grid:`;
+const GRID_CONCIERGE_MARKER = `${GRID_MARK_PREFIX}${GRID_ID}:concierge`;
 const DEFAULT_DASHBOARD_PORT = 7799;
 const PROJECTS_FILE = process.env.CMUX_DASH_PROJECTS_FILE || path.join(__dirname, 'projects.json');
 const PROJECTS_EXAMPLE_FILE = process.env.CMUX_DASH_PROJECTS_EXAMPLE_FILE || path.join(__dirname, 'projects.example.json');
@@ -1175,6 +1176,11 @@ const slotRefState = new Map();
 const gridRuntimeState = {
   wsRef: null,
   anchorSurfaceRef: null,
+  concierge: {
+    surfaceRef: null,
+    paneRef: null,
+    marker: GRID_CONCIERGE_MARKER,
+  },
   columns: [],
   lastRebalance: null,
   lastRebalanceRepairAt: null,
@@ -1895,6 +1901,10 @@ function gridTitleCommand(columnId, slot) {
   return `printf '\\033]0;${gridSlotMarker(columnId, slot)}\\007'`;
 }
 
+function gridConciergeTitleCommand() {
+  return `printf '\\033]0;${GRID_CONCIERGE_MARKER}\\007'`;
+}
+
 function shellQuote(value) {
   return `'${String(value || '').replace(/'/g, "'\\''")}'`;
 }
@@ -1911,6 +1921,11 @@ function gridLaunchCommand(project, cfg, columnId, slot) {
   const cmd = configuredSlotCommand(project, cfg, slot);
   const cwd = shellQuote(rowCwd(project, { create: true }));
   return `${gridTitleCommand(columnId, slot)}; cd ${cwd} && exec ${cmd || SLOT_DEFS[slot].defaultCommand}`;
+}
+
+function gridConciergeLaunchCommand() {
+  const cwd = shellQuote(CMUX_DASH_PROJECTS_ROOT);
+  return `${gridConciergeTitleCommand()}; cd ${cwd} && exec ${SLOT_DEFS.cc.defaultCommand}`;
 }
 
 function slotMarkerSearchText(surface) {
@@ -2392,9 +2407,42 @@ function gridColumnSnapshot(column, order = column && column.order) {
   };
 }
 
+function emptyGridConcierge() {
+  return {
+    surfaceRef: null,
+    paneRef: null,
+    marker: GRID_CONCIERGE_MARKER,
+  };
+}
+
+function resetGridConcierge() {
+  gridRuntimeState.concierge = emptyGridConcierge();
+}
+
+function setGridConciergeSurface(surface) {
+  const ref = cleanRef(surface && (surface.ref || surface.surfaceRef));
+  const paneRef = cleanRef(surface && surface.paneRef);
+  gridRuntimeState.concierge = {
+    surfaceRef: ref,
+    paneRef: paneRef || null,
+    marker: GRID_CONCIERGE_MARKER,
+  };
+  return gridRuntimeState.concierge;
+}
+
+function gridConciergeSnapshot() {
+  const state = gridRuntimeState.concierge || {};
+  return {
+    surfaceRef: cleanRef(state.surfaceRef),
+    paneRef: cleanRef(state.paneRef),
+    marker: GRID_CONCIERGE_MARKER,
+  };
+}
+
 function gridStateSnapshot(wsRef, columns = gridRuntimeState.columns) {
   return {
     wsRef: cleanRef(wsRef),
+    concierge: gridConciergeSnapshot(),
     columns: (Array.isArray(columns) ? columns : [])
       .map((column, idx) => gridColumnSnapshot(column, idx))
       .filter(Boolean),
@@ -2423,9 +2471,13 @@ async function findGridWorkspace(opts = {}) {
 async function ensureGridWorkspace() {
   const knownRef = cleanRef(gridRuntimeState.wsRef);
   if (knownRef && await workspaceRefExists(knownRef, { allowStale: true, quick: true })) {
+    await ensureConciergeSurface(knownRef);
     return knownRef;
   }
-  if (knownRef) gridRuntimeState.anchorSurfaceRef = null;
+  if (knownRef) {
+    gridRuntimeState.anchorSurfaceRef = null;
+    resetGridConcierge();
+  }
 
   const existing = await findGridWorkspace({
     attempts: GRID_WORKSPACE_LOOKUP_ATTEMPTS,
@@ -2434,12 +2486,17 @@ async function ensureGridWorkspace() {
     quick: true,
   });
   if (existing && existing.ref) {
-    if (gridRuntimeState.wsRef !== existing.ref) gridRuntimeState.anchorSurfaceRef = null;
+    if (gridRuntimeState.wsRef !== existing.ref) {
+      gridRuntimeState.anchorSurfaceRef = null;
+      resetGridConcierge();
+    }
     gridRuntimeState.wsRef = existing.ref;
+    await ensureConciergeSurface(existing.ref);
     return existing.ref;
   }
 
   gridRuntimeState.anchorSurfaceRef = null;
+  resetGridConcierge();
   const layout = gridWorkspaceLayout([], loadConfig());
   const out = await cmux([
     'new-workspace',
@@ -2454,9 +2511,11 @@ async function ensureGridWorkspace() {
   await settle();
   gridRuntimeState.wsRef = ref;
   gridRuntimeState.anchorSurfaceRef = null;
+  resetGridConcierge();
   gridRuntimeState.columns = [];
   gridRuntimeState.lastRebalance = null;
   gridRuntimeState.lastRebalanceRepairAt = null;
+  await ensureConciergeSurface(ref);
   return ref;
 }
 
@@ -2470,6 +2529,17 @@ function gridBrowserLayout() {
 
 function gridTerminalLayout() {
   return paneLayout({ type: 'terminal' });
+}
+
+function gridBrowserConciergeLayout() {
+  return {
+    direction: 'vertical',
+    split: 0.5,
+    children: [
+      gridBrowserLayout(),
+      gridTerminalLayout(),
+    ],
+  };
 }
 
 function gridRightAnchorLayout() {
@@ -2501,12 +2571,12 @@ function equalHorizontalLayout(children) {
 }
 
 function gridMainAreaLayout(columnLayouts) {
-  if (!columnLayouts.length) return gridBrowserLayout();
+  if (!columnLayouts.length) return gridBrowserConciergeLayout();
   return {
     direction: 'horizontal',
     split: GRID_DASHBOARD_SPLIT,
     children: [
-      gridBrowserLayout(),
+      gridBrowserConciergeLayout(),
       equalHorizontalLayout(columnLayouts),
     ],
   };
@@ -2612,6 +2682,41 @@ function gridColumnSurfaceRefSet(columns = gridRuntimeState.columns) {
   return refs;
 }
 
+function isGridConciergeSurface(surface) {
+  if (!surface || !surface.ref) return false;
+  const state = gridRuntimeState.concierge || {};
+  const knownRef = cleanRef(state.surfaceRef);
+  if (knownRef && cleanRef(surface.ref) === knownRef) return true;
+  return slotMarkerSearchText(surface).includes(GRID_CONCIERGE_MARKER.toLowerCase());
+}
+
+function markedOrKnownGridConciergeSurface(surfaces) {
+  const list = Array.isArray(surfaces) ? surfaces : [];
+  const state = gridRuntimeState.concierge || {};
+  const knownRef = cleanRef(state.surfaceRef);
+  if (knownRef) {
+    const known = list.find((surface) => surface && cleanRef(surface.ref) === knownRef);
+    if (known) return known;
+  }
+  return markerSurface(list, GRID_CONCIERGE_MARKER);
+}
+
+function inferUnmarkedGridConciergeSurface(surfaces, columns = gridRuntimeState.columns) {
+  const list = Array.isArray(surfaces) ? surfaces : [];
+  const columnRefs = gridColumnSurfaceRefSet(columns);
+  const anchor = gridRightAnchorSurface(list, columns);
+  const anchorRef = cleanRef(anchor && anchor.ref);
+  const candidates = list.filter((surface) => (
+    surface &&
+    surface.ref &&
+    isGridTerminalSurface(surface) &&
+    !columnRefs.has(surface.ref) &&
+    cleanRef(surface.ref) !== anchorRef &&
+    !isGridColumnLikeTerminalSurface(surface)
+  ));
+  return candidates[0] || null;
+}
+
 function isGridColumnLikeTerminalSurface(surface) {
   const markerText = slotMarkerSearchText(surface);
   if (markerText.includes(GRID_MARK_PREFIX)) return true;
@@ -2628,6 +2733,7 @@ function gridRightAnchorSurface(surfaces, columns = gridRuntimeState.columns) {
     surface.ref &&
     isGridTerminalSurface(surface) &&
     !columnRefs.has(surface.ref) &&
+    !isGridConciergeSurface(surface) &&
     !isGridColumnLikeTerminalSurface(surface)
   ));
   if (knownRef) {
@@ -2800,8 +2906,10 @@ function gridRebalanceExpectedPaneRefs(columns, surfaces) {
     push('column.cdx', column && column.cdx && column.cdx.paneRef, { index, slot: 'cdx', projectId });
   }
   const browserSurface = gridBrowserAnchorSurface(surfaces);
+  const conciergeSurface = markedOrKnownGridConciergeSurface(surfaces);
   const anchorSurface = gridRightAnchorSurface(surfaces, columns);
   push('browser', browserSurface && browserSurface.paneRef, { surfaceRef: browserSurface && browserSurface.ref || null });
+  push('concierge', conciergeSurface && conciergeSurface.paneRef, { surfaceRef: conciergeSurface && conciergeSurface.ref || null });
   push('rightAnchor', anchorSurface && anchorSurface.paneRef, { surfaceRef: anchorSurface && anchorSurface.ref || null });
 
   const seen = new Set();
@@ -2965,11 +3073,14 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
   if (!geometry.frames.length) return { ok: false, reason: 'missing pixel frames', paneRead: paneReadInfo };
 
   const browserSurface = gridBrowserAnchorSurface(surfaces);
+  const conciergeSurface = markedOrKnownGridConciergeSurface(surfaces);
   const anchorSurface = gridRightAnchorSurface(surfaces, columns);
   const columnPaneRefs = new Set(columns.flatMap(gridColumnPaneRefs));
   const excludedForBrowser = new Set(columnPaneRefs);
   const anchorPaneRefFromSurface = cleanRef(anchorSurface && anchorSurface.paneRef);
   if (anchorPaneRefFromSurface) excludedForBrowser.add(anchorPaneRefFromSurface);
+  const conciergePaneRefFromSurface = cleanRef(conciergeSurface && conciergeSurface.paneRef);
+  if (conciergePaneRefFromSurface) excludedForBrowser.add(conciergePaneRefFromSurface);
 
   let browserPaneRef = cleanRef(browserSurface && browserSurface.paneRef);
   if (!browserPaneRef || !geometry.byRef.has(browserPaneRef)) {
@@ -2983,6 +3094,7 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
   if (!anchorPaneRef || !geometry.byRef.has(anchorPaneRef)) {
     const excludedForAnchor = new Set(columnPaneRefs);
     excludedForAnchor.add(browserPaneRef);
+    if (conciergePaneRefFromSurface) excludedForAnchor.add(conciergePaneRefFromSurface);
     anchorPaneRef = fallbackPaneRefByPosition(geometry.frames, excludedForAnchor, 'right');
   }
   if (!anchorPaneRef || !geometry.byRef.has(anchorPaneRef)) {
@@ -3011,7 +3123,10 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
   const target = gridRebalanceTargets(container, orderedColumns.length);
   if (!target) return { ok: false, reason: 'insufficient container width', paneRead: paneReadInfo };
 
-  const browserFrame = geometry.byRef.get(browserPaneRef);
+  const leftAreaPaneRefs = [browserPaneRef, conciergePaneRefFromSurface]
+    .map(cleanRef)
+    .filter((paneRef) => paneRef && geometry.byRef.has(paneRef));
+  const browserFrame = paneBoundsForRefs(geometry.byRef, leftAreaPaneRefs) || geometry.byRef.get(browserPaneRef);
   const anchorFrame = geometry.byRef.get(anchorPaneRef);
   const measurements = [
     gridRebalanceMetric('browser', browserFrame.width, target.browserWidth, geometry.cellWidthPx, { paneRef: browserPaneRef }),
@@ -3304,6 +3419,56 @@ async function ensureGridRightAnchorSurface(wsRef) {
   return { ref: anchor.surfaceRef, paneRef: anchor.paneRef || null };
 }
 
+async function launchGridConciergeSurface(wsRef, surfaceRef) {
+  const ref = cleanRef(surfaceRef);
+  if (!wsRef) throw new Error('grid workspace ref is required');
+  if (!ref) throw new Error('grid concierge surface ref is required');
+  await cmux(['send', '--workspace', wsRef, '--surface', ref, gridConciergeLaunchCommand() + '\n']);
+}
+
+async function ensureConciergeSurface(wsRef) {
+  const ref = cleanRef(wsRef);
+  if (!ref) throw new Error('grid workspace ref is required');
+
+  let surfaces = await listWorkspaceSurfaces(ref);
+  const known = markedOrKnownGridConciergeSurface(surfaces);
+  if (known && known.ref) {
+    const state = setGridConciergeSurface(known);
+    return { ref: state.surfaceRef, surfaceRef: state.surfaceRef, paneRef: state.paneRef, marker: state.marker, existing: true };
+  }
+
+  const adoptable = inferUnmarkedGridConciergeSurface(surfaces);
+  if (adoptable && adoptable.ref) {
+    const state = setGridConciergeSurface(adoptable);
+    await launchGridConciergeSurface(ref, state.surfaceRef);
+    await settle(Math.min(CMUX_SETTLE_MS, 500));
+    surfaces = await listWorkspaceSurfaces(ref);
+    const launched = markedOrKnownGridConciergeSurface(surfaces) || adoptable;
+    const next = setGridConciergeSurface(launched);
+    return { ref: next.surfaceRef, surfaceRef: next.surfaceRef, paneRef: next.paneRef, marker: next.marker, existing: true, launched: true };
+  }
+
+  const browserAnchor = await findGridBrowserAnchorSurface(ref);
+  const created = await createAnchoredGridSplitSurface(ref, browserAnchor.ref, 'down');
+  const state = setGridConciergeSurface({ ref: created.surfaceRef, paneRef: created.paneRef || null });
+  await launchGridConciergeSurface(ref, state.surfaceRef);
+  await settle(Math.min(CMUX_SETTLE_MS, 500));
+  surfaces = await listWorkspaceSurfaces(ref);
+  const launched = markedOrKnownGridConciergeSurface(surfaces);
+  const next = setGridConciergeSurface(launched || state);
+  return {
+    ref: next.surfaceRef,
+    surfaceRef: next.surfaceRef,
+    paneRef: next.paneRef,
+    marker: next.marker,
+    existing: false,
+    launched: true,
+    split: true,
+    splitFrom: browserAnchor.ref,
+    direction: 'down',
+  };
+}
+
 async function listGridTerminalSurfacesWithRetry(wsRef, expectedCount, attempts = 6) {
   let terminals = [];
   for (let i = 0; i < attempts; i += 1) {
@@ -3387,6 +3552,7 @@ async function rebuildGridWorkspace(columns, cfg = loadConfig()) {
     const closedWs = await closeGridWorkspaceIfPresent();
     gridRuntimeState.wsRef = null;
     gridRuntimeState.anchorSurfaceRef = null;
+    resetGridConcierge();
     gridRuntimeState.columns = [];
     gridRuntimeState.lastRebalance = null;
     gridRuntimeState.lastRebalanceRepairAt = null;
@@ -3395,6 +3561,7 @@ async function rebuildGridWorkspace(columns, cfg = loadConfig()) {
 
   await closeGridWorkspaceIfPresent();
   gridRuntimeState.anchorSurfaceRef = null;
+  resetGridConcierge();
   gridRuntimeState.lastRebalance = null;
   gridRuntimeState.lastRebalanceRepairAt = null;
   const layout = gridWorkspaceLayout(desired, cfg);
@@ -3411,8 +3578,16 @@ async function rebuildGridWorkspace(columns, cfg = loadConfig()) {
   await settle();
 
   const now = new Date().toISOString();
-  const terminalSurfaces = await listGridTerminalSurfacesWithRetry(wsRef, desired.length * 2, 6);
-  const rebuilt = resolveGridColumnSurfaces(wsRef, desired, terminalSurfaces, now);
+  const terminalSurfaces = await listGridTerminalSurfacesWithRetry(wsRef, desired.length * 2 + 2, 6);
+  const conciergeSurface = terminalSurfaces[0] || null;
+  const columnSurfaces = terminalSurfaces.slice(1, 1 + desired.length * 2);
+  const rebuilt = resolveGridColumnSurfaces(wsRef, desired, columnSurfaces, now);
+  if (conciergeSurface && conciergeSurface.ref) {
+    setGridConciergeSurface(conciergeSurface);
+    await launchGridConciergeSurface(wsRef, conciergeSurface.ref);
+  } else {
+    await ensureConciergeSurface(wsRef);
+  }
   await launchGridColumnSurfaces(wsRef, rebuilt, cfg);
   await settle();
   gridRuntimeState.wsRef = wsRef;
@@ -3455,6 +3630,7 @@ async function validateGridRuntimeState() {
     }
     gridRuntimeState.wsRef = null;
     gridRuntimeState.anchorSurfaceRef = null;
+    resetGridConcierge();
     gridRuntimeState.columns = [];
     gridRuntimeState.lastRebalance = null;
     gridRuntimeState.lastRebalanceRepairAt = null;
@@ -3474,6 +3650,12 @@ async function validateGridRuntimeState() {
   const byRef = liveSurfaceIndex(surfaces);
   const anchorRef = cleanRef(gridRuntimeState.anchorSurfaceRef);
   if (anchorRef && !byRef.has(anchorRef)) gridRuntimeState.anchorSurfaceRef = null;
+  const concierge = markedOrKnownGridConciergeSurface(surfaces);
+  if (concierge && concierge.ref) {
+    setGridConciergeSurface(concierge);
+  } else {
+    resetGridConcierge();
+  }
   gridRuntimeState.columns = gridRuntimeState.columns.filter((column) => (
     column &&
     column.cc &&
@@ -3553,6 +3735,31 @@ async function getGridState() {
   return repair ? gridStateSnapshot(cleanRef(gridRuntimeState.wsRef), gridRuntimeState.columns) : state;
 }
 
+function conciergeKickoffText(text) {
+  const userText = String(text || '').trim();
+  const templatePath = templateAbsolutePath(path.join('templates', 'CONCIERGE.md'));
+  const templateInstruction = fs.existsSync(templatePath)
+    ? `まず ${templatePath} を読み、そのプロトコルに従って対話→確定後に API でプロジェクト登録と列起動を実行せよ`
+    : `まず ${templatePath} を読む。存在しない場合は、プロジェクト作成窓口として対話→確定後に API でプロジェクト登録と列起動を実行せよ`;
+  return `${userText}\n\n${templateInstruction}`;
+}
+
+async function conciergeAsk(text) {
+  const wsRef = await ensureGridWorkspace();
+  const concierge = await ensureConciergeSurface(wsRef);
+  const surfaceRef = cleanRef(concierge && (concierge.surfaceRef || concierge.ref));
+  const kickoffText = conciergeKickoffText(text);
+  await submitToSurface(wsRef, surfaceRef, kickoffText);
+  return {
+    sent: true,
+    wsRef,
+    surfaceRef,
+    paneRef: concierge && concierge.paneRef || null,
+    marker: GRID_CONCIERGE_MARKER,
+    kickoffText,
+  };
+}
+
 async function focusGridWorkspace({ ensure = false, wsRef = null } = {}) {
   let ref = cleanRef(wsRef || gridRuntimeState.wsRef);
   let ws = ref ? { ref } : null;
@@ -3624,6 +3831,7 @@ async function addProjectColumn(projectId, { focus = false } = {}) {
       await closeGridWorkspaceIfPresent();
       gridRuntimeState.wsRef = null;
       gridRuntimeState.anchorSurfaceRef = null;
+      resetGridConcierge();
       gridRuntimeState.columns = [];
       gridRuntimeState.lastRebalance = null;
       gridRuntimeState.lastRebalanceRepairAt = null;
@@ -3663,6 +3871,7 @@ async function removeProjectColumn(projectId) {
     const closedWs = await closeGridWorkspaceIfPresent();
     gridRuntimeState.wsRef = null;
     gridRuntimeState.anchorSurfaceRef = null;
+    resetGridConcierge();
     gridRuntimeState.columns = [];
     gridRuntimeState.lastRebalance = null;
     gridRuntimeState.lastRebalanceRepairAt = null;
@@ -4011,7 +4220,7 @@ module.exports = {
   agmsgDbPath, getTeamMessages,
   createCmuxHealthTracker, getCmuxHealth, pingCmuxForRecovery,
   getState, getWorkspaceYaml, getProjectState, ensureSlot, ensureCollabSlots, sendToSurface, submitToSurface, loadConfig, saveConfig, openProject, closeProject, focusProject,
-  workspaceRefExists, ensureGridWorkspace, focusGridWorkspace, addProjectColumn, removeProjectColumn, rebalanceGridColumns, getGridState, gridWorkspaceLayout,
+  workspaceRefExists, ensureGridWorkspace, ensureConciergeSurface, conciergeAsk, focusGridWorkspace, addProjectColumn, removeProjectColumn, rebalanceGridColumns, getGridState, gridWorkspaceLayout,
   openAll, closeAll, reorderProjects, addProject, removeProject, expandHome, rowCwd, rowCwdInfo, normalizeCollabProjectDir, normalizeCollabProjectDirInfo,
   projectKind, isGlobalProject, configuredRows, configuredProjectRows, configuredGlobalRows,
 };
