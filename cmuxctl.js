@@ -1176,12 +1176,15 @@ const gridRuntimeState = {
   wsRef: null,
   anchorSurfaceRef: null,
   columns: [],
+  lastRebalance: null,
 };
 const GRID_DASHBOARD_SPLIT = (() => {
   const n = Number.parseFloat(process.env.CMUX_DASH_GRID_DASHBOARD_SPLIT || '');
   return Number.isFinite(n) && n > 0.08 && n < 0.4 ? n : 0.18;
 })();
 const GRID_RIGHT_ANCHOR_SPLIT = 0.94;
+const GRID_REBALANCE_MAX_PASSES = 4;
+const GRID_REBALANCE_TOLERANCE = 0.10;
 const GRID_WORKSPACE_LOOKUP_ATTEMPTS = 3;
 
 function cleanRef(value) {
@@ -2382,6 +2385,16 @@ function gridColumnSnapshot(column, order = column && column.order) {
   };
 }
 
+function gridStateSnapshot(wsRef, columns = gridRuntimeState.columns) {
+  return {
+    wsRef: cleanRef(wsRef),
+    columns: (Array.isArray(columns) ? columns : [])
+      .map((column, idx) => gridColumnSnapshot(column, idx))
+      .filter(Boolean),
+    lastRebalance: gridRuntimeState.lastRebalance || null,
+  };
+}
+
 function reindexGridColumns() {
   gridRuntimeState.columns.forEach((column, idx) => {
     column.order = idx;
@@ -2435,6 +2448,7 @@ async function ensureGridWorkspace() {
   gridRuntimeState.wsRef = ref;
   gridRuntimeState.anchorSurfaceRef = null;
   gridRuntimeState.columns = [];
+  gridRuntimeState.lastRebalance = null;
   return ref;
 }
 
@@ -2690,36 +2704,43 @@ function fallbackPaneRefByPosition(frames, excludedRefs, side) {
   return candidates[0].ref;
 }
 
-async function resizeGridBoundary(wsRef, paneRef, targetRightPx, cellWidthHintPx) {
-  const ref = cleanRef(paneRef);
-  if (!ref) return { resized: false, reason: 'missing pane ref' };
-  const panes = await readWorkspacePanes(wsRef);
-  const geometry = paneGeometryIndex(panes);
-  const frame = geometry.byRef.get(ref);
-  if (!frame) return { resized: false, reason: 'missing pane frame' };
-  const cellWidthPx = geometry.cellWidthPx || cellWidthHintPx || 8;
-  const diffPx = targetRightPx - (frame.x + frame.width);
-  if (Math.abs(diffPx) <= cellWidthPx) {
-    return { resized: false, reason: 'within one cell', diffPx };
-  }
-  const amount = Math.max(1, Math.round(Math.abs(diffPx) / cellWidthPx));
-  const direction = diffPx > 0 ? '-R' : '-L';
-  await cmux(['resize-pane', '--pane', ref, direction, '--amount', String(amount)]);
-  return { resized: true, paneRef: ref, direction, amount, diffPx };
+function gridRebalanceMetric(name, actualPx, targetPx, cellWidthPx, extra = {}) {
+  const actual = Number(actualPx);
+  const target = Number(targetPx);
+  const diffPx = actual - target;
+  const tolerancePx = Math.max(Number(cellWidthPx) || 1, Math.abs(target) * GRID_REBALANCE_TOLERANCE);
+  return {
+    name,
+    actualPx: Math.round(actual),
+    targetPx: Math.round(target),
+    diffPx: Math.round(diffPx),
+    tolerancePx: Math.round(tolerancePx),
+    withinTolerance: Math.abs(diffPx) <= tolerancePx,
+    ...extra,
+  };
 }
 
-async function rebalanceGridColumns(wsRef) {
-  const ref = cleanRef(wsRef);
-  if (!ref) return { rebalanced: false, reason: 'missing workspace ref' };
-  const columns = (Array.isArray(gridRuntimeState.columns) ? gridRuntimeState.columns : [])
-    .filter((column) => column && (!column.wsRef || column.wsRef === ref));
-  if (!columns.length) return { rebalanced: false, reason: 'no columns' };
+function gridRebalanceTargets(container, columnCount) {
+  const browserWidth = Math.max(1, Math.round(container.width * GRID_DASHBOARD_SPLIT));
+  const maxAnchorWidth = Math.max(1, container.width - browserWidth - columnCount);
+  const anchorWidth = Math.min(maxAnchorWidth, Math.max(1, Math.round(container.width * 0.02)));
+  const columnsWidth = container.width - browserWidth - anchorWidth;
+  if (columnsWidth <= 0) return null;
+  return {
+    containerWidth: container.width,
+    browserWidth,
+    anchorWidth,
+    columnWidth: columnsWidth / columnCount,
+    columnCount,
+    tolerance: GRID_REBALANCE_TOLERANCE,
+  };
+}
 
-  const panes = await readWorkspacePanes(ref);
+async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
+  const panes = await readWorkspacePanes(wsRef);
   const geometry = paneGeometryIndex(panes);
-  if (!geometry.frames.length) return { rebalanced: false, reason: 'missing pixel frames' };
+  if (!geometry.frames.length) return { ok: false, reason: 'missing pixel frames' };
 
-  const surfaces = await listWorkspaceSurfaces(ref);
   const browserSurface = gridBrowserAnchorSurface(surfaces);
   const anchorSurface = gridRightAnchorSurface(surfaces, columns);
   const columnPaneRefs = new Set(columns.flatMap(gridColumnPaneRefs));
@@ -2732,7 +2753,7 @@ async function rebalanceGridColumns(wsRef) {
     browserPaneRef = fallbackPaneRefByPosition(geometry.frames, excludedForBrowser, 'left');
   }
   if (!browserPaneRef || !geometry.byRef.has(browserPaneRef)) {
-    return { rebalanced: false, reason: 'missing browser pane frame' };
+    return { ok: false, reason: 'missing browser pane frame' };
   }
 
   let anchorPaneRef = anchorPaneRefFromSurface;
@@ -2742,7 +2763,7 @@ async function rebalanceGridColumns(wsRef) {
     anchorPaneRef = fallbackPaneRefByPosition(geometry.frames, excludedForAnchor, 'right');
   }
   if (!anchorPaneRef || !geometry.byRef.has(anchorPaneRef)) {
-    return { rebalanced: false, reason: 'missing right anchor pane frame' };
+    return { ok: false, reason: 'missing right anchor pane frame' };
   }
 
   const orderedColumns = columns
@@ -2759,49 +2780,133 @@ async function rebalanceGridColumns(wsRef) {
     .filter((item) => item.bounds && item.resizePaneRef)
     .sort((a, b) => a.bounds.x - b.bounds.x);
   if (orderedColumns.length !== columns.length) {
-    return { rebalanced: false, reason: 'missing column pane frames' };
+    return { ok: false, reason: 'missing column pane frames' };
   }
 
   const container = boundsForFrames(geometry.frames);
-  if (!container || container.width <= 0) return { rebalanced: false, reason: 'missing container frame' };
+  if (!container || container.width <= 0) return { ok: false, reason: 'missing container frame' };
+  const target = gridRebalanceTargets(container, orderedColumns.length);
+  if (!target) return { ok: false, reason: 'insufficient container width' };
 
-  const browserWidth = Math.max(1, Math.round(container.width * GRID_DASHBOARD_SPLIT));
-  const maxAnchorWidth = Math.max(1, container.width - browserWidth - orderedColumns.length);
-  const anchorWidth = Math.min(maxAnchorWidth, Math.max(40, Math.round(container.width * 0.02)));
-  const columnsWidth = container.width - browserWidth - anchorWidth;
-  if (columnsWidth <= 0) return { rebalanced: false, reason: 'insufficient container width' };
-
-  const columnWidth = columnsWidth / orderedColumns.length;
+  const browserFrame = geometry.byRef.get(browserPaneRef);
+  const anchorFrame = geometry.byRef.get(anchorPaneRef);
+  const measurements = [
+    gridRebalanceMetric('browser', browserFrame.width, target.browserWidth, geometry.cellWidthPx, { paneRef: browserPaneRef }),
+    ...orderedColumns.map((item, idx) => gridRebalanceMetric(
+      `column:${item.column.projectId || item.column.columnId || idx}`,
+      item.bounds.width,
+      target.columnWidth,
+      geometry.cellWidthPx,
+      { paneRef: item.resizePaneRef, index: idx },
+    )),
+    gridRebalanceMetric('rightAnchor', anchorFrame.width, target.anchorWidth, geometry.cellWidthPx, { paneRef: anchorPaneRef }),
+  ];
   const boundaries = [
-    { paneRef: browserPaneRef, targetRightPx: container.x + browserWidth },
+    { paneRef: browserPaneRef, targetRightPx: container.x + target.browserWidth },
     ...orderedColumns.map((item, idx) => ({
       paneRef: item.resizePaneRef,
-      targetRightPx: container.x + browserWidth + columnWidth * (idx + 1),
+      targetRightPx: container.x + target.browserWidth + target.columnWidth * (idx + 1),
     })),
   ];
-
-  const operations = [];
-  for (const boundary of boundaries) {
-    operations.push(await resizeGridBoundary(ref, boundary.paneRef, boundary.targetRightPx, geometry.cellWidthPx));
-  }
   return {
-    rebalanced: operations.some((item) => item && item.resized),
+    ok: true,
+    geometry,
+    target,
+    measurements,
+    boundaries,
+    withinTolerance: measurements.every((item) => item.withinTolerance),
+  };
+}
+
+async function resizeGridBoundary(wsRef, paneRef, targetRightPx, cellWidthHintPx) {
+  const ws = cleanRef(wsRef);
+  if (!ws) return { resized: false, reason: 'missing workspace ref' };
+  const ref = cleanRef(paneRef);
+  if (!ref) return { resized: false, reason: 'missing pane ref' };
+  const panes = await readWorkspacePanes(ws);
+  const geometry = paneGeometryIndex(panes);
+  const frame = geometry.byRef.get(ref);
+  if (!frame) return { resized: false, reason: 'missing pane frame' };
+  const cellWidthPx = geometry.cellWidthPx || cellWidthHintPx || 8;
+  const diffPx = targetRightPx - (frame.x + frame.width);
+  if (Math.abs(diffPx) <= cellWidthPx) {
+    return { resized: false, reason: 'within one cell', diffPx };
+  }
+  const amount = Math.max(1, Math.round(Math.abs(diffPx) / cellWidthPx));
+  const direction = diffPx > 0 ? '-R' : '-L';
+  await cmux(['resize-pane', '--workspace', ws, '--pane', ref, direction, '--amount', String(amount)]);
+  return { resized: true, workspace: ws, paneRef: ref, direction, amount, diffPx, targetRightPx };
+}
+
+async function rebalanceGridColumns(wsRef) {
+  const ref = cleanRef(wsRef);
+  if (!ref) return { rebalanced: false, error: 'missing workspace ref' };
+  const columns = (Array.isArray(gridRuntimeState.columns) ? gridRuntimeState.columns : [])
+    .filter((column) => column && (!column.wsRef || column.wsRef === ref));
+  if (!columns.length) return { rebalanced: false, error: 'no columns' };
+
+  const surfaces = await listWorkspaceSurfaces(ref);
+  const passes = [];
+  let changed = false;
+  let snapshot = null;
+  for (let pass = 1; pass <= GRID_REBALANCE_MAX_PASSES; pass += 1) {
+    snapshot = await readGridRebalanceSnapshot(ref, columns, surfaces);
+    if (!snapshot.ok) return { rebalanced: false, error: snapshot.reason, pass, passes };
+    if (snapshot.withinTolerance) {
+      const operations = passes.reduce((acc, item) => acc.concat(item.operations || []), []);
+      return {
+        rebalanced: true,
+        changed,
+        converged: true,
+        passCount: passes.length,
+        operations,
+        passes,
+        measurements: snapshot.measurements,
+        target: snapshot.target,
+      };
+    }
+
+    const operations = [];
+    for (const boundary of snapshot.boundaries) {
+      operations.push(await resizeGridBoundary(ref, boundary.paneRef, boundary.targetRightPx, snapshot.geometry.cellWidthPx));
+    }
+    const passChanged = operations.some((item) => item && item.resized);
+    changed = changed || passChanged;
+    passes.push({
+      pass,
+      operations,
+      measurements: snapshot.measurements,
+      target: snapshot.target,
+    });
+    if (!passChanged) break;
+  }
+
+  snapshot = await readGridRebalanceSnapshot(ref, columns, surfaces);
+  if (!snapshot.ok) return { rebalanced: false, error: snapshot.reason, passes };
+  const operations = passes.reduce((acc, item) => acc.concat(item.operations || []), []);
+  return {
+    rebalanced: snapshot.withinTolerance,
+    changed,
+    converged: snapshot.withinTolerance,
     operations,
-    target: {
-      containerWidth: container.width,
-      browserWidth,
-      anchorWidth,
-      columnWidth,
-      columnCount: orderedColumns.length,
-    },
+    passes,
+    passCount: passes.length,
+    measurements: snapshot.measurements,
+    target: snapshot.target,
+    ...(snapshot.withinTolerance ? {} : { error: `grid rebalance did not converge within ${GRID_REBALANCE_MAX_PASSES} passes` }),
   };
 }
 
 async function rebalanceGridColumnsBestEffort(wsRef) {
-  try { return await rebalanceGridColumns(wsRef); }
+  try {
+    const result = await rebalanceGridColumns(wsRef);
+    gridRuntimeState.lastRebalance = { ...result, checkedAt: new Date().toISOString() };
+    return gridRuntimeState.lastRebalance;
+  }
   catch (err) {
     console.warn(`grid column rebalance failed: ${summarizeError(err)}`);
-    return { rebalanced: false, error: summarizeError(err) };
+    gridRuntimeState.lastRebalance = { rebalanced: false, error: summarizeError(err), checkedAt: new Date().toISOString() };
+    return gridRuntimeState.lastRebalance;
   }
 }
 
@@ -2943,11 +3048,13 @@ async function rebuildGridWorkspace(columns, cfg = loadConfig()) {
     gridRuntimeState.wsRef = null;
     gridRuntimeState.anchorSurfaceRef = null;
     gridRuntimeState.columns = [];
-    return { wsRef: null, columns: [], closedWs, rebuilt: true };
+    gridRuntimeState.lastRebalance = null;
+    return { ...gridStateSnapshot(null, []), closedWs, rebuilt: true };
   }
 
   await closeGridWorkspaceIfPresent();
   gridRuntimeState.anchorSurfaceRef = null;
+  gridRuntimeState.lastRebalance = null;
   const layout = gridWorkspaceLayout(desired, cfg);
   const out = await cmux([
     'new-workspace',
@@ -2974,7 +3081,7 @@ async function rebuildGridWorkspace(columns, cfg = loadConfig()) {
   } catch (_) {
     gridRuntimeState.anchorSurfaceRef = null;
   }
-  return { wsRef, columns: rebuilt.map((column, idx) => gridColumnSnapshot(column, idx)), layout, rebuilt: true };
+  return { ...gridStateSnapshot(wsRef, rebuilt), layout, rebuilt: true };
 }
 
 function liveSurfaceIndex(surfaces) {
@@ -3002,12 +3109,13 @@ async function validateGridRuntimeState() {
     if (knownRef && knownRefCheck && !knownRefCheck.ok) {
       gridRuntimeState.wsRef = knownRef;
       reindexGridColumns();
-      return { wsRef: knownRef, columns: gridRuntimeState.columns.map((column, idx) => gridColumnSnapshot(column, idx)) };
+      return gridStateSnapshot(knownRef);
     }
     gridRuntimeState.wsRef = null;
     gridRuntimeState.anchorSurfaceRef = null;
     gridRuntimeState.columns = [];
-    return { wsRef: null, columns: [] };
+    gridRuntimeState.lastRebalance = null;
+    return gridStateSnapshot(null, []);
   }
 
   gridRuntimeState.wsRef = ws.ref;
@@ -3017,7 +3125,7 @@ async function validateGridRuntimeState() {
       column ? { ...column, wsRef: ws.ref } : column
     ));
     reindexGridColumns();
-    return { wsRef: ws.ref, columns: gridRuntimeState.columns.map((column, idx) => gridColumnSnapshot(column, idx)) };
+    return gridStateSnapshot(ws.ref);
   }
   const surfaces = surfaceState.surfaces;
   const byRef = liveSurfaceIndex(surfaces);
@@ -3040,7 +3148,7 @@ async function validateGridRuntimeState() {
     };
   });
   reindexGridColumns();
-  return { wsRef: ws.ref, columns: gridRuntimeState.columns.map((column, idx) => gridColumnSnapshot(column, idx)) };
+  return gridStateSnapshot(ws.ref);
 }
 
 async function getGridState() {
@@ -3119,6 +3227,7 @@ async function addProjectColumn(projectId, { focus = false } = {}) {
       gridRuntimeState.wsRef = null;
       gridRuntimeState.anchorSurfaceRef = null;
       gridRuntimeState.columns = [];
+      gridRuntimeState.lastRebalance = null;
     }
     throw err;
   }
@@ -3126,8 +3235,8 @@ async function addProjectColumn(projectId, { focus = false } = {}) {
   const next = await validateGridRuntimeState();
   const column = next.columns.find((item) => item && item.projectId === projectId);
   if (!column) throw new Error('grid column was not created: ' + projectId);
-  await rebalanceGridColumnsBestEffort(next.wsRef);
-  const response = { ...column, added: true, already: false, rebuilt: false, incremental: true };
+  const rebalance = await rebalanceGridColumnsBestEffort(next.wsRef);
+  const response = { ...column, added: true, already: false, rebuilt: false, incremental: true, rebalance, lastRebalance: rebalance };
   if (focus) response.focus = await focusGridWorkspace({ wsRef: next.wsRef });
   return response;
 }
@@ -3156,6 +3265,7 @@ async function removeProjectColumn(projectId) {
     gridRuntimeState.wsRef = null;
     gridRuntimeState.anchorSurfaceRef = null;
     gridRuntimeState.columns = [];
+    gridRuntimeState.lastRebalance = null;
     return {
       projectId,
       removed: true,
@@ -3167,6 +3277,7 @@ async function removeProjectColumn(projectId) {
       closedPaneRefs: closed.paneRefs,
       wsRef: null,
       columns: [],
+      lastRebalance: null,
     };
   }
 
@@ -3174,7 +3285,7 @@ async function removeProjectColumn(projectId) {
   reindexGridColumns();
   await settle();
   const result = await validateGridRuntimeState();
-  await rebalanceGridColumnsBestEffort(result.wsRef);
+  const rebalance = await rebalanceGridColumnsBestEffort(result.wsRef);
   return {
     projectId,
     removed: true,
@@ -3185,6 +3296,8 @@ async function removeProjectColumn(projectId) {
     closedSurfaces: closed.surfaceRefs,
     closedPaneRefs: closed.paneRefs,
     ...result,
+    rebalance,
+    lastRebalance: rebalance,
   };
 }
 

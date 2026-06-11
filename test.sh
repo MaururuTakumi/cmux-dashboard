@@ -920,31 +920,36 @@ process.stdout.write("OK " + surfaceRef + " " + paneRef + " " + workspace + "\n"
 NODE
     ;;
   resize-pane)
+    workspace=""
     pane=""
     direction=""
     amount=""
     while [ "\$#" -gt 0 ]; do
       case "\$1" in
+        --workspace) workspace="\${2:-}"; shift 2 ;;
         --pane) pane="\${2:-}"; shift 2 ;;
         --amount) amount="\${2:-}"; shift 2 ;;
         -L|-R|-U|-D) direction="\${1#-}"; shift ;;
         *) shift ;;
       esac
     done
-    "\$NODE_BIN" - "\$STATE" "\$pane" "\$direction" "\$amount" <<'NODE'
+    "\$NODE_BIN" - "\$STATE" "\$workspace" "\$pane" "\$direction" "\$amount" <<'NODE'
 const fs = require("fs");
 const file = process.argv[2];
-const pane = process.argv[3] || "";
-const direction = process.argv[4] || "";
-const amount = Number(process.argv[5] || "0");
+const workspace = process.argv[3] || "";
+const pane = process.argv[4] || "";
+const direction = process.argv[5] || "";
+const amount = Number(process.argv[6] || "0");
 let s = { commands: [], panes: [] };
 try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
 s.commands = Array.isArray(s.commands) ? s.commands : [];
-const target = (s.panes || []).find((item) => item && item.ref === pane);
+const target = (s.panes || []).find((item) => item && item.ref === pane && (!workspace || item.workspace === workspace))
+  || (s.panes || []).find((item) => item && item.ref === pane);
 s.commands.push({
   cmd: "resize-pane",
   pane,
   workspace: target && target.workspace || null,
+  workspaceArg: workspace || null,
   direction,
   amount,
 });
@@ -1668,6 +1673,7 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       ));
       check("grid G2: addProjectColumn issues resize-pane rebalance after add", (
         gridResizeCommands.length >= 1 &&
+        gridResizeCommands.every((item) => item && item.workspaceArg === initialGridRef) &&
         gridResizeCommands.some((item) => (
           item &&
           item.pane &&
