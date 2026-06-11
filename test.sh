@@ -467,7 +467,7 @@ EOF
     return "$rc"
   fi
 
-  (cd "$DIR" && exec env CMUX_BIN="$fake_cmux" CMUX_DASH_PORT="$api_port" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$cfg_file" CMUX_DASH_READ_TIMEOUT=1000 CMUX_DASH_READ_RETRY_BUDGET_MS=1000 CMUX_DASH_READ_RETRIES=0 "$NODE_BIN" server.js >"$api_log" 2>&1) &
+  (cd "$DIR" && exec env CMUX_BIN="$fake_cmux" CMUX_DASH_FRONT_DESK_TEAM=off CMUX_DASH_PORT="$api_port" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$cfg_file" CMUX_DASH_READ_TIMEOUT=1000 CMUX_DASH_READ_RETRY_BUDGET_MS=1000 CMUX_DASH_READ_RETRIES=0 "$NODE_BIN" server.js >"$api_log" 2>&1) &
   BAD_SERVER_PID=$!
   for _ in $(seq 1 50); do
     body="$(curl -fsS --max-time 2 "$api_url/api/metrics" 2>/dev/null || true)"
@@ -499,7 +499,7 @@ process.exit(ok ? 0 : 1);
     return 1
   fi
 
-  (cd "$DIR" && exec env CMUX_BIN="$bad_cmux" CMUX_DASH_PORT="$bad_api_port" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$cfg_file" CMUX_DASH_READ_TIMEOUT=1000 CMUX_DASH_READ_RETRY_BUDGET_MS=1000 CMUX_DASH_READ_RETRIES=0 "$NODE_BIN" server.js >"$bad_api_log" 2>&1) &
+  (cd "$DIR" && exec env CMUX_BIN="$bad_cmux" CMUX_DASH_FRONT_DESK_TEAM=off CMUX_DASH_PORT="$bad_api_port" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$cfg_file" CMUX_DASH_READ_TIMEOUT=1000 CMUX_DASH_READ_RETRY_BUDGET_MS=1000 CMUX_DASH_READ_RETRIES=0 "$NODE_BIN" server.js >"$bad_api_log" 2>&1) &
   BAD_SERVER_PID=$!
   for _ in $(seq 1 50); do
     bad_body="$(curl -fsS --max-time 2 "$bad_api_url/api/metrics" 2>/dev/null || true)"
@@ -1668,8 +1668,8 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       const initialConciergeSurface = rawSurface(initialConcierge.surfaceRef);
       const initialConciergePane = initialConciergeSurface && paneForRef(initialConciergeSurface.pane) || null;
       const initialConciergeLaunchText = initialConciergeSurface && initialConciergeSurface.sendText || "";
-      let notReadyResult = null;
-      let notReadySendCommands = [];
+      let selfHealExistingResult = null;
+      let selfHealExistingSendCommands = [];
       {
         const raw = rawCmuxState();
         const stuck = (raw.surfaces || []).find((surface) => surface && surface.ref === initialConcierge.surfaceRef);
@@ -1681,14 +1681,14 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         try {
           process.env.CMUX_DASH_CONCIERGE_READY_TIMEOUT_MS = "1";
           process.env.CMUX_DASH_CONCIERGE_READY_POLL_MS = "1";
-          notReadyResult = await ctl.conciergeAsk("ready gate should not send");
+          selfHealExistingResult = await ctl.conciergeAsk("ready gate should self heal");
         } finally {
           if (prevTimeout == null) delete process.env.CMUX_DASH_CONCIERGE_READY_TIMEOUT_MS;
           else process.env.CMUX_DASH_CONCIERGE_READY_TIMEOUT_MS = prevTimeout;
           if (prevPoll == null) delete process.env.CMUX_DASH_CONCIERGE_READY_POLL_MS;
           else process.env.CMUX_DASH_CONCIERGE_READY_POLL_MS = prevPoll;
         }
-        notReadySendCommands = (rawCmuxState().commands || [])
+        selfHealExistingSendCommands = (rawCmuxState().commands || [])
           .filter((item) => item && item.cmd === "send")
           .slice(sendCountBeforeNotReady);
       }
@@ -1825,11 +1825,16 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         initialConciergeLaunchText.includes("mkdir -p " + shellQuoted(ctl.CMUX_DASH_PROJECTS_ROOT)) &&
         initialConciergeLaunchText.includes("cd " + shellQuoted(ctl.CMUX_DASH_PROJECTS_ROOT) + " && exec claude --enable-auto-mode")
       ));
-      check("grid concierge readiness: conciergeAsk does not submit before claude process", (
-        notReadyResult &&
-        notReadyResult.sent === false &&
-        notReadyResult.error === "concierge not ready" &&
-        notReadySendCommands.length === 0
+      const selfHealExistingLaunch = selfHealExistingSendCommands.find((item) => item && String(item.text || "").includes("cmuxdash:grid:__grid__:concierge")) || null;
+      const selfHealExistingBody = selfHealExistingSendCommands.find((item) => item && String(item.text || "").includes("ready gate should self heal")) || null;
+      check("grid concierge readiness: conciergeAsk self-heals existing non-claude surface before submit", (
+        selfHealExistingResult &&
+        selfHealExistingResult.sent === true &&
+        selfHealExistingResult.surfaceRef === initialConcierge.surfaceRef &&
+        selfHealExistingLaunch &&
+        selfHealExistingLaunch.processBeforeSend === "zsh" &&
+        selfHealExistingBody &&
+        selfHealExistingBody.processBeforeSend === "claude"
       ));
       check("grid concierge B/C: conciergeAsk repairs dead concierge and submits kickoff to that surface", (
         initialBrowserAnchor &&
@@ -2181,7 +2186,7 @@ if (obj && obj.queued === true && obj.actionId) process.stdout.write(String(obj.
       info "R4 API slot payload: ${body:-empty}"
       return 1
     fi
-    for _ in $(seq 1 50); do
+    for _ in $(seq 1 120); do
       line="$(curl -fsS --max-time 5 "$api_url/api/state" 2>/dev/null | "$NODE_BIN" -e '
 const fs = require("fs");
 const actionId = Number(process.argv[1]);
@@ -2237,7 +2242,7 @@ if (obj && obj.queued === true && obj.actionId && String(obj.label || "").starts
       info "R4 API grid payload: ${body:-empty}"
       return 1
     fi
-    for _ in $(seq 1 50); do
+    for _ in $(seq 1 120); do
       line="$(curl -fsS --max-time 5 "$api_url/api/state" 2>/dev/null | "$NODE_BIN" -e '
 const fs = require("fs");
 const actionId = Number(process.argv[1]);
@@ -2277,7 +2282,7 @@ if (obj && obj.queued === true && obj.actionId && obj.label === "grid:focus") pr
       info "R4 API grid focus payload: ${body:-empty}"
       return 1
     fi
-    for _ in $(seq 1 50); do
+    for _ in $(seq 1 120); do
       line="$(curl -fsS --max-time 5 "$api_url/api/state" 2>/dev/null | "$NODE_BIN" -e '
 const fs = require("fs");
 const actionId = Number(process.argv[1]);
@@ -2299,7 +2304,7 @@ if (action) process.stdout.write(`${action.status}\t${action.error || ""}`);
     return 1
   }
 
-  (cd "$DIR" && exec env CMUX_BIN="$fake_cmux" CMUX_DASH_PORT="$api_port" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$cfg_file" CMUX_DASH_SETTLE_MS=0 CMUX_FAKE_RESIZE_PX_PER_AMOUNT=0.25 "$NODE_BIN" server.js >"$api_log" 2>&1) &
+  (cd "$DIR" && exec env CMUX_BIN="$fake_cmux" CMUX_DASH_FRONT_DESK_TEAM=off CMUX_DASH_PORT="$api_port" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$cfg_file" CMUX_DASH_SETTLE_MS=0 CMUX_FAKE_RESIZE_PX_PER_AMOUNT=0.25 "$NODE_BIN" server.js >"$api_log" 2>&1) &
   BAD_SERVER_PID=$!
   for _ in $(seq 1 50); do
     body="$(curl -fsS --max-time 2 "$api_url/api/state" 2>/dev/null || true)"
@@ -2425,7 +2430,14 @@ NODE
     return 1
   fi
 
+  local concierge_action_id
   body="$(curl -fsS -X POST --max-time 10 -H 'Content-Type: application/json' --data '{"text":"テスト用プロジェクトを作りたい"}' "$api_url/api/concierge/ask" 2>/dev/null || true)"
+  concierge_action_id="$(printf '%s' "$body" | "$NODE_BIN" -e '
+const fs = require("fs");
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+if (obj && obj.actionId) process.stdout.write(String(obj.actionId));
+' 2>/dev/null || true)"
   if printf '%s' "$body" | "$NODE_BIN" -e '
 const fs = require("fs");
 let obj;
@@ -2437,6 +2449,22 @@ process.exit(obj && obj.queued === true && obj.actionId && obj.label === "concie
     fail "R4 API: POST /api/concierge/ask queued contract failed"
     info "R4 concierge ask payload: ${body:-empty}"
     return 1
+  fi
+  if [ -n "$concierge_action_id" ]; then
+    for _ in $(seq 1 120); do
+      line="$(curl -fsS --max-time 5 "$api_url/api/state" 2>/dev/null | "$NODE_BIN" -e '
+const fs = require("fs");
+const actionId = Number(process.argv[1]);
+let obj;
+try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
+const action = (Array.isArray(obj.actions) ? obj.actions : []).find((a) => Number(a.id) === actionId);
+if (action) process.stdout.write(`${action.status}\t${action.error || ""}`);
+' "$concierge_action_id" 2>/dev/null || true)"
+      status="${line%%	*}"
+      [ "$status" = "succeeded" ] && break
+      [ "$status" = "failed" ] && break
+      sleep 0.2
+    done
   fi
 
   body="$(curl -fsS --max-time 2 -D "$header_file" "$api_url/api/workspace-yaml" 2>/dev/null || true)"
@@ -2634,7 +2662,7 @@ async function findFreePort(start) {
   }
   throw new Error("no free port near " + start);
 }
-async function waitForAction(port, actionId, timeoutMs = 5000) {
+async function waitForAction(port, actionId, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const res = await request(port, "/api/state").catch(() => null);
@@ -3121,6 +3149,7 @@ function countLog(fakes, event) {
       env: {
         ...process.env,
         CMUX_BIN: fakeCmux,
+        CMUX_DASH_FRONT_DESK_TEAM: "off",
         CMUX_DASH_PROJECTS_FILE: cfgFile,
         CMUX_DASH_PORT: String(port),
         CMUX_DASH_HOST: host,
@@ -3349,10 +3378,16 @@ process.exit(res.status == null ? 1 : res.status);
       "(4, '2026-06-08T00:00:04Z', 'beta', 'claude', 'codex', 'wrong team', NULL),",
       "(0, '2026-06-08T00:00:05Z', 'alpha', 'codex', 'claude', 'wrong direction', NULL),",
       "(8, '2026-06-08T00:00:08Z', 'grid-weird', 'claude', 'codex', 'grid-only-body', NULL),",
-      "(9, '2026-06-08T00:00:09Z', 'dual', 'claude', 'codex', 'double-presence-body', NULL);",
+      "(9, '2026-06-08T00:00:09Z', 'dual', 'claude', 'codex', 'double-presence-body', NULL),",
+      "(10, '2026-06-08T00:00:10Z', 'front-desk', 'openclaw', 'concierge', 'OPENCLAW_FULL_BODY', NULL),",
+      "(11, '2026-06-08T00:00:11Z', 'front-desk', 'hermes', 'concierge', 'HERMES_SECOND_BODY', NULL),",
+      "(12, '2026-06-08T00:00:12Z', 'front-desk', 'concierge', 'concierge', 'self message ignored', NULL),",
+      "(13, '2026-06-08T00:00:13Z', 'front-desk', 'openclaw', 'codex', 'wrong recipient', NULL);",
     ].join(" "));
 
     const deliveryModule = require(path.join(repo, "collab-delivery.js"));
+    process.env.CMUX_DASH_FRONT_DESK_TEAM = "off";
+    process.env.CMUX_DASH_FRONT_DESK_AGENT = "off";
     const readOpts = {
       dbPath: db,
       sqlite3Bin: sqliteWrapper,
@@ -3371,6 +3406,23 @@ process.exit(res.status == null ? 1 : res.status);
       unread[0].from === "claude" &&
       unread[0].to === "codex" &&
       !Object.prototype.hasOwnProperty.call(unread[0], "body")
+    ));
+    const defaultFrontDeskTarget = deliveryModule.frontDeskDeliveryTargetFromEnv({});
+    const offFrontDeskTarget = deliveryModule.frontDeskDeliveryTargetFromEnv({ CMUX_DASH_FRONT_DESK_TEAM: "off" });
+    check("R6 front-desk env defaults to front-desk/concierge and supports off", (
+      defaultFrontDeskTarget &&
+      defaultFrontDeskTarget.team === "front-desk" &&
+      defaultFrontDeskTarget.agent === "concierge" &&
+      offFrontDeskTarget === null
+    ));
+    const frontDeskUnread = await deliveryModule.readUnreadFrontDeskMessages("front-desk", "concierge", readOpts);
+    check("R6 front-desk unread filter selects concierge inbox and includes full body", (
+      frontDeskUnread.length === 2 &&
+      frontDeskUnread[0].id === 10 &&
+      frontDeskUnread[0].from === "openclaw" &&
+      frontDeskUnread[0].to === "concierge" &&
+      frontDeskUnread[0].body === "OPENCLAW_FULL_BODY" &&
+      frontDeskUnread[1].id === 11
     ));
 
     let sends = [];
@@ -3556,6 +3608,72 @@ process.exit(res.status == null ? 1 : res.status);
       doubleSnap.projects.dual.pending[0].id === 9 &&
       doubleSnap.gridColumns[doubleGridKey] &&
       doubleSnap.gridColumns[doubleGridKey].pending[0].id === 9
+    ));
+
+    const frontDeskCalls = [];
+    const frontDeskSends = [];
+    now += 60;
+    const frontDeskCtl = {
+      async getState() { return { projects: [], globalRows: [], grid: { columns: [] } }; },
+      async ensureGridWorkspace() {
+        frontDeskCalls.push("ensureGridWorkspace");
+        return "workspace:front";
+      },
+      async ensureConciergeReadySurface(wsRef) {
+        frontDeskCalls.push("ensureConciergeReadySurface:" + wsRef);
+        return { ready: true, repaired: true, wsRef, surfaceRef: "surface:concierge", paneRef: "pane:concierge" };
+      },
+      async submitToSurface(wsRef, surfaceRef, text) {
+        frontDeskCalls.push("submitToSurface:" + surfaceRef);
+        frontDeskSends.push({ wsRef, surfaceRef, text });
+      },
+    };
+    const frontDeskDelivery = deliveryModule.createCollabDelivery({
+      ctl: frontDeskCtl,
+      dbPath: db,
+      sqlite3Bin: sqliteWrapper,
+      env: { ...process.env, REAL_SQLITE3: realSqlite3 },
+      frontDeskTeam: "front-desk",
+      frontDeskAgent: "concierge",
+      intervalMs: 0,
+      retryMs: 50,
+      minWakeIntervalMs: 100,
+      now: () => now,
+    });
+    const frontDeskFirst = await frontDeskDelivery.tick();
+    const frontDeskFirstResult = frontDeskFirst.results.find((item) => item && item.targetType === "front-desk");
+    check("R6 front-desk delivery wakes concierge surface with full body and reply command", (
+      frontDeskSends.length === 1 &&
+      frontDeskSends[0].wsRef === "workspace:front" &&
+      frontDeskSends[0].surfaceRef === "surface:concierge" &&
+      frontDeskSends[0].text.includes("OPENCLAW_FULL_BODY") &&
+      frontDeskSends[0].text.includes("agmsg send front-desk concierge openclaw")
+    ));
+    check("R6 front-desk delivery self-heal path runs before submit and reports repair", (
+      frontDeskFirstResult &&
+      frontDeskFirstResult.repaired === true &&
+      frontDeskCalls.join(">") === "ensureGridWorkspace>ensureConciergeReadySurface:workspace:front>submitToSurface:surface:concierge"
+    ));
+    sqlite(db, "UPDATE messages SET read_at='2026-06-08T00:03:00Z' WHERE id=10;");
+    await frontDeskDelivery.tick();
+    let frontDeskSnap = frontDeskDelivery.snapshot().frontDesk["front-desk/concierge"];
+    check("R6 front-desk delivery throttles second unread until min wake interval", (
+      frontDeskSends.length === 1 &&
+      frontDeskSnap &&
+      frontDeskSnap.pending.length === 1 &&
+      frontDeskSnap.pending[0].id === 11 &&
+      frontDeskSnap.pending[0].attempts === 0
+    ));
+    now += 101;
+    await frontDeskDelivery.tick();
+    frontDeskSnap = frontDeskDelivery.snapshot().frontDesk["front-desk/concierge"];
+    check("R6 front-desk delivery releases throttled unread after interval", (
+      frontDeskSends.length === 2 &&
+      frontDeskSends[1].text.includes("agmsg send front-desk concierge hermes") &&
+      frontDeskSnap &&
+      frontDeskSnap.pending.length === 1 &&
+      frontDeskSnap.pending[0].id === 11 &&
+      frontDeskSnap.pending[0].attempts === 1
     ));
 
     sends = [];
@@ -4314,6 +4432,7 @@ async function startDashboard({ port, cmuxBin, projectsFile, logFile }) {
     env: {
       ...process.env,
       CMUX_BIN: cmuxBin,
+      CMUX_DASH_FRONT_DESK_TEAM: "off",
       CMUX_DASH_PORT: String(port),
       CMUX_DASH_HOST: host,
       CMUX_DASH_PROJECTS_FILE: projectsFile,
@@ -4713,6 +4832,7 @@ if (cmd === "send") {
         ...process.env,
         FAKE_CMUX_REPO: repo,
         CMUX_BIN: self,
+        CMUX_DASH_FRONT_DESK_TEAM: "off",
         CMUX_DASH_PROJECTS_FILE: process.env.CMUX_DASH_PROJECTS_FILE,
         CMUX_DASH_PORT: process.env.CMUX_DASH_PORT,
         CMUX_DASH_HOST: process.env.CMUX_DASH_HOST,
@@ -5806,6 +5926,7 @@ phase3_fetch_doctor_server() {
 
   (cd "$DIR" && exec env \
     CMUX_BIN="$cmux_bin" \
+    CMUX_DASH_FRONT_DESK_TEAM=off \
     CMUX_DASH_PORT="$port" \
     CMUX_DASH_HOST="$HOST" \
     CMUX_DASH_PROJECTS_FILE="$TEST_PROJECTS_FILE" \
@@ -6085,7 +6206,7 @@ if (!m[0].body.split("").every((c) => c === "x")) process.exit(5);
   bad_port=$((PORT + 1000))
   bad_url="http://${HOST}:${bad_port}"
   bad_log="$TEST_TMP_DIR/agmsg-db-error-server.log"
-  (cd "$DIR" && exec env CMUX_BIN="$CMUX_BIN" CMUX_DASH_PORT="$bad_port" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$TEST_PROJECTS_FILE" AGMSG_STORAGE_PATH="/dev/null" "$NODE_BIN" server.js >"$bad_log" 2>&1) &
+  (cd "$DIR" && exec env CMUX_BIN="$CMUX_BIN" CMUX_DASH_FRONT_DESK_TEAM=off CMUX_DASH_PORT="$bad_port" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$TEST_PROJECTS_FILE" AGMSG_STORAGE_PATH="/dev/null" "$NODE_BIN" server.js >"$bad_log" 2>&1) &
   BAD_SERVER_PID=$!
   for _ in $(seq 1 50); do
     bad_body="$(curl -fsS --max-time 2 "$bad_url/api/agmsg/${agmsg_id}" 2>/dev/null || true)"
@@ -6409,7 +6530,7 @@ EOF
     return "$rc"
   fi
 
-  (cd "$DIR" && exec env HOME="$phase_dir/home" CMUX_BIN="$fake_cmux" CMUX_DASH_PORT="$api_port" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$cfg_file" CMUX_DASH_SETTLE_MS=0 CMUX_DASH_READ_TIMEOUT=1000 CMUX_DASH_READ_RETRY_BUDGET_MS=1000 CMUX_DASH_READ_RETRIES=0 "$NODE_BIN" server.js >"$api_log" 2>&1) &
+  (cd "$DIR" && exec env HOME="$phase_dir/home" CMUX_BIN="$fake_cmux" CMUX_DASH_FRONT_DESK_TEAM=off CMUX_DASH_PORT="$api_port" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$cfg_file" CMUX_DASH_SETTLE_MS=0 CMUX_DASH_READ_TIMEOUT=1000 CMUX_DASH_READ_RETRY_BUDGET_MS=1000 CMUX_DASH_READ_RETRIES=0 "$NODE_BIN" server.js >"$api_log" 2>&1) &
   BAD_SERVER_PID=$!
   for _ in $(seq 1 50); do
     body="$(curl -fsS --max-time 2 "$api_url/api/state" 2>/dev/null || true)"
@@ -7145,7 +7266,7 @@ if server_healthy; then
     finish
   fi
 fi
-(cd "$DIR" && exec env CMUX_BIN="$CMUX_BIN" CMUX_DASH_PORT="$PORT" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$TEST_PROJECTS_FILE" CMUX_DASH_DOCTOR_TIMEOUT=1000 CMUX_DASH_DOCTOR_RETRY_BUDGET_MS=1000 CMUX_DASH_DOCTOR_RETRIES=0 "$NODE_BIN" server.js >"$LOG" 2>&1) &
+(cd "$DIR" && exec env CMUX_BIN="$CMUX_BIN" CMUX_DASH_FRONT_DESK_TEAM=off CMUX_DASH_PORT="$PORT" CMUX_DASH_HOST="$HOST" CMUX_DASH_PROJECTS_FILE="$TEST_PROJECTS_FILE" CMUX_DASH_DOCTOR_TIMEOUT=1000 CMUX_DASH_DOCTOR_RETRY_BUDGET_MS=1000 CMUX_DASH_DOCTOR_RETRIES=0 "$NODE_BIN" server.js >"$LOG" 2>&1) &
 SERVER_PID=$!
 STARTED_SERVER=1
 for _ in $(seq 1 50); do

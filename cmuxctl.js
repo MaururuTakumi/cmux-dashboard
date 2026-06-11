@@ -3544,6 +3544,24 @@ async function ensureConciergeSurface(wsRef) {
   };
 }
 
+async function ensureConciergeReadySurface(wsRef) {
+  const ref = cleanRef(wsRef);
+  if (!ref) throw new Error('grid workspace ref is required');
+  const concierge = await ensureConciergeSurface(ref);
+  let ready = await waitForConciergeReady(ref, concierge);
+  if (ready.ready) {
+    return { ...ready, wsRef: ref, marker: GRID_CONCIERGE_MARKER, repaired: false };
+  }
+
+  const surfaceRef = cleanRef(ready.surfaceRef || concierge && (concierge.surfaceRef || concierge.ref));
+  if (surfaceRef) {
+    await launchGridConciergeSurface(ref, surfaceRef);
+    await settle(Math.min(CMUX_SETTLE_MS, 500));
+    ready = await waitForConciergeReady(ref, { ...concierge, surfaceRef });
+  }
+  return { ...ready, wsRef: ref, marker: GRID_CONCIERGE_MARKER, repaired: true };
+}
+
 async function listGridTerminalSurfacesWithRetry(wsRef, expectedCount, attempts = 6) {
   let terminals = [];
   for (let i = 0; i < attempts; i += 1) {
@@ -3821,17 +3839,16 @@ function conciergeKickoffText(text) {
 
 async function conciergeAsk(text) {
   const wsRef = await ensureGridWorkspace();
-  const concierge = await ensureConciergeSurface(wsRef);
   const kickoffText = conciergeKickoffText(text);
-  const ready = await waitForConciergeReady(wsRef, concierge);
-  const surfaceRef = cleanRef(ready.surfaceRef || concierge && (concierge.surfaceRef || concierge.ref));
+  const ready = await ensureConciergeReadySurface(wsRef);
+  const surfaceRef = cleanRef(ready.surfaceRef || ready.ref);
   if (!ready.ready) {
     return {
       sent: false,
       error: 'concierge not ready',
       wsRef,
       surfaceRef,
-      paneRef: ready.paneRef || concierge && concierge.paneRef || null,
+      paneRef: ready.paneRef || null,
       marker: GRID_CONCIERGE_MARKER,
       kickoffText,
     };
@@ -3841,7 +3858,7 @@ async function conciergeAsk(text) {
     sent: true,
     wsRef,
     surfaceRef,
-    paneRef: ready.paneRef || concierge && concierge.paneRef || null,
+    paneRef: ready.paneRef || null,
     marker: GRID_CONCIERGE_MARKER,
     kickoffText,
   };
@@ -4307,7 +4324,7 @@ module.exports = {
   agmsgDbPath, getTeamMessages,
   createCmuxHealthTracker, getCmuxHealth, pingCmuxForRecovery,
   getState, getWorkspaceYaml, getProjectState, ensureSlot, ensureCollabSlots, sendToSurface, submitToSurface, loadConfig, saveConfig, openProject, closeProject, focusProject,
-  workspaceRefExists, ensureGridWorkspace, ensureConciergeSurface, conciergeAsk, focusGridWorkspace, addProjectColumn, removeProjectColumn, rebalanceGridColumns, getGridState, gridWorkspaceLayout,
+  workspaceRefExists, ensureGridWorkspace, ensureConciergeSurface, ensureConciergeReadySurface, conciergeAsk, focusGridWorkspace, addProjectColumn, removeProjectColumn, rebalanceGridColumns, getGridState, gridWorkspaceLayout,
   openAll, closeAll, reorderProjects, addProject, removeProject, expandHome, rowCwd, rowCwdInfo, normalizeCollabProjectDir, normalizeCollabProjectDirInfo,
   projectKind, isGlobalProject, configuredRows, configuredProjectRows, configuredGlobalRows,
 };

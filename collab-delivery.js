@@ -10,6 +10,8 @@ const ctl = require('./cmuxctl');
 // the same send is swallowed into the input box rather than submitting). Do NOT
 // append \n / \r here — submitToSurface adds the submitting Enter itself.
 const DEFAULT_WAKE_TEXT = '[cmux-dashboard] New message from claude in this project. In this same turn, do not stop after only reading: (1) run `agmsg inbox` to read it, (2) follow the collab protocol in CLAUDE.md — if it is a plan-agreed task, implement it and run the tests; if anything is ambiguous, unapproved, or irreversible, do NOT guess, (3) ALWAYS reply to claude with `agmsg send` — either a success report with the test evidence, or a concrete blocker/question.';
+const DEFAULT_FRONT_DESK_TEAM = 'front-desk';
+const DEFAULT_FRONT_DESK_AGENT = 'concierge';
 
 function intEnv(name, fallback) {
   const n = parseInt(process.env[name] || '', 10);
@@ -47,6 +49,10 @@ function boundedInt(value, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } 
   const n = Number.parseInt(value, 10);
   if (!Number.isFinite(n) || n < min) return fallback;
   return Math.min(n, max);
+}
+
+function offValue(value) {
+  return /^(0|false|no|off|disabled)$/i.test(String(value || '').trim());
 }
 
 async function resolveDbPath(opts = {}) {
@@ -87,6 +93,32 @@ async function readUnreadWakeMessages(team, opts = {}) {
   })).filter((row) => row.id > 0);
 }
 
+async function readUnreadFrontDeskMessages(team, agent, opts = {}) {
+  const normalizedTeam = (opts.teamName || ctl.teamName)(team || DEFAULT_FRONT_DESK_TEAM);
+  const normalizedAgent = String(agent || DEFAULT_FRONT_DESK_AGENT).trim();
+  const limit = boundedInt(opts.limit, 20, { min: 1, max: 200 });
+  const sql = [
+    'SELECT id, created_at AS createdAt, team, from_agent AS "from", to_agent AS "to", body, read_at AS readAt',
+    'FROM messages',
+    `WHERE team = ${sqlString(normalizedTeam)}`,
+    `AND to_agent = ${sqlString(normalizedAgent)}`,
+    `AND from_agent <> ${sqlString(normalizedAgent)}`,
+    'AND read_at IS NULL',
+    'ORDER BY id ASC',
+    `LIMIT ${limit};`,
+  ].join(' ');
+  const rows = await sqliteJson(sql, opts);
+  return rows.map((row) => ({
+    id: Number(row.id) || 0,
+    createdAt: row.createdAt || null,
+    team: row.team || normalizedTeam,
+    from: row.from || '',
+    to: row.to || normalizedAgent,
+    body: row.body == null ? '' : String(row.body),
+    readAt: row.readAt || null,
+  })).filter((row) => row.id > 0);
+}
+
 async function readDeliveryStatus(team, messageId, opts = {}) {
   const normalizedTeam = (opts.teamName || ctl.teamName)(team);
   const id = boundedInt(messageId, 0, { min: 1 });
@@ -103,6 +135,35 @@ async function readDeliveryStatus(team, messageId, opts = {}) {
     `WHERE m.team = ${sqlString(normalizedTeam)} AND m.id = ${id}`,
     'LIMIT 1;',
   ].join(' ');
+  const rows = await sqliteJson(sql, opts);
+  const row = rows[0] || {};
+  const replyId = Number(row.replyId) || null;
+  const readAt = row.readAt || null;
+  return { delivered: !!(readAt || replyId), readAt, replyId, missing: !rows.length };
+}
+
+async function readFrontDeskDeliveryStatus(team, agent, messageId, fromAgent, opts = {}) {
+  const normalizedTeam = (opts.teamName || ctl.teamName)(team || DEFAULT_FRONT_DESK_TEAM);
+  const normalizedAgent = String(agent || DEFAULT_FRONT_DESK_AGENT).trim();
+  const from = String(fromAgent || '').trim();
+  const id = boundedInt(messageId, 0, { min: 1 });
+  if (!id) return { delivered: false, readAt: null, replyId: null, missing: true };
+  const fromClause = from ? `AND m.from_agent = ${sqlString(from)}` : '';
+  const sql = [
+    'SELECT m.id, m.read_at AS readAt,',
+    '(SELECT r.id FROM messages r',
+    `WHERE r.team = ${sqlString(normalizedTeam)}`,
+    `AND r.from_agent = ${sqlString(normalizedAgent)}`,
+    'AND r.to_agent = m.from_agent',
+    'AND r.id > m.id',
+    'ORDER BY r.id ASC LIMIT 1) AS replyId',
+    'FROM messages m',
+    `WHERE m.team = ${sqlString(normalizedTeam)}`,
+    `AND m.to_agent = ${sqlString(normalizedAgent)}`,
+    `AND m.id = ${id}`,
+    fromClause,
+    'LIMIT 1;',
+  ].filter(Boolean).join(' ');
   const rows = await sqliteJson(sql, opts);
   const row = rows[0] || {};
   const replyId = Number(row.replyId) || null;
@@ -127,6 +188,7 @@ function isPaneDeliveryActiveProject(row) {
 function targetSurfaceRef(target) {
   return target && (
     target.surfaceRef ||
+    target.ref ||
     (target.slotRefs && target.slotRefs.cdx) ||
     (target.cdx && target.cdx.surfaceRef) ||
     null
@@ -205,6 +267,38 @@ function deliveryTargetsFromState(state, ctlRef = ctl) {
   return targets;
 }
 
+function frontDeskDeliveryTargetFromEnv(env = process.env, opts = {}) {
+  if (opts.frontDeskEnabled === false) return null;
+  const teamValue = opts.frontDeskTeam != null ? opts.frontDeskTeam : env.CMUX_DASH_FRONT_DESK_TEAM;
+  const agentValue = opts.frontDeskAgent != null ? opts.frontDeskAgent : env.CMUX_DASH_FRONT_DESK_AGENT;
+  const team = String(teamValue || DEFAULT_FRONT_DESK_TEAM).trim();
+  const agent = String(agentValue || DEFAULT_FRONT_DESK_AGENT).trim();
+  if (!team || !agent || offValue(team) || offValue(agent)) return null;
+  return {
+    key: `front-desk:${team}:${agent}`,
+    id: `${team}/${agent}`,
+    type: 'front-desk',
+    team,
+    agent,
+  };
+}
+
+function frontDeskWakeText(message, target = {}) {
+  const team = target.team || message.team || DEFAULT_FRONT_DESK_TEAM;
+  const agent = target.agent || message.to || DEFAULT_FRONT_DESK_AGENT;
+  const from = String(message.from || '<from>').trim() || '<from>';
+  const body = message.body == null ? '' : String(message.body);
+  return [
+    '[cmux-dashboard] front-desk message for concierge.',
+    `team=${team} to=${agent} from=${from} message_id=${message.id}`,
+    '',
+    '本文全文:',
+    body,
+    '',
+    `返信は agmsg send ${team} ${agent} ${from} "<返信本文>" を実行してください。`,
+  ].join('\n');
+}
+
 class CollabDelivery {
   constructor(opts = {}) {
     this.ctl = opts.ctl || ctl;
@@ -216,7 +310,12 @@ class CollabDelivery {
     this.logger = opts.logger || console;
     this.readUnread = opts.readUnreadWakeMessages || ((team) => readUnreadWakeMessages(team, opts));
     this.readStatus = opts.readDeliveryStatus || ((team, id) => readDeliveryStatus(team, id, opts));
+    this.readFrontDesk = opts.readUnreadFrontDeskMessages || ((team, agent) => readUnreadFrontDeskMessages(team, agent, opts));
+    this.readFrontDeskStatus = opts.readFrontDeskDeliveryStatus || ((team, agent, id, from) => readFrontDeskDeliveryStatus(team, agent, id, from, opts));
     this.sendWake = opts.sendWake || ((target, text) => this.ctl.submitToSurface(target.wsRef, targetSurfaceRef(target), text));
+    this.sendFrontDeskWake = opts.sendFrontDeskWake || ((target, text) => this.defaultSendFrontDeskWake(target, text));
+    this.frontDeskWakeText = opts.frontDeskWakeText || ((message, target) => frontDeskWakeText(message, target));
+    this.frontDeskTargetFactory = opts.frontDeskTargetFactory || (() => frontDeskDeliveryTargetFromEnv(opts.env || process.env, opts));
     this.states = new Map();
     this.inFlight = false;
     this.timer = null;
@@ -302,14 +401,16 @@ class CollabDelivery {
   snapshot() {
     const projects = {};
     const gridColumns = {};
+    const frontDesk = {};
     const targets = {};
     for (const [id, state] of this.states.entries()) {
       const snap = this.stateSnapshot(state);
       targets[id] = snap;
       if (state.type === 'grid-column') gridColumns[id] = snap;
+      else if (state.type === 'front-desk') frontDesk[state.id || id] = snap;
       else projects[state.projectId || state.id || id] = snap;
     }
-    return { inFlight: this.inFlight, projects, gridColumns, targets };
+    return { inFlight: this.inFlight, projects, gridColumns, frontDesk, targets };
   }
 
   async tick() {
@@ -318,6 +419,8 @@ class CollabDelivery {
     try {
       const state = await this.ctl.getState();
       const targets = deliveryTargetsFromState(state, this.ctl);
+      const seen = new Set(targets.map((target) => target.key));
+      pushTarget(targets, seen, this.frontDeskTarget());
       this.pruneMissingTargets(new Set(targets.map((target) => target.key)));
       const results = [];
       for (const target of targets) {
@@ -329,13 +432,17 @@ class CollabDelivery {
     }
   }
 
+  frontDeskTarget() {
+    return this.frontDeskTargetFactory ? this.frontDeskTargetFactory() : null;
+  }
+
   async processTarget(target) {
     const projectState = this.stateFor(target);
     const team = target.team || this.ctl.teamName(target.projectId || target.id);
     try {
       const pending = Array.from(projectState.pending.values()).sort((a, b) => a.id - b.id);
       for (const item of pending) {
-        const status = await this.readStatus(team, item.id);
+        const status = await this.readStatusForTarget(target, item);
         if (status.delivered) {
           this.markDelivered(projectState, item.id);
           continue;
@@ -346,10 +453,10 @@ class CollabDelivery {
         return { id: target.id, targetKey: target.key, targetType: target.type, pending: item.id, sent: false, reason: 'pending' };
       }
 
-      const messages = await this.readUnread(team);
+      const messages = await this.readUnreadForTarget(target, team);
       for (const message of messages) {
         if (projectState.completed.has(message.id)) continue;
-        const status = await this.readStatus(team, message.id);
+        const status = await this.readStatusForTarget(target, message);
         if (status.delivered) {
           this.markDelivered(projectState, message.id);
           continue;
@@ -367,6 +474,52 @@ class CollabDelivery {
     }
   }
 
+  async readUnreadForTarget(target, team) {
+    if (target && target.type === 'front-desk') return this.readFrontDesk(target.team, target.agent);
+    return this.readUnread(team);
+  }
+
+  async readStatusForTarget(target, message) {
+    const team = target.team || this.ctl.teamName(target.projectId || target.id);
+    if (target && target.type === 'front-desk') {
+      return this.readFrontDeskStatus(target.team, target.agent, message.id, message.from);
+    }
+    return this.readStatus(team, message.id);
+  }
+
+  wakeTextForTarget(target, message) {
+    if (target && target.type === 'front-desk') return this.frontDeskWakeText(message, target);
+    return this.wakeText;
+  }
+
+  async sendWakeForTarget(target, text) {
+    if (target && target.type === 'front-desk') return this.sendFrontDeskWake(target, text);
+    return this.sendWake(target, text);
+  }
+
+  async defaultSendFrontDeskWake(target, text) {
+    if (!this.ctl.ensureGridWorkspace || !this.ctl.submitToSurface) {
+      throw new Error('front-desk delivery requires ensureGridWorkspace and submitToSurface');
+    }
+    const wsRef = await this.ctl.ensureGridWorkspace();
+    let ready = null;
+    if (this.ctl.ensureConciergeReadySurface) {
+      ready = await this.ctl.ensureConciergeReadySurface(wsRef);
+    } else {
+      if (!this.ctl.ensureConciergeSurface) throw new Error('front-desk delivery requires ensureConciergeSurface');
+      const concierge = await this.ctl.ensureConciergeSurface(wsRef);
+      if (this.ctl.waitForConciergeReady) ready = await this.ctl.waitForConciergeReady(wsRef, concierge);
+      else ready = { ready: true, wsRef, surfaceRef: targetSurfaceRef(concierge), paneRef: concierge && concierge.paneRef || null };
+    }
+    const surfaceRef = targetSurfaceRef(ready);
+    if (!ready || !ready.ready || !surfaceRef) {
+      const suffix = ready && ready.timeoutMs ? ` after ${ready.timeoutMs}ms` : '';
+      throw new Error(`concierge not ready${suffix}`);
+    }
+    await this.ctl.submitToSurface(ready.wsRef || wsRef, surfaceRef, text);
+    return { ...ready, wsRef: ready.wsRef || wsRef, surfaceRef };
+  }
+
   canWake(projectState) {
     return this.now() - (projectState.lastWakeAt || 0) >= this.minWakeIntervalMs;
   }
@@ -379,6 +532,8 @@ class CollabDelivery {
       nextRetryAt,
       lastSentAt: attempts > 0 ? this.now() : null,
       lastError: null,
+      from: message.from || null,
+      to: message.to || null,
     };
   }
 
@@ -395,11 +550,13 @@ class CollabDelivery {
     };
     projectState.pending.set(message.id, pending);
     try {
-      await this.sendWake(target, this.wakeText);
+      const deliveryInfo = await this.sendWakeForTarget(target, this.wakeTextForTarget(target, message));
       projectState.lastWakeAt = this.now();
       projectState.sentHighWater = Math.max(projectState.sentHighWater || 0, message.id);
       projectState.lastError = null;
-      return { id: target.id, targetKey: target.key, targetType: target.type, messageId: message.id, sent: true, reason, attempts };
+      const result = { id: target.id, targetKey: target.key, targetType: target.type, messageId: message.id, sent: true, reason, attempts };
+      if (deliveryInfo && deliveryInfo.repaired) result.repaired = true;
+      return result;
     } catch (e) {
       pending.lastError = summarizeError(e);
       projectState.lastError = pending.lastError;
@@ -423,11 +580,17 @@ function createCollabDelivery(opts = {}) {
 module.exports = {
   DEFAULT_WAKE_TEXT,
   CollabDelivery,
+  DEFAULT_FRONT_DESK_AGENT,
+  DEFAULT_FRONT_DESK_TEAM,
   createCollabDelivery,
   deliveryTargetsFromState,
+  frontDeskDeliveryTargetFromEnv,
+  frontDeskWakeText,
   gridColumnDeliveryTarget,
   isPaneDeliveryActiveProject,
   projectDeliveryTarget,
+  readFrontDeskDeliveryStatus,
+  readUnreadFrontDeskMessages,
   readDeliveryStatus,
   readUnreadWakeMessages,
   sqliteJson,
