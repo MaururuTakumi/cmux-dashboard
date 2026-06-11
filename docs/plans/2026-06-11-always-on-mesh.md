@@ -11,3 +11,11 @@
 bin/launchd の plist を実際に gui domain へ bootstrap する install/uninstall スクリプト(bin/install-launchd.sh)。再起動後も openclaw/hermes ブリッジが自動復活。README追記。
 ## 受入(E2E)
 Discord→openclaw→front-desk→(サーバー配信)→コンシェルジュペインのclaudeが**可視で**動く→返信がDiscordへ。サーバー再起動・ペインkill後も自己復旧。Opusが静的照合+再現。
+## 補遺: エージェント別ウェイク方式マトリクス(ベストプラクティス・ユーザー合意)
+| エージェント | Monitor有無 | 常時オンの起こし方(全てbash監視=トークンゼロ) |
+|---|---|---|
+| claude(コンシェルジュ/CCペイン) | あり | dashboardサーバーのfront-desk配信(S1) or agmsg monitorモード |
+| codex(ペイン) | **なし** | collab-delivery のペイン注入(既存・サーバー常駐で常時オン) |
+| codex(ヘッドレス) | なし | claude-codex-collab のプロセスブリッジ |
+| openclaw / hermes | なし | agmsg-bridge.sh + launchd 常駐(S2) |
+原則: 「Monitorが無いエージェントはブリッジ(bash)が代わりに見張る」。LLMは新着時のみ起動。
