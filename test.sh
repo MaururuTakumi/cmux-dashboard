@@ -1167,7 +1167,8 @@ const text = process.argv[5] || "";
 let s = { surfaces: [] };
 try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
 s.commands = Array.isArray(s.commands) ? s.commands : [];
-s.commands.push({ cmd: "send", surface, workspace, text });
+const targetBefore = (s.surfaces || []).find((item) => item && item.ref === surface) || null;
+s.commands.push({ cmd: "send", surface, workspace, text, processBeforeSend: targetBefore && targetBefore.process || null });
 const match = text.match(/cmuxdash:slot:(cc|cdx|yazi|term)/);
 const gridMatch = text.match(/(cmuxdash:grid:[^\s']+:slot:(cc|cdx))/);
 const conciergeMatch = text.match(/(cmuxdash:grid:__grid__:concierge)/);
@@ -1666,6 +1667,31 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       const initialConcierge = initialGridState.concierge || {};
       const initialConciergeSurface = rawSurface(initialConcierge.surfaceRef);
       const initialConciergePane = initialConciergeSurface && paneForRef(initialConciergeSurface.pane) || null;
+      const initialConciergeLaunchText = initialConciergeSurface && initialConciergeSurface.sendText || "";
+      let notReadyResult = null;
+      let notReadySendCommands = [];
+      {
+        const raw = rawCmuxState();
+        const stuck = (raw.surfaces || []).find((surface) => surface && surface.ref === initialConcierge.surfaceRef);
+        if (stuck) stuck.process = "zsh";
+        writeCmuxState(raw);
+        const sendCountBeforeNotReady = (rawCmuxState().commands || []).filter((item) => item && item.cmd === "send").length;
+        const prevTimeout = process.env.CMUX_DASH_CONCIERGE_READY_TIMEOUT_MS;
+        const prevPoll = process.env.CMUX_DASH_CONCIERGE_READY_POLL_MS;
+        try {
+          process.env.CMUX_DASH_CONCIERGE_READY_TIMEOUT_MS = "1";
+          process.env.CMUX_DASH_CONCIERGE_READY_POLL_MS = "1";
+          notReadyResult = await ctl.conciergeAsk("ready gate should not send");
+        } finally {
+          if (prevTimeout == null) delete process.env.CMUX_DASH_CONCIERGE_READY_TIMEOUT_MS;
+          else process.env.CMUX_DASH_CONCIERGE_READY_TIMEOUT_MS = prevTimeout;
+          if (prevPoll == null) delete process.env.CMUX_DASH_CONCIERGE_READY_POLL_MS;
+          else process.env.CMUX_DASH_CONCIERGE_READY_POLL_MS = prevPoll;
+        }
+        notReadySendCommands = (rawCmuxState().commands || [])
+          .filter((item) => item && item.cmd === "send")
+          .slice(sendCountBeforeNotReady);
+      }
       {
         const raw = rawCmuxState();
         raw.surfaces = (raw.surfaces || []).filter((surface) => surface && surface.ref !== initialConcierge.surfaceRef);
@@ -1681,6 +1707,7 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         .filter((item) => item && item.cmd === "send")
         .slice(repairSendCountBefore)
         .filter((item) => item && item.surface === conciergeAskResult.surfaceRef);
+      const repairedLaunchSend = askSendCommands.find((item) => item && String(item.text || "").includes("cmuxdash:grid:__grid__:concierge")) || null;
       const askBodySend = askSendCommands.find((item) => item && String(item.text || "").includes("テスト用プロジェクトを作りたい")) || null;
       const askEnterSend = askSendCommands[askSendCommands.length - 1] || null;
       const alphaStateBeforeGrid = await ctl.getProjectState("alpha");
@@ -1792,6 +1819,18 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         initialConciergeSurface.process === "claude" &&
         initialConciergeSurface.cwd === ctl.CMUX_DASH_PROJECTS_ROOT
       ));
+      check("grid concierge launch: command creates projects root and guards missing claude", (
+        initialConciergeLaunchText.includes("command -v claude >/dev/null") &&
+        initialConciergeLaunchText.includes("claude CLI が見つかりません: https://claude.com/claude-code") &&
+        initialConciergeLaunchText.includes("mkdir -p " + shellQuoted(ctl.CMUX_DASH_PROJECTS_ROOT)) &&
+        initialConciergeLaunchText.includes("cd " + shellQuoted(ctl.CMUX_DASH_PROJECTS_ROOT) + " && exec claude --enable-auto-mode")
+      ));
+      check("grid concierge readiness: conciergeAsk does not submit before claude process", (
+        notReadyResult &&
+        notReadyResult.sent === false &&
+        notReadyResult.error === "concierge not ready" &&
+        notReadySendCommands.length === 0
+      ));
       check("grid concierge B/C: conciergeAsk repairs dead concierge and submits kickoff to that surface", (
         initialBrowserAnchor &&
         conciergeAfterAsk &&
@@ -1804,11 +1843,16 @@ async function exerciseAllSlots(id, expectedCwd, label) {
           item.resultSurface === conciergeAskResult.surfaceRef
         )) &&
         askSendCommands.length >= 3 &&
+        repairedLaunchSend &&
+        String(repairedLaunchSend.text || "").includes("command -v claude >/dev/null") &&
+        String(repairedLaunchSend.text || "").includes("mkdir -p " + shellQuoted(ctl.CMUX_DASH_PROJECTS_ROOT)) &&
         askBodySend &&
+        askBodySend.processBeforeSend === "claude" &&
         String(askBodySend.text || "").includes("templates/CONCIERGE.md") &&
         String(askBodySend.text || "").includes("対話") &&
         String(askBodySend.text || "").includes("API") &&
         askEnterSend &&
+        askEnterSend.processBeforeSend === "claude" &&
         askEnterSend.text === "\\r"
       ));
       check("grid C1: addProjectColumn creates ordered scoped cc/cdx columns", (

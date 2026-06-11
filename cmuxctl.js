@@ -299,6 +299,9 @@ const CMUX_BACKOFF_JITTER = Math.max(0, Math.min(1, Number(process.env.CMUX_DASH
 const CMUX_SETTLE_MS = intEnv('CMUX_DASH_SETTLE_MS', 750);
 const CMUX_OPENALL_GAP_MS = intEnv('CMUX_DASH_OPENALL_GAP_MS', 750);
 const CMUX_HEALTH_FAILURE_THRESHOLD = intEnv('CMUX_DASH_HEALTH_FAILURE_THRESHOLD', 5);
+const GRID_CONCIERGE_READY_TIMEOUT_MAX_MS = 20000;
+const GRID_CONCIERGE_READY_TIMEOUT_DEFAULT_MS = 20000;
+const GRID_CONCIERGE_READY_POLL_DEFAULT_MS = 1000;
 
 function createCmuxHealthTracker(threshold = CMUX_HEALTH_FAILURE_THRESHOLD) {
   const state = {
@@ -1925,7 +1928,9 @@ function gridLaunchCommand(project, cfg, columnId, slot) {
 
 function gridConciergeLaunchCommand() {
   const cwd = shellQuote(CMUX_DASH_PROJECTS_ROOT);
-  return `${gridConciergeTitleCommand()}; cd ${cwd} && exec ${SLOT_DEFS.cc.defaultCommand}`;
+  const missingClaude = shellQuote('claude CLI が見つかりません: https://claude.com/claude-code');
+  const claudeGuard = `command -v claude >/dev/null || { echo ${missingClaude}; exec "\${SHELL:-/bin/sh}"; }`;
+  return `${gridConciergeTitleCommand()}; ${claudeGuard}; mkdir -p ${cwd} && cd ${cwd} && exec ${SLOT_DEFS.cc.defaultCommand}`;
 }
 
 function slotMarkerSearchText(surface) {
@@ -3426,6 +3431,76 @@ async function launchGridConciergeSurface(wsRef, surfaceRef) {
   await cmux(['send', '--workspace', wsRef, '--surface', ref, gridConciergeLaunchCommand() + '\n']);
 }
 
+function conciergeReadyTimeoutMs() {
+  return Math.min(
+    GRID_CONCIERGE_READY_TIMEOUT_MAX_MS,
+    intEnv('CMUX_DASH_CONCIERGE_READY_TIMEOUT_MS', GRID_CONCIERGE_READY_TIMEOUT_DEFAULT_MS),
+  );
+}
+
+function conciergeReadyPollMs() {
+  const ms = intEnv('CMUX_DASH_CONCIERGE_READY_POLL_MS', GRID_CONCIERGE_READY_POLL_DEFAULT_MS);
+  return Math.max(1, ms);
+}
+
+function surfaceProcessValues(surface, processMap = {}) {
+  const values = [];
+  if (surface) {
+    for (const key of ['process', 'processName', 'command']) {
+      if (surface[key]) values.push(surface[key]);
+    }
+    if (Array.isArray(surface.processes)) values.push(...surface.processes);
+    if (surface.ref && Array.isArray(processMap[surface.ref])) values.push(...processMap[surface.ref]);
+  }
+  return values.map((value) => String(value || '').trim()).filter(Boolean);
+}
+
+function conciergeSurfaceHasClaudeProcess(surface, processMap = {}) {
+  return surfaceProcessValues(surface, processMap)
+    .some((value) => SLOT_DEFS.cc.processRe.test(value) || classifyProcess(value) === 'C');
+}
+
+async function waitForConciergeReady(wsRef, concierge) {
+  const surfaceRef = cleanRef(concierge && (concierge.surfaceRef || concierge.ref));
+  const started = Date.now();
+  const timeoutMs = conciergeReadyTimeoutMs();
+  const deadline = started + timeoutMs;
+  let lastSurface = null;
+  let lastProcess = null;
+
+  while (true) {
+    const surfaces = await listWorkspaceSurfaces(wsRef);
+    const surface = surfaceByRef(surfaces, surfaceRef) || markedOrKnownGridConciergeSurface(surfaces);
+    if (surface && surface.ref) {
+      lastSurface = surface;
+      setGridConciergeSurface(surface);
+      const processMap = await surfaceProcessMap(wsRef);
+      const values = surfaceProcessValues(surface, processMap);
+      lastProcess = values.join('\n') || null;
+      if (conciergeSurfaceHasClaudeProcess(surface, processMap)) {
+        return {
+          ready: true,
+          surfaceRef: surface.ref,
+          paneRef: surface.paneRef || null,
+          process: lastProcess,
+        };
+      }
+    }
+
+    if (Date.now() >= deadline) {
+      return {
+        ready: false,
+        surfaceRef: surfaceRef || cleanRef(lastSurface && lastSurface.ref),
+        paneRef: lastSurface && lastSurface.paneRef || concierge && concierge.paneRef || null,
+        process: lastProcess,
+        timeoutMs,
+      };
+    }
+
+    await sleep(Math.min(conciergeReadyPollMs(), Math.max(0, deadline - Date.now())));
+  }
+}
+
 async function ensureConciergeSurface(wsRef) {
   const ref = cleanRef(wsRef);
   if (!ref) throw new Error('grid workspace ref is required');
@@ -3747,14 +3822,26 @@ function conciergeKickoffText(text) {
 async function conciergeAsk(text) {
   const wsRef = await ensureGridWorkspace();
   const concierge = await ensureConciergeSurface(wsRef);
-  const surfaceRef = cleanRef(concierge && (concierge.surfaceRef || concierge.ref));
   const kickoffText = conciergeKickoffText(text);
+  const ready = await waitForConciergeReady(wsRef, concierge);
+  const surfaceRef = cleanRef(ready.surfaceRef || concierge && (concierge.surfaceRef || concierge.ref));
+  if (!ready.ready) {
+    return {
+      sent: false,
+      error: 'concierge not ready',
+      wsRef,
+      surfaceRef,
+      paneRef: ready.paneRef || concierge && concierge.paneRef || null,
+      marker: GRID_CONCIERGE_MARKER,
+      kickoffText,
+    };
+  }
   await submitToSurface(wsRef, surfaceRef, kickoffText);
   return {
     sent: true,
     wsRef,
     surfaceRef,
-    paneRef: concierge && concierge.paneRef || null,
+    paneRef: ready.paneRef || concierge && concierge.paneRef || null,
     marker: GRID_CONCIERGE_MARKER,
     kickoffText,
   };
