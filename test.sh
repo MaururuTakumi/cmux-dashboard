@@ -2041,6 +2041,47 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         Number(alphaLeftPass2.amount) >= Math.floor(Number(alphaLeftPass1.amount) * 0.9)
       ));
       {
+        const raw = rawCmuxState();
+        raw.gridBoundaries = raw.gridBoundaries && typeof raw.gridBoundaries === "object" ? raw.gridBoundaries : {};
+        raw.gridBoundaries[initialGridRef] = [1100, 1170, 1205];
+        writeCmuxState(raw);
+        const resizeCountBeforeStuck = (rawCmuxState().commands || [])
+          .filter((item) => item && item.cmd === "resize-pane" && item.workspace === initialGridRef).length;
+        const previousScale = process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT;
+        let stuckResult = null;
+        try {
+          process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT = "0";
+          stuckResult = await ctl.rebalanceGridColumns(initialGridRef);
+        } finally {
+          if (previousScale == null) delete process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT;
+          else process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT = previousScale;
+        }
+        const stuckCommands = (rawCmuxState().commands || [])
+          .filter((item) => item && item.cmd === "resize-pane" && item.workspace === initialGridRef)
+          .slice(resizeCountBeforeStuck);
+        const stuckOps = stuckResult && Array.isArray(stuckResult.operations)
+          ? stuckResult.operations.filter((item) => item && item.resized)
+          : [];
+        const stuckSignatures = stuckOps.map((item) => item.signature).filter(Boolean);
+        const perBoundary = {};
+        for (const op of stuckOps) perBoundary[op.name] = (perBoundary[op.name] || 0) + 1;
+        check("grid rebalance guard: no-movement boundaries avoid repeated identical resize and return repair proposal", (
+          stuckResult &&
+          stuckResult.rebalanced === false &&
+          stuckResult.converged === false &&
+          stuckResult.unconverged === true &&
+          stuckResult.repair &&
+          /rebuild/.test(String(stuckResult.repair.recommendation || "")) &&
+          Array.isArray(stuckResult.unconvergedBoundaries) &&
+          stuckResult.unconvergedBoundaries.length >= 1 &&
+          stuckCommands.length === stuckOps.length &&
+          stuckSignatures.length === stuckOps.length &&
+          new Set(stuckSignatures).size === stuckSignatures.length &&
+          Object.values(perBoundary).every((count) => count <= 2) &&
+          stuckOps.some((item) => item.strategy === "alternate")
+        ));
+      }
+      {
         const forceDivergentGridBoundaries = () => {
           const raw = rawCmuxState();
           raw.gridBoundaries = raw.gridBoundaries && typeof raw.gridBoundaries === "object" ? raw.gridBoundaries : {};

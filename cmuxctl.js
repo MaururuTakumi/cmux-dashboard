@@ -3105,6 +3105,30 @@ function gridResizeCalibrationFromSnapshot(operations, snapshot) {
   };
 }
 
+function gridResizeObservationsFromSnapshot(operations, snapshot) {
+  if (!snapshot || !snapshot.ok || !Array.isArray(snapshot.boundaries)) return [];
+  const byName = new Map(snapshot.boundaries.map((boundary) => [boundary.name, boundary]));
+  const minMovePx = Math.max(1, Number(snapshot.geometry && snapshot.geometry.cellWidthPx) * 0.25 || 1);
+  return (Array.isArray(operations) ? operations : []).map((op) => {
+    if (!op || !op.resized || !op.name) return null;
+    const before = Number(op.actualBoundaryPx);
+    const next = byName.get(op.name);
+    const after = Number(next && next.actualPx);
+    if (!Number.isFinite(before) || !Number.isFinite(after)) return null;
+    const observedMovePx = after - before;
+    return {
+      name: op.name,
+      beforePx: Math.round(before),
+      afterPx: Math.round(after),
+      observedMovePx: Math.round(observedMovePx),
+      absObservedMovePx: Math.abs(observedMovePx),
+      moved: Math.abs(observedMovePx) >= minMovePx,
+      minMovePx,
+      operation: op,
+    };
+  }).filter(Boolean);
+}
+
 function fallbackPaneRefByPosition(frames, excludedRefs, side) {
   const candidates = (Array.isArray(frames) ? frames : [])
     .filter((item) => item && item.ref && !(excludedRefs || new Set()).has(item.ref));
@@ -3446,9 +3470,17 @@ async function resizeGridBoundary(wsRef, boundaryOrPaneRef, targetRightPx, cellW
   }
   const pxPerAmount = gridResizeCoefficientPxPerAmount(opts.pxPerAmount);
   const amount = Math.max(1, Math.ceil(Math.abs(diffPx) / pxPerAmount));
-  const direction = diffPx > 0 ? '-R' : '-L';
-  const ref = diffPx > 0 ? leftPaneRef : rightPaneRef;
-  const resizeFrame = diffPx > 0 ? leftFrame : rightFrame;
+  const primary = diffPx > 0
+    ? { ref: leftPaneRef, frame: leftFrame, direction: '-R', convention: 'left-pane-R' }
+    : { ref: rightPaneRef, frame: rightFrame, direction: '-L', convention: 'right-pane-L' };
+  const alternate = diffPx > 0
+    ? { ref: rightPaneRef, frame: rightFrame, direction: '-L', convention: 'right-pane-L' }
+    : { ref: leftPaneRef, frame: leftFrame, direction: '-R', convention: 'left-pane-R' };
+  const strategy = opts.strategy === 'alternate' && alternate.ref && alternate.frame ? 'alternate' : 'primary';
+  const instruction = strategy === 'alternate' ? alternate : primary;
+  const direction = instruction.direction;
+  const ref = instruction.ref;
+  const resizeFrame = instruction.frame;
   if (!ref || !resizeFrame) {
     return {
       resized: false,
@@ -3458,9 +3490,11 @@ async function resizeGridBoundary(wsRef, boundaryOrPaneRef, targetRightPx, cellW
       diffPx,
       actualBoundaryPx: Math.round(actualBoundaryPx),
       targetRightPx: target,
+      strategy,
     };
   }
   await cmux(['resize-pane', '--workspace', ws, '--pane', ref, direction, '--amount', String(amount)]);
+  const signature = [boundary.name || 'boundary', ref, direction, amount].join('|');
   return {
     resized: true,
     workspace: ws,
@@ -3470,6 +3504,9 @@ async function resizeGridBoundary(wsRef, boundaryOrPaneRef, targetRightPx, cellW
     direction,
     amount,
     pxPerAmount,
+    strategy,
+    convention: instruction.convention,
+    signature,
     estimatedMovePx: Math.round(amount * pxPerAmount),
     diffPx,
     actualBoundaryPx: Math.round(actualBoundaryPx),
@@ -3491,9 +3528,37 @@ async function rebalanceGridColumns(wsRef) {
   let snapshot = null;
   let pxPerAmount = GRID_RESIZE_FALLBACK_PX_PER_AMOUNT;
   let pendingCalibration = null;
+  const stagnantBoundaries = new Map();
+  const abandonedBoundaries = new Map();
   for (let pass = 1; pass <= GRID_REBALANCE_MAX_PASSES; pass += 1) {
     snapshot = await readGridRebalanceSnapshot(ref, columns, surfaces);
     if (pendingCalibration && snapshot.ok) {
+      for (const observation of gridResizeObservationsFromSnapshot(pendingCalibration.operations, snapshot)) {
+        if (observation.moved) {
+          stagnantBoundaries.delete(observation.name);
+          continue;
+        }
+        const previous = stagnantBoundaries.get(observation.name) || { count: 0 };
+        const next = {
+          count: previous.count + 1,
+          lastObservation: observation,
+          lastOperation: observation.operation,
+          nextStrategy: 'alternate',
+        };
+        stagnantBoundaries.set(observation.name, next);
+        if (next.count >= 2) {
+          abandonedBoundaries.set(observation.name, {
+            name: observation.name,
+            reason: 'boundary did not move after two resize attempts',
+            observation: {
+              beforePx: observation.beforePx,
+              afterPx: observation.afterPx,
+              observedMovePx: observation.observedMovePx,
+            },
+            lastOperation: observation.operation,
+          });
+        }
+      }
       const calibration = gridResizeCalibrationFromSnapshot(pendingCalibration.operations, snapshot);
       if (calibration) {
         pxPerAmount = calibration.pxPerAmount;
@@ -3525,9 +3590,24 @@ async function rebalanceGridColumns(wsRef) {
 
     const operations = [];
     for (const boundary of snapshot.boundaries) {
+      if (abandonedBoundaries.has(boundary.name)) {
+        operations.push({
+          resized: false,
+          name: boundary.name,
+          leftPaneRef: boundary.leftPaneRef,
+          rightPaneRef: boundary.rightPaneRef,
+          actualBoundaryPx: boundary.actualPx,
+          targetRightPx: boundary.targetRightPx,
+          reason: 'unconverged boundary abandoned after no movement',
+          unconverged: true,
+        });
+        continue;
+      }
+      const stagnant = stagnantBoundaries.get(boundary.name);
       operations.push(await resizeGridBoundary(ref, boundary, boundary.targetRightPx, snapshot.geometry.cellWidthPx, {
         pxPerAmount,
         tolerancePx: boundary.tolerancePx,
+        strategy: stagnant && stagnant.count === 1 ? 'alternate' : 'primary',
       }));
     }
     const passChanged = operations.some((item) => item && item.resized);
@@ -3557,10 +3637,20 @@ async function rebalanceGridColumns(wsRef) {
   const finalPasses = passes.concat(gridRebalancePassRecord(finalPass, snapshot, { operations: [], final: true, pxPerAmount }));
   if (!snapshot.ok) return { rebalanced: false, error: snapshot.reason, passes: finalPasses };
   const operations = finalPasses.reduce((acc, item) => acc.concat(item.operations || []), []);
+  const unconvergedBoundaries = Array.from(abandonedBoundaries.values());
   return {
     rebalanced: snapshot.withinTolerance,
     changed,
     converged: snapshot.withinTolerance,
+    ...(unconvergedBoundaries.length ? {
+      unconverged: true,
+      unconvergedBoundaries,
+      repair: {
+        recommendation: 'POST /api/grid/rebuild',
+        requiresConfirm: false,
+        reason: 'one or more grid boundaries did not move after resize commands',
+      },
+    } : {}),
     operations,
     passes: finalPasses,
     passCount: finalPasses.length,
