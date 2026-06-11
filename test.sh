@@ -558,6 +558,48 @@ if ! run_r2_metrics_checks; then
   finish
 fi
 
+run_scroll_reset_static_checks() {
+  local index_file="$DIR/public/index.html"
+
+  if grep -F 'data-row-id="${esc(p.id)}"' "$index_file" >/dev/null 2>&1 \
+    && grep -F "function syncKeyedChildren(container, items, keyFn, htmlFn, cache)" "$index_file" >/dev/null 2>&1 \
+    && grep -F "data-panel-id=\"memory\"" "$index_file" >/dev/null 2>&1; then
+    pass "Scroll reset: keyed row/panel diff helper contract is present"
+  else
+    fail "Scroll reset: keyed row/panel diff helper contract is missing"
+    return 1
+  fi
+
+  if ! grep -Eq "\\$\\('#grid'\\)\\.innerHTML[[:space:]]*=" "$index_file" 2>/dev/null; then
+    pass "Scroll reset: polling render path does not assign #grid innerHTML"
+  else
+    fail "Scroll reset: #grid innerHTML assignment remains in render path"
+    return 1
+  fi
+
+  if grep -F "function captureScrollGuard()" "$index_file" >/dev/null 2>&1 \
+    && grep -F "const restoreScroll = captureScrollGuard();" "$index_file" >/dev/null 2>&1 \
+    && grep -F "restoreScroll();" "$index_file" >/dev/null 2>&1; then
+    pass "Scroll reset: render calls upward-only scroll guard"
+  else
+    fail "Scroll reset: scroll guard function or render call is missing"
+    return 1
+  fi
+
+  if grep -F "details[open]" "$index_file" >/dev/null 2>&1 \
+    && grep -F "function restoreOpenDetails(root, openDetails)" "$index_file" >/dev/null 2>&1 \
+    && grep -F "el.open = true" "$index_file" >/dev/null 2>&1; then
+    pass "Scroll reset: details open state is preserved across row replacement"
+  else
+    fail "Scroll reset: details open preservation contract is missing"
+    return 1
+  fi
+}
+
+if ! run_scroll_reset_static_checks; then
+  finish
+fi
+
 run_r4_checks() {
   local phase_dir="$TEST_TMP_DIR/r4"
   local fake_cmux="$phase_dir/cmux"
@@ -6302,12 +6344,13 @@ const html = fs.readFileSync(process.argv[2], "utf8");
 const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
 if (!scriptMatch) process.exit(2);
 const script = scriptMatch[1];
-const gridAssign = script.match(/\$\('#grid'\)\.innerHTML =([\s\S]*?)renderMetricsPanels\(\);/);
 const checks = [
   html.includes(".projects-list"),
   html.includes(".row-origin"),
   html.includes(".project-row.dragging"),
+  script.includes("function syncKeyedChildren(container, items, keyFn, htmlFn, cache)"),
   script.includes('data-project-id="${esc(p.id)}"'),
+  script.includes('data-row-id="${esc(p.id)}"'),
   script.includes('data-project-index="${index}"'),
   script.includes('draggable="true"'),
   script.includes("function dragStart(ev,id)"),
@@ -6320,7 +6363,9 @@ const checks = [
   script.includes("function renderProjectRows(s)"),
   script.includes('id="projectRows"'),
   script.includes("projects.map((p,i)=>renderProjectRow(p,i,s)).join('')"),
-  gridAssign && gridAssign[1].includes("renderProjectRows(s)"),
+  script.includes("function syncProjectRows(s, container)"),
+  script.includes("syncProjectRows(s, layout.projectRows)"),
+  script.includes("syncMetricsPanels(layout.metricsPanels)"),
   html.includes("Memory") && html.includes("CC &amp; Codex"),
 ];
 process.stdout.write(checks.every(Boolean) ? "ok" : "bad");

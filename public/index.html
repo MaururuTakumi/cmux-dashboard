@@ -389,6 +389,75 @@ let pollTimer=null;
 let metricsTimer=null;
 let actionInFlight=0;   // アクション実行中はポーリングを止める（cmuxアプリのsocket競合を避ける）
 let lastToastError='';
+let projectRowCache = new Map();
+let globalRowCache = new Map();
+let metricsPanelCache = new Map();
+
+function htmlToElement(html){
+  const tpl = document.createElement('template');
+  tpl.innerHTML = String(html || '').trim();
+  return tpl.content.firstElementChild;
+}
+function keyedChildId(el){
+  return el && el.dataset ? (el.dataset.rowId || el.dataset.panelId || el.dataset.syncKey || '') : '';
+}
+function collectOpenDetails(root){
+  return Array.from(root ? root.querySelectorAll('details[open]') : []).map((el,index)=>el.dataset.detailId || el.className || String(index));
+}
+function restoreOpenDetails(root, openDetails){
+  if(!root || !openDetails || !openDetails.length) return;
+  const open = new Set(openDetails);
+  Array.from(root.querySelectorAll('details')).forEach((el,index)=>{
+    const key = el.dataset.detailId || el.className || String(index);
+    if(open.has(key)) el.open = true;
+  });
+}
+function syncKeyedChildren(container, items, keyFn, htmlFn, cache){
+  if(!container) return;
+  const existing = new Map();
+  Array.from(container.children).forEach((child)=>{
+    const key = keyedChildId(child);
+    if(key) existing.set(key, child);
+  });
+  const seen = new Set();
+  items.forEach((item,index)=>{
+    const key = String(keyFn(item,index));
+    const html = String(htmlFn(item,index));
+    let node = existing.get(key);
+    if(!node || cache.get(key) !== html){
+      const openDetails = collectOpenDetails(node);
+      if(node){
+        const at = Array.prototype.indexOf.call(container.children, node);
+        node.outerHTML = html;
+        node = container.children[at] || null;
+      }else{
+        node = htmlToElement(html);
+      }
+      restoreOpenDetails(node, openDetails);
+      cache.set(key, html);
+    }
+    if(!node) return;
+    const current = container.children[index] || null;
+    if(node !== current) container.insertBefore(node, current);
+    seen.add(key);
+  });
+  Array.from(container.children).forEach((child)=>{
+    const key = keyedChildId(child);
+    if(key && !seen.has(key)){
+      child.remove();
+      cache.delete(key);
+    }
+  });
+}
+function captureScrollGuard(){
+  const grid = $('#grid');
+  const winY = window.scrollY || window.pageYOffset || 0;
+  const gridTop = grid ? grid.scrollTop : 0;
+  return function restoreScrollGuard(){
+    if((window.scrollY || window.pageYOffset || 0) < winY) window.scrollTo(window.scrollX || 0, winY);
+    if(grid && grid.scrollTop < gridTop) grid.scrollTop = gridTop;
+  };
+}
 function startPoll(){ stopPoll(); pollTimer=setInterval(()=>{ if(!actionInFlight) refresh(); }, 4000); }
 function stopPoll(){ if(pollTimer){ clearInterval(pollTimer); pollTimer=null; } }
 function startMetricsPoll(){ stopMetricsPoll(); metricsTimer=setInterval(()=>{ if(!actionInFlight && document.visibilityState!=='hidden') refreshMetrics(); }, 5000); }
@@ -594,7 +663,7 @@ function typeChips(byType){
     return `<span class="type-chip">${label} ${fmtBytes(item.rssBytes||0)} · ${Number(item.procCount)||0}</span>`;
   }).join('')}</div>`;
 }
-function renderMetricsPanels(){
+function renderMetricsPanelItems(){
   const m = lastMetrics || {};
   const projects = metricProjects();
   const app = m.app || {};
@@ -611,8 +680,8 @@ function renderMetricsPanels(){
   const maxSlot = Math.max(1, ...slots.map(s=>s.rss));
   const totals = typeTotals(projects);
   const stamp = m.updatedAt ? rel(m.updatedAt) : 'waiting';
-  return `<div class="metrics-grid" id="metricsPanels">
-    <section class="metrics-panel">
+  return [
+    { id:'memory', html:`<section class="metrics-panel" data-panel-id="memory">
       <div class="metrics-head"><div class="metrics-title">Memory</div><div class="metrics-stamp">${esc(stamp)}</div></div>
       <div class="metrics-kpis">
         <div class="kpi"><div class="kpi-label">App footprint</div><div class="kpi-value">${fmtBytes(app.footprint)}</div></div>
@@ -625,8 +694,8 @@ function renderMetricsPanels(){
           <div class="bar-value">${fmtBytes(p.rssBytes)}</div>
         </div>`).join('') : '<div class="thread-empty">計測待ち</div>'}</div>
       ${m.error?`<div class="metrics-error">${esc(m.error)}</div>`:''}
-    </section>
-    <section class="metrics-panel">
+    </section>` },
+    { id:'agents', html:`<section class="metrics-panel" data-panel-id="agents">
       <div class="metrics-head"><div class="metrics-title">CC &amp; Codex</div>${typeChips(totals)}</div>
       <div class="agent-list">${slots.length ? slots.slice(0,10).map(s=>`
         <div class="agent-row">
@@ -639,8 +708,14 @@ function renderMetricsPanels(){
           <div class="bar-value">${s.procCount} proc</div>
         </div>`).join('') : '<div class="thread-empty">計測待ち</div>'}</div>
       <div class="legend"><span>C=Claude/CC</span><span>M=MCP</span><span>X=Codex</span><span>O=Other</span></div>
-    </section>
-  </div>`;
+    </section>` },
+  ];
+}
+function renderMetricsPanels(){
+  return `<div class="metrics-grid" id="metricsPanels">${renderMetricsPanelItems().map((item)=>item.html).join('')}</div>`;
+}
+function syncMetricsPanels(container){
+  syncKeyedChildren(container, renderMetricsPanelItems(), (item)=>item.id, (item)=>item.html, metricsPanelCache);
 }
 function renderSlotButtons(p){
   const collab = collabState(p);
@@ -728,7 +803,7 @@ function renderProjectRow(p, index, s){
   const primaryLabel = gridable ? (gridBusy ? '…' : (gridOpen ? '× 閉じる' : '▶ 開く')) : (p.open ? '表示' : '▶ 開く');
   const primaryTitle = gridable ? (gridOpen ? 'grid columnを閉じる' : 'grid columnを開く') : (p.open ? 'workspaceを表示' : 'workspaceを起動');
   const dragAttrs = isGlobal ? '' : `draggable="true" ondragstart="dragStart(event,${jsArg(p.id)})" ondragover="dragOver(event)" ondragleave="dragLeave(event)" ondrop="dropProject(event,${jsArg(p.id)})" ondragend="dragEnd(event)"`;
-  return `<div class="project-row ${isGlobal?'global-row':''} ${p.open?'open':''} ${gridOpen?'grid-open':''} ${failed?'fail':''}" data-project-id="${esc(p.id)}" data-row-kind="${projectKind(p)}" data-project-index="${index}" data-grid-open="${gridOpen?'true':'false'}" ${dragAttrs} onclick="cardClick(event,${jsArg(p.id)},${gridOpen?'true':'false'},${gridable?'true':'false'},${p.open?'true':'false'})" style="--c:${esc(p.color || '#888')}">
+  return `<div class="project-row ${isGlobal?'global-row':''} ${p.open?'open':''} ${gridOpen?'grid-open':''} ${failed?'fail':''}" data-row-id="${esc(p.id)}" data-project-id="${esc(p.id)}" data-row-kind="${projectKind(p)}" data-project-index="${index}" data-grid-open="${gridOpen?'true':'false'}" ${dragAttrs} onclick="cardClick(event,${jsArg(p.id)},${gridOpen?'true':'false'},${gridable?'true':'false'},${p.open?'true':'false'})" style="--c:${esc(p.color || '#888')}">
     <div class="row-index" title="${isGlobal?'グローバル行':'ドラッグで並び替え'}">${isGlobal?'G':'#'}${index + 1}</div>
     <div class="row-origin">${isGlobal?'gbl':'lcl'}</div>
     <div class="project-main">
@@ -766,72 +841,132 @@ function renderProjectRows(s){
   const globalRows = Array.isArray(s.globalRows) ? s.globalRows : [];
   const normalHtml = projects.map((p,i)=>renderProjectRow(p,i,s)).join('');
   const globalHtml = globalRows.length ? [
-    '<div class="project-separator" id="globalRowsSeparator">Global</div>',
-    '<div id="globalRows">',
+    '<div class="project-separator" id="globalRowsSeparator" data-row-id="globalRowsSeparator">Global</div>',
+    '<div id="globalRows" data-row-id="globalRows">',
     globalRows.map((p,i)=>renderProjectRow(p,i,s)).join(''),
     '</div>',
   ].join('') : '';
   return `<div class="projects-list" id="projectRows">${normalHtml}${globalHtml}</div>`;
 }
+function syncProjectRows(s, container){
+  const projects = Array.isArray(s.projects) ? s.projects : [];
+  const globalRows = Array.isArray(s.globalRows) ? s.globalRows : [];
+  const items = projects.map((p,i)=>({ key:p.id, html:renderProjectRow(p,i,s) }));
+  if(globalRows.length){
+    items.push({ key:'globalRowsSeparator', html:'<div class="project-separator" id="globalRowsSeparator" data-row-id="globalRowsSeparator">Global</div>' });
+    items.push({ key:'globalRows', html:'<div id="globalRows" data-row-id="globalRows"></div>' });
+  }else{
+    globalRowCache.clear();
+  }
+  syncKeyedChildren(container, items, (item)=>item.key, (item)=>item.html, projectRowCache);
+  const globalContainer = $('#globalRows');
+  if(globalContainer){
+    syncKeyedChildren(globalContainer, globalRows, (p)=>p.id, (p,i)=>renderProjectRow(p,i,s), globalRowCache);
+  }
+}
+function ensureGridLayout(hasRows){
+  const grid = $('#grid');
+  let projectRows = $('#projectRows');
+  let metricsPanels = $('#metricsPanels');
+  let emptyState = $('#emptyState');
+  if(hasRows){
+    if(emptyState) emptyState.remove();
+    if(!projectRows){
+      projectRows = htmlToElement('<div class="projects-list" id="projectRows"></div>');
+      grid.insertBefore(projectRows, grid.firstElementChild);
+    }
+    if(!metricsPanels){
+      metricsPanels = htmlToElement('<div class="metrics-grid" id="metricsPanels"></div>');
+      grid.appendChild(metricsPanels);
+    }
+    if(grid.firstElementChild !== projectRows) grid.insertBefore(projectRows, grid.firstElementChild);
+    if(projectRows.nextElementSibling !== metricsPanels) grid.insertBefore(metricsPanels, projectRows.nextElementSibling);
+  }else{
+    if(projectRows){
+      projectRows.remove();
+      projectRowCache.clear();
+      globalRowCache.clear();
+    }
+    if(!metricsPanels){
+      metricsPanels = htmlToElement('<div class="metrics-grid" id="metricsPanels"></div>');
+      grid.insertBefore(metricsPanels, grid.firstElementChild);
+    }
+    if(grid.firstElementChild !== metricsPanels) grid.insertBefore(metricsPanels, grid.firstElementChild);
+    if(!emptyState){
+      emptyState = htmlToElement('<div class="empty" id="emptyState">プロジェクトがありません。<br>「？ セットアップ」から最初のプロジェクトを登録してください。</div>');
+      grid.insertBefore(emptyState, metricsPanels.nextElementSibling);
+    }
+    if(metricsPanels.nextElementSibling !== emptyState) grid.insertBefore(emptyState, metricsPanels.nextElementSibling);
+  }
+  return { projectRows, metricsPanels };
+}
 function render(s){
   if(!s || !Array.isArray(s.projects)) return;
-  const rows = stateRows(s);
-  const globals = Array.isArray(s.globalRows) ? s.globalRows : [];
-  const projectIds = new Set(rows.map(p=>p.id));
-  for(const id of Array.from(threads.keys())) if(!projectIds.has(id)) closeThread(id);
-  const openCount = Number.isFinite(Number(s.openCount)) ? Number(s.openCount) : s.projects.filter((p)=>p.open).length;
-  const globalOpenCount = Number.isFinite(Number(s.globalOpenCount)) ? Number(s.globalOpenCount) : globals.filter((p)=>p.open).length;
-  $('#sub').textContent = `${openCount}/${s.projects.length} 起動中${globals.length ? ` · global ${globalOpenCount}/${globals.length}` : ''}`;
-  $('#monCount').textContent = globals.length ? `${openCount}/${s.projects.length} +G${globalOpenCount}/${globals.length}` : `${openCount}/${s.projects.length}`;
-  $('#agState').textContent = s.agmsgInstalled ? 'ready' : 'なし';
-  $('#agDot').style.background = s.agmsgInstalled ? 'var(--ok)' : 'var(--warn)';
-  const actionError = s.lastActionError && s.lastActionError.message ? s.lastActionError : null;
-  const cmuxHealth = s.health && s.health.cmux ? s.health.cmux : null;
-  renderStateLine(s, actionError, cmuxHealth);
-  renderGridSidePanel(s);
-  if(cmuxHealth && (cmuxHealth.unhealthy || cmuxHealth.ok === false)){
-    $('#warn').innerHTML = `⚠ cmux応答不良: サーバー再起動が必要 <button class="inline-btn" onclick="restartServer()">サーバー再起動</button><code class="copy" data-copy="./cmux-dash restart" onclick="event.stopPropagation();copyFrom(this)">./cmux-dash restart</code>`;
-    $('#warn').classList.add('show');
-  }else if(!s.agmsgInstalled){
-    $('#warn').innerHTML = '⚠ agmsg が未インストールです。<code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/fujibee/agmsg/main/setup.sh) --cmd agmsg</code> を実行してください（エージェント間メッセージングが無効のまま起動します）。';
-    $('#warn').classList.add('show');
-  }else if(actionError){
-    $('#warn').textContent = `⚠ ${actionError.label || 'action'} failed: ${actionError.message}`;
-    $('#warn').classList.add('show');
-    const key = `${actionError.label}:${actionError.message}:${actionError.at || ''}`;
-    if(key !== lastToastError){ lastToastError = key; toast('失敗: '+actionError.message); }
-  }else{
-    $('#warn').classList.remove('show');
-  }
+  const restoreScroll = captureScrollGuard();
+  try{
+    const rows = stateRows(s);
+    const globals = Array.isArray(s.globalRows) ? s.globalRows : [];
+    const projectIds = new Set(rows.map(p=>p.id));
+    for(const id of Array.from(threads.keys())) if(!projectIds.has(id)) closeThread(id);
+    const openCount = Number.isFinite(Number(s.openCount)) ? Number(s.openCount) : s.projects.filter((p)=>p.open).length;
+    const globalOpenCount = Number.isFinite(Number(s.globalOpenCount)) ? Number(s.globalOpenCount) : globals.filter((p)=>p.open).length;
+    $('#sub').textContent = `${openCount}/${s.projects.length} 起動中${globals.length ? ` · global ${globalOpenCount}/${globals.length}` : ''}`;
+    $('#monCount').textContent = globals.length ? `${openCount}/${s.projects.length} +G${globalOpenCount}/${globals.length}` : `${openCount}/${s.projects.length}`;
+    $('#agState').textContent = s.agmsgInstalled ? 'ready' : 'なし';
+    $('#agDot').style.background = s.agmsgInstalled ? 'var(--ok)' : 'var(--warn)';
+    const actionError = s.lastActionError && s.lastActionError.message ? s.lastActionError : null;
+    const cmuxHealth = s.health && s.health.cmux ? s.health.cmux : null;
+    renderStateLine(s, actionError, cmuxHealth);
+    renderGridSidePanel(s);
+    if(cmuxHealth && (cmuxHealth.unhealthy || cmuxHealth.ok === false)){
+      $('#warn').innerHTML = `⚠ cmux応答不良: サーバー再起動が必要 <button class="inline-btn" onclick="restartServer()">サーバー再起動</button><code class="copy" data-copy="./cmux-dash restart" onclick="event.stopPropagation();copyFrom(this)">./cmux-dash restart</code>`;
+      $('#warn').classList.add('show');
+    }else if(!s.agmsgInstalled){
+      $('#warn').innerHTML = '⚠ agmsg が未インストールです。<code>bash &lt;(curl -fsSL https://raw.githubusercontent.com/fujibee/agmsg/main/setup.sh) --cmd agmsg</code> を実行してください（エージェント間メッセージングが無効のまま起動します）。';
+      $('#warn').classList.add('show');
+    }else if(actionError){
+      $('#warn').textContent = `⚠ ${actionError.label || 'action'} failed: ${actionError.message}`;
+      $('#warn').classList.add('show');
+      const key = `${actionError.label}:${actionError.message}:${actionError.at || ''}`;
+      if(key !== lastToastError){ lastToastError = key; toast('失敗: '+actionError.message); }
+    }else{
+      $('#warn').classList.remove('show');
+    }
 
-  // sidebar monitor
-  $('#mon').innerHTML = rows.map(p=>{
-    const isGlobal = projectKind(p)==='global';
-    const gridable = !isGlobal;
-    const gridOpen = gridable && !!gridColumnForProject(s,p.id);
-    const gridBusy = gridable && busy.has(`${p.id}:grid`);
-    const click = gridable
-      ? (gridOpen ? 'focusGrid()' : `toggleGridColumn(${jsArg(p.id)},true)`)
-      : (p.open ? `focus(${jsArg(p.id)})` : `open_(${jsArg(p.id)})`);
-    const time = gridable ? (gridBusy ? 'grid pending' : (gridOpen ? 'grid open' : 'grid closed')) : (p.open ? (p.lastAt?rel(p.lastAt):'起動中') : 'stopped');
-    return `<div class="mon-item ${p.open?'open':''} ${gridOpen?'grid-open':''}" onclick="${click}">
-      <span class="dot"></span>
-      <div class="mi-main">
-        <div class="mi-name">${esc(p.emoji || '')} ${esc(p.name)}${isGlobal?' · G':''}</div>
-        ${p.open && p.lastMessage ? `<div class="mi-msg">${esc(p.lastMessage)}</div>`:''}
-        <div class="mi-time">${esc(time)}</div>
-      </div>
-    </div>`;
-  }).join('');
+    // sidebar monitor
+    $('#mon').innerHTML = rows.map(p=>{
+      const isGlobal = projectKind(p)==='global';
+      const gridable = !isGlobal;
+      const gridOpen = gridable && !!gridColumnForProject(s,p.id);
+      const gridBusy = gridable && busy.has(`${p.id}:grid`);
+      const click = gridable
+        ? (gridOpen ? 'focusGrid()' : `toggleGridColumn(${jsArg(p.id)},true)`)
+        : (p.open ? `focus(${jsArg(p.id)})` : `open_(${jsArg(p.id)})`);
+      const time = gridable ? (gridBusy ? 'grid pending' : (gridOpen ? 'grid open' : 'grid closed')) : (p.open ? (p.lastAt?rel(p.lastAt):'起動中') : 'stopped');
+      return `<div class="mon-item ${p.open?'open':''} ${gridOpen?'grid-open':''}" onclick="${click}">
+        <span class="dot"></span>
+        <div class="mi-main">
+          <div class="mi-name">${esc(p.emoji || '')} ${esc(p.name)}${isGlobal?' · G':''}</div>
+          ${p.open && p.lastMessage ? `<div class="mi-msg">${esc(p.lastMessage)}</div>`:''}
+          <div class="mi-time">${esc(time)}</div>
+        </div>
+      </div>`;
+    }).join('');
 
-  // main grid
-  if(!rows.length){
-    $('#grid').innerHTML=renderMetricsPanels() + '<div class="empty">プロジェクトがありません。<br>「？ セットアップ」から最初のプロジェクトを登録してください。</div>';
+    // main grid
+    if(!rows.length){
+      const layout = ensureGridLayout(false);
+      syncMetricsPanels(layout.metricsPanels);
+      maybeOpenOnboarding(s);
+      return;
+    }
     maybeOpenOnboarding(s);
-    return;
+    const layout = ensureGridLayout(true);
+    syncProjectRows(s, layout.projectRows);
+    syncMetricsPanels(layout.metricsPanels);
+  }finally{
+    restoreScroll();
   }
-  maybeOpenOnboarding(s);
-  $('#grid').innerHTML = renderProjectRows(s) + renderMetricsPanels();
 }
 
 function threadFor(id){
