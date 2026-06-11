@@ -1562,6 +1562,10 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       const secondCdxSplit = gridSplitCommands[3] || {};
       const alphaStateAfterGrid = await ctl.getProjectState("alpha");
       const layout = gridWs && gridWs.layout || {};
+      const browserPaneRef = browserAnchor && browserAnchor.pane || null;
+      const rightAnchorPaneRef = rightAnchor && rightAnchor.pane || null;
+      const alphaResizePaneRef = alphaGridColumn && alphaGridColumn.cc && alphaGridColumn.cc.paneRef || null;
+      const generalResizePaneRef = generalGridColumn && generalGridColumn.cc && generalGridColumn.cc.paneRef || null;
 
       check("grid C1: ensureGridWorkspace uses dedicated tag and stays out of project state", (
         initialGridRef &&
@@ -1679,6 +1683,26 @@ async function exerciseAllSlots(id, expectedCwd, label) {
           item.pane &&
           ["L", "R"].includes(item.direction) &&
           Number(item.amount) > 0
+        ))
+      ));
+      check("grid G2: rebalance never resizes invalid outer grid borders", (
+        browserPaneRef &&
+        rightAnchorPaneRef &&
+        !gridResizeCommands.some((item) => (
+          item &&
+          ((item.pane === browserPaneRef && item.direction === "L") ||
+            (item.pane === rightAnchorPaneRef && item.direction === "R"))
+        ))
+      ));
+      check("grid G2: rebalance moves boundaries through adjacent panes", (
+        alphaResizePaneRef &&
+        generalResizePaneRef &&
+        gridResizeCommands.some((item) => item && item.pane === alphaResizePaneRef && item.direction === "L") &&
+        gridResizeCommands.some((item) => item && item.pane === generalResizePaneRef && item.direction === "L") &&
+        gridResizeCommands.some((item) => (
+          item &&
+          [alphaResizePaneRef, generalResizePaneRef].includes(item.pane) &&
+          item.direction === "R"
         ))
       ));
       {

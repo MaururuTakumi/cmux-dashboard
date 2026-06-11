@@ -1183,7 +1183,7 @@ const GRID_DASHBOARD_SPLIT = (() => {
   return Number.isFinite(n) && n > 0.08 && n < 0.4 ? n : 0.18;
 })();
 const GRID_RIGHT_ANCHOR_SPLIT = 0.94;
-const GRID_REBALANCE_MAX_PASSES = 4;
+const GRID_REBALANCE_MAX_PASSES = 5;
 const GRID_REBALANCE_TOLERANCE = 0.10;
 const GRID_REBALANCE_PANE_READ_ATTEMPTS = 5;
 const GRID_REBALANCE_PANE_READ_DELAY_MS = 600;
@@ -2805,6 +2805,22 @@ function gridRebalanceMeasurementSummary(measurements) {
   }));
 }
 
+function gridRebalanceBoundarySummary(boundaries) {
+  return (Array.isArray(boundaries) ? boundaries : []).map((item) => ({
+    name: item.name,
+    leftPaneRef: item.leftPaneRef,
+    rightPaneRef: item.rightPaneRef,
+    paneRef: item.paneRef,
+    actualPx: item.actualPx,
+    targetPx: item.targetPx,
+    targetRightPx: item.targetRightPx,
+    diffPx: item.diffPx,
+    tolerancePx: item.tolerancePx,
+    withinTolerance: item.withinTolerance,
+    ...(item.index != null ? { index: item.index } : {}),
+  }));
+}
+
 function gridRebalancePassRecord(pass, snapshot, extra = {}) {
   const record = { pass, ...extra };
   if (snapshot && snapshot.paneRead) record.paneRead = snapshot.paneRead;
@@ -2821,6 +2837,7 @@ function gridRebalancePassRecord(pass, snapshot, extra = {}) {
     withinTolerance: snapshot.withinTolerance,
     measurements: snapshot.measurements,
     summary: gridRebalanceMeasurementSummary(snapshot.measurements),
+    boundaries: gridRebalanceBoundarySummary(snapshot.boundaries),
     target: snapshot.target,
   };
 }
@@ -2838,6 +2855,39 @@ function gridRebalanceTargets(container, columnCount) {
     columnWidth: columnsWidth / columnCount,
     columnCount,
     tolerance: GRID_REBALANCE_TOLERANCE,
+  };
+}
+
+function gridBoundaryActualPx(leftFrame, rightFrame) {
+  const values = [];
+  if (leftFrame) values.push(leftFrame.x + leftFrame.width);
+  if (rightFrame) values.push(rightFrame.x);
+  if (!values.length) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function gridRebalanceBoundaryRecord(boundary, geometry, cellWidthPx) {
+  const leftPaneRef = cleanRef(boundary && boundary.leftPaneRef);
+  const rightPaneRef = cleanRef(boundary && boundary.rightPaneRef);
+  const targetRightPx = Number(boundary && boundary.targetRightPx);
+  const leftFrame = leftPaneRef ? geometry.byRef.get(leftPaneRef) : null;
+  const rightFrame = rightPaneRef ? geometry.byRef.get(rightPaneRef) : null;
+  const actual = gridBoundaryActualPx(leftFrame, rightFrame);
+  const target = Number.isFinite(targetRightPx) ? targetRightPx : 0;
+  const tolerancePx = Math.max(Number(cellWidthPx) || 1, 1);
+  const diffPx = Number.isFinite(actual) ? actual - target : null;
+  return {
+    name: boundary && boundary.name || 'boundary',
+    leftPaneRef,
+    rightPaneRef,
+    paneRef: leftPaneRef,
+    targetRightPx: Number.isFinite(targetRightPx) ? targetRightPx : null,
+    targetPx: Math.round(target),
+    actualPx: Number.isFinite(actual) ? Math.round(actual) : null,
+    diffPx: Number.isFinite(diffPx) ? Math.round(diffPx) : null,
+    tolerancePx: Math.round(tolerancePx),
+    withinTolerance: Number.isFinite(diffPx) ? Math.abs(diffPx) <= tolerancePx : false,
+    ...(boundary && boundary.index != null ? { index: boundary.index } : {}),
   };
 }
 
@@ -2907,13 +2957,27 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
     )),
     gridRebalanceMetric('rightAnchor', anchorFrame.width, target.anchorWidth, geometry.cellWidthPx, { paneRef: anchorPaneRef }),
   ];
-  const boundaries = [
-    { paneRef: browserPaneRef, targetRightPx: container.x + target.browserWidth },
-    ...orderedColumns.map((item, idx) => ({
-      paneRef: item.resizePaneRef,
-      targetRightPx: container.x + target.browserWidth + target.columnWidth * (idx + 1),
-    })),
+  const boundarySpecs = [
+    {
+      name: `browser|column:${orderedColumns[0].column.projectId || orderedColumns[0].column.columnId || 0}`,
+      leftPaneRef: browserPaneRef,
+      rightPaneRef: orderedColumns[0].resizePaneRef,
+      targetRightPx: container.x + target.browserWidth,
+    },
+    ...orderedColumns.map((item, idx) => {
+      const next = orderedColumns[idx + 1];
+      return {
+        name: next
+          ? `column:${item.column.projectId || item.column.columnId || idx}|column:${next.column.projectId || next.column.columnId || idx + 1}`
+          : `column:${item.column.projectId || item.column.columnId || idx}|rightAnchor`,
+        leftPaneRef: item.resizePaneRef,
+        rightPaneRef: next ? next.resizePaneRef : anchorPaneRef,
+        targetRightPx: container.x + target.browserWidth + target.columnWidth * (idx + 1),
+        index: idx,
+      };
+    }),
   ];
+  const boundaries = boundarySpecs.map((boundary) => gridRebalanceBoundaryRecord(boundary, geometry, geometry.cellWidthPx));
   return {
     ok: true,
     geometry,
@@ -2925,24 +2989,58 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
   };
 }
 
-async function resizeGridBoundary(wsRef, paneRef, targetRightPx, cellWidthHintPx) {
+async function resizeGridBoundary(wsRef, boundaryOrPaneRef, targetRightPx, cellWidthHintPx) {
   const ws = cleanRef(wsRef);
   if (!ws) return { resized: false, reason: 'missing workspace ref' };
-  const ref = cleanRef(paneRef);
-  if (!ref) return { resized: false, reason: 'missing pane ref' };
+  const boundary = (boundaryOrPaneRef && typeof boundaryOrPaneRef === 'object')
+    ? boundaryOrPaneRef
+    : { leftPaneRef: boundaryOrPaneRef, paneRef: boundaryOrPaneRef, targetRightPx };
+  const leftPaneRef = cleanRef(boundary.leftPaneRef || boundary.paneRef);
+  const rightPaneRef = cleanRef(boundary.rightPaneRef);
+  const target = Number(boundary.targetRightPx);
+  if (!leftPaneRef && !rightPaneRef) return { resized: false, reason: 'missing boundary pane refs' };
+  if (!Number.isFinite(target)) return { resized: false, reason: 'missing boundary target' };
   const panes = await readWorkspacePanes(ws);
   const geometry = paneGeometryIndex(panes);
-  const frame = geometry.byRef.get(ref);
-  if (!frame) return { resized: false, reason: 'missing pane frame' };
+  const leftFrame = leftPaneRef ? geometry.byRef.get(leftPaneRef) : null;
+  const rightFrame = rightPaneRef ? geometry.byRef.get(rightPaneRef) : null;
+  if (!leftFrame && !rightFrame) return { resized: false, reason: 'missing boundary pane frames', leftPaneRef, rightPaneRef };
   const cellWidthPx = geometry.cellWidthPx || cellWidthHintPx || 8;
-  const diffPx = targetRightPx - (frame.x + frame.width);
+  const actualBoundaryPx = gridBoundaryActualPx(leftFrame, rightFrame);
+  if (!Number.isFinite(actualBoundaryPx)) return { resized: false, reason: 'missing boundary measurement', leftPaneRef, rightPaneRef };
+  const diffPx = target - actualBoundaryPx;
   if (Math.abs(diffPx) <= cellWidthPx) {
-    return { resized: false, reason: 'within one cell', diffPx };
+    return { resized: false, reason: 'within one cell', diffPx, actualBoundaryPx: Math.round(actualBoundaryPx), targetRightPx: target, leftPaneRef, rightPaneRef };
   }
   const amount = Math.max(1, Math.round(Math.abs(diffPx) / cellWidthPx));
   const direction = diffPx > 0 ? '-R' : '-L';
+  const ref = diffPx > 0 ? leftPaneRef : rightPaneRef;
+  const resizeFrame = diffPx > 0 ? leftFrame : rightFrame;
+  if (!ref || !resizeFrame) {
+    return {
+      resized: false,
+      reason: diffPx > 0 ? 'missing left boundary pane frame' : 'missing right boundary pane frame',
+      leftPaneRef,
+      rightPaneRef,
+      diffPx,
+      actualBoundaryPx: Math.round(actualBoundaryPx),
+      targetRightPx: target,
+    };
+  }
   await cmux(['resize-pane', '--workspace', ws, '--pane', ref, direction, '--amount', String(amount)]);
-  return { resized: true, workspace: ws, paneRef: ref, direction, amount, diffPx, targetRightPx };
+  return {
+    resized: true,
+    workspace: ws,
+    paneRef: ref,
+    leftPaneRef,
+    rightPaneRef,
+    direction,
+    amount,
+    diffPx,
+    actualBoundaryPx: Math.round(actualBoundaryPx),
+    targetRightPx: target,
+    ...(boundary.name ? { name: boundary.name } : {}),
+  };
 }
 
 async function rebalanceGridColumns(wsRef) {
@@ -2979,7 +3077,7 @@ async function rebalanceGridColumns(wsRef) {
 
     const operations = [];
     for (const boundary of snapshot.boundaries) {
-      operations.push(await resizeGridBoundary(ref, boundary.paneRef, boundary.targetRightPx, snapshot.geometry.cellWidthPx));
+      operations.push(await resizeGridBoundary(ref, boundary, boundary.targetRightPx, snapshot.geometry.cellWidthPx));
     }
     const passChanged = operations.some((item) => item && item.resized);
     changed = changed || passChanged;
