@@ -747,7 +747,68 @@ const workspace = process.argv[3] || "";
 let s = { panes: [] };
 try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
 const panes = (s.panes || []).filter((p) => !workspace || p.workspace === workspace);
-process.stdout.write(JSON.stringify({ panes }) + "\n");
+const surfaces = (s.surfaces || []).filter((surface) => !workspace || surface.workspace === workspace);
+function gridMarker(surface) {
+  const text = [surface && surface.sendText, surface && surface.title].filter(Boolean).join(" ");
+  const match = text.match(/(cmuxdash:grid:[^\s']+):slot:(cc|cdx)/);
+  return match ? { columnKey: match[1], slot: match[2] } : null;
+}
+function paneOrder(ref) {
+  const pane = panes.find((item) => item && item.ref === ref);
+  return pane && Number.isFinite(pane.index) ? pane.index : 9999;
+}
+function withGridFrames() {
+  const browserSurface = surfaces.find((surface) => surface && surface.type === "browser");
+  const browserPane = browserSurface && browserSurface.pane || "";
+  const columnMap = new Map();
+  for (const surface of surfaces) {
+    const marker = gridMarker(surface);
+    if (!marker || !surface || !surface.pane) continue;
+    const rec = columnMap.get(marker.columnKey) || { columnKey: marker.columnKey, order: 9999, cc: "", cdx: "" };
+    rec[marker.slot] = surface.pane;
+    rec.order = Math.min(rec.order, paneOrder(surface.pane));
+    columnMap.set(marker.columnKey, rec);
+  }
+  const columns = Array.from(columnMap.values()).sort((a, b) => a.order - b.order);
+  if (!browserPane && !columns.length) return panes;
+  const columnPaneRefs = new Set(columns.flatMap((column) => [column.cc, column.cdx]).filter(Boolean));
+  const anchorPane = panes
+    .filter((pane) => pane && pane.ref !== browserPane && !columnPaneRefs.has(pane.ref))
+    .sort((a, b) => paneOrder(b.ref) - paneOrder(a.ref))[0];
+  const frames = new Map();
+  const totalWidth = 1266;
+  const totalHeight = 900;
+  const cellWidth = 7;
+  function setFrame(ref, x, y, width, height) {
+    if (!ref) return;
+    frames.set(ref, {
+      pixel_frame: { x: Math.round(x), y: Math.round(y), width: Math.round(width), height: Math.round(height) },
+      cell_frame: {
+        x: Math.round(x / cellWidth),
+        y: Math.round(y / 18),
+        width: Math.max(1, Math.round(width / cellWidth)),
+        height: Math.max(1, Math.round(height / 18)),
+      },
+      cell_width_px: cellWidth,
+    });
+  }
+  let x = 0;
+  const browserWidth = columns.length ? 1100 : 1190;
+  setFrame(browserPane, x, 0, browserWidth, totalHeight);
+  x += browserWidth;
+  columns.forEach((column, idx) => {
+    const width = idx === 0 ? 70 : 35;
+    setFrame(column.cc, x, 0, width, totalHeight / 2);
+    setFrame(column.cdx, x, totalHeight / 2, width, totalHeight / 2);
+    x += width;
+  });
+  if (anchorPane && anchorPane.ref) setFrame(anchorPane.ref, x, 0, Math.max(20, totalWidth - x), totalHeight);
+  return panes.map((pane) => {
+    const frame = pane && frames.get(pane.ref);
+    return frame ? { ...pane, ...frame } : pane;
+  });
+}
+process.stdout.write(JSON.stringify({ panes: withGridFrames() }) + "\n");
 NODE
     ;;
   list-pane-surfaces)
@@ -856,6 +917,38 @@ s.surfaces.push({ ref: surfaceRef, workspace, pane: paneRef, title: "terminal", 
 s.commands.push({ cmd: "new-split", direction, workspace, surface: anchorSurface, resultPane: paneRef, resultSurface: surfaceRef });
 fs.writeFileSync(file, JSON.stringify(s) + "\n");
 process.stdout.write("OK " + surfaceRef + " " + paneRef + " " + workspace + "\n");
+NODE
+    ;;
+  resize-pane)
+    pane=""
+    direction=""
+    amount=""
+    while [ "\$#" -gt 0 ]; do
+      case "\$1" in
+        --pane) pane="\${2:-}"; shift 2 ;;
+        --amount) amount="\${2:-}"; shift 2 ;;
+        -L|-R|-U|-D) direction="\${1#-}"; shift ;;
+        *) shift ;;
+      esac
+    done
+    "\$NODE_BIN" - "\$STATE" "\$pane" "\$direction" "\$amount" <<'NODE'
+const fs = require("fs");
+const file = process.argv[2];
+const pane = process.argv[3] || "";
+const direction = process.argv[4] || "";
+const amount = Number(process.argv[5] || "0");
+let s = { commands: [], panes: [] };
+try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
+s.commands = Array.isArray(s.commands) ? s.commands : [];
+const target = (s.panes || []).find((item) => item && item.ref === pane);
+s.commands.push({
+  cmd: "resize-pane",
+  pane,
+  workspace: target && target.workspace || null,
+  direction,
+  amount,
+});
+fs.writeFileSync(file, JSON.stringify(s) + "\n");
 NODE
     ;;
   new-surface)
@@ -1456,6 +1549,8 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       ));
       const gridSplitCommands = (rawCmuxState().commands || [])
         .filter((item) => item && item.cmd === "new-split" && item.workspace === initialGridRef);
+      const gridResizeCommands = (rawCmuxState().commands || [])
+        .filter((item) => item && item.cmd === "resize-pane" && item.workspace === initialGridRef);
       const firstCcSplit = gridSplitCommands[0] || {};
       const firstCdxSplit = gridSplitCommands[1] || {};
       const secondCcSplit = gridSplitCommands[2] || {};
@@ -1570,6 +1665,15 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         secondCcSplit.resultSurface === generalGridColumn.cc.surfaceRef &&
         secondCdxSplit.direction === "down" &&
         secondCdxSplit.surface === generalGridColumn.cc.surfaceRef
+      ));
+      check("grid G2: addProjectColumn issues resize-pane rebalance after add", (
+        gridResizeCommands.length >= 1 &&
+        gridResizeCommands.some((item) => (
+          item &&
+          item.pane &&
+          ["L", "R"].includes(item.direction) &&
+          Number(item.amount) > 0
+        ))
       ));
       {
         const threeColumnLayout = ctl.gridWorkspaceLayout([

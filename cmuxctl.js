@@ -1268,6 +1268,91 @@ async function listWorkspacePanes(wsRef) {
   catch (_) { return []; }
 }
 
+function firstFiniteNumber(obj, keys) {
+  for (const key of keys) {
+    if (!obj || !hasOwn(obj, key)) continue;
+    const n = Number(obj[key]);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function normalizeFrame(value) {
+  if (!value) return null;
+  if (Array.isArray(value) && value.length >= 4) {
+    const nums = value.slice(0, 4).map((item) => Number(item));
+    if (nums.every(Number.isFinite)) return { x: nums[0], y: nums[1], width: nums[2], height: nums[3] };
+  }
+  if (typeof value !== 'object') return null;
+  const x = firstFiniteNumber(value, ['x', 'left']);
+  const y = firstFiniteNumber(value, ['y', 'top']);
+  const width = firstFiniteNumber(value, ['width', 'w']);
+  const height = firstFiniteNumber(value, ['height', 'h']);
+  if ([x, y, width, height].every((n) => Number.isFinite(n)) && width > 0 && height > 0) {
+    return { x, y, width, height };
+  }
+  return null;
+}
+
+function panePixelFrame(pane) {
+  if (!pane) return null;
+  return normalizeFrame(
+    pane.pixel_frame ||
+    pane.pixelFrame ||
+    pane.frame_pixels ||
+    pane.framePixels ||
+    pane.pixelFramePx ||
+    (pane.frame && (pane.frame.pixel || pane.frame.pixels || pane.frame.pixel_frame))
+  );
+}
+
+function paneCellFrame(pane) {
+  if (!pane) return null;
+  return normalizeFrame(
+    pane.cell_frame ||
+    pane.cellFrame ||
+    pane.frame_cells ||
+    pane.frameCells ||
+    (pane.frame && (pane.frame.cell || pane.frame.cells || pane.frame.cell_frame))
+  );
+}
+
+function plausibleCellWidthPx(value) {
+  return Number.isFinite(value) && value >= 3 && value <= 40;
+}
+
+function paneCellWidthPx(pane, pixelFrame = panePixelFrame(pane)) {
+  const direct = firstFiniteNumber(pane, [
+    'cell_width_px',
+    'cellWidthPx',
+    'cell_width',
+    'cellWidth',
+    'char_width_px',
+    'charWidthPx',
+  ]);
+  if (plausibleCellWidthPx(direct)) return direct;
+
+  const cellFrame = paneCellFrame(pane);
+  if (pixelFrame && cellFrame && cellFrame.width > 0) {
+    const fromCellFrame = pixelFrame.width / cellFrame.width;
+    if (plausibleCellWidthPx(fromCellFrame)) return fromCellFrame;
+  }
+
+  const cellCount = firstFiniteNumber(pane, ['columns', 'cols', 'cell_width_cells', 'width_cells', 'cells_width']);
+  if (pixelFrame && cellCount > 0) {
+    const fromCellCount = pixelFrame.width / cellCount;
+    if (plausibleCellWidthPx(fromCellCount)) return fromCellCount;
+  }
+
+  const paneWidth = firstFiniteNumber(pane, ['width']);
+  if (pixelFrame && paneWidth > 0 && paneWidth < pixelFrame.width) {
+    const fromPaneWidth = pixelFrame.width / paneWidth;
+    if (plausibleCellWidthPx(fromPaneWidth)) return fromPaneWidth;
+  }
+
+  return null;
+}
+
 async function listWorkspaceSurfaces(wsRef) {
   const panes = await listWorkspacePanes(wsRef);
   const surfaces = [];
@@ -2544,6 +2629,182 @@ async function findGridRightAnchorSurface(wsRef, attempts = 6) {
   throw new Error(`grid right anchor surface was not resolved in ${wsRef}`);
 }
 
+function gridColumnPaneRefs(column) {
+  return [
+    column && column.cc && column.cc.paneRef,
+    column && column.cdx && column.cdx.paneRef,
+  ].map(cleanRef).filter(Boolean);
+}
+
+function gridColumnResizePaneRef(column, frameByPane) {
+  const refs = gridColumnPaneRefs(column);
+  return refs.find((ref) => frameByPane.has(ref)) || refs[0] || null;
+}
+
+function paneBoundsForRefs(frameByPane, refs) {
+  const frames = (Array.isArray(refs) ? refs : [])
+    .map((ref) => frameByPane.get(cleanRef(ref)))
+    .filter(Boolean);
+  if (!frames.length) return null;
+  const left = Math.min(...frames.map((frame) => frame.x));
+  const top = Math.min(...frames.map((frame) => frame.y));
+  const right = Math.max(...frames.map((frame) => frame.x + frame.width));
+  const bottom = Math.max(...frames.map((frame) => frame.y + frame.height));
+  return { x: left, y: top, width: right - left, height: bottom - top, right, bottom };
+}
+
+function paneGeometryIndex(panes) {
+  const byRef = new Map();
+  const frames = [];
+  let cellWidthPx = null;
+  for (const pane of Array.isArray(panes) ? panes : []) {
+    const ref = cleanRef(pane && pane.ref);
+    const frame = panePixelFrame(pane);
+    if (!ref || !frame) continue;
+    byRef.set(ref, frame);
+    frames.push({ ref, pane, frame });
+    const paneCellWidth = paneCellWidthPx(pane, frame);
+    if (paneCellWidth && (!cellWidthPx || paneCellWidth < cellWidthPx)) cellWidthPx = paneCellWidth;
+  }
+  return { byRef, frames, cellWidthPx: cellWidthPx || 8 };
+}
+
+function boundsForFrames(frames) {
+  if (!Array.isArray(frames) || !frames.length) return null;
+  const left = Math.min(...frames.map((item) => item.frame.x));
+  const top = Math.min(...frames.map((item) => item.frame.y));
+  const right = Math.max(...frames.map((item) => item.frame.x + item.frame.width));
+  const bottom = Math.max(...frames.map((item) => item.frame.y + item.frame.height));
+  return { x: left, y: top, width: right - left, height: bottom - top, right, bottom };
+}
+
+function fallbackPaneRefByPosition(frames, excludedRefs, side) {
+  const candidates = (Array.isArray(frames) ? frames : [])
+    .filter((item) => item && item.ref && !(excludedRefs || new Set()).has(item.ref));
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => {
+    const ax = side === 'right' ? a.frame.x + a.frame.width : a.frame.x;
+    const bx = side === 'right' ? b.frame.x + b.frame.width : b.frame.x;
+    return side === 'right' ? bx - ax : ax - bx;
+  });
+  return candidates[0].ref;
+}
+
+async function resizeGridBoundary(wsRef, paneRef, targetRightPx, cellWidthHintPx) {
+  const ref = cleanRef(paneRef);
+  if (!ref) return { resized: false, reason: 'missing pane ref' };
+  const panes = await readWorkspacePanes(wsRef);
+  const geometry = paneGeometryIndex(panes);
+  const frame = geometry.byRef.get(ref);
+  if (!frame) return { resized: false, reason: 'missing pane frame' };
+  const cellWidthPx = geometry.cellWidthPx || cellWidthHintPx || 8;
+  const diffPx = targetRightPx - (frame.x + frame.width);
+  if (Math.abs(diffPx) <= cellWidthPx) {
+    return { resized: false, reason: 'within one cell', diffPx };
+  }
+  const amount = Math.max(1, Math.round(Math.abs(diffPx) / cellWidthPx));
+  const direction = diffPx > 0 ? '-R' : '-L';
+  await cmux(['resize-pane', '--pane', ref, direction, '--amount', String(amount)]);
+  return { resized: true, paneRef: ref, direction, amount, diffPx };
+}
+
+async function rebalanceGridColumns(wsRef) {
+  const ref = cleanRef(wsRef);
+  if (!ref) return { rebalanced: false, reason: 'missing workspace ref' };
+  const columns = (Array.isArray(gridRuntimeState.columns) ? gridRuntimeState.columns : [])
+    .filter((column) => column && (!column.wsRef || column.wsRef === ref));
+  if (!columns.length) return { rebalanced: false, reason: 'no columns' };
+
+  const panes = await readWorkspacePanes(ref);
+  const geometry = paneGeometryIndex(panes);
+  if (!geometry.frames.length) return { rebalanced: false, reason: 'missing pixel frames' };
+
+  const surfaces = await listWorkspaceSurfaces(ref);
+  const browserSurface = gridBrowserAnchorSurface(surfaces);
+  const anchorSurface = gridRightAnchorSurface(surfaces, columns);
+  const columnPaneRefs = new Set(columns.flatMap(gridColumnPaneRefs));
+  const excludedForBrowser = new Set(columnPaneRefs);
+  const anchorPaneRefFromSurface = cleanRef(anchorSurface && anchorSurface.paneRef);
+  if (anchorPaneRefFromSurface) excludedForBrowser.add(anchorPaneRefFromSurface);
+
+  let browserPaneRef = cleanRef(browserSurface && browserSurface.paneRef);
+  if (!browserPaneRef || !geometry.byRef.has(browserPaneRef)) {
+    browserPaneRef = fallbackPaneRefByPosition(geometry.frames, excludedForBrowser, 'left');
+  }
+  if (!browserPaneRef || !geometry.byRef.has(browserPaneRef)) {
+    return { rebalanced: false, reason: 'missing browser pane frame' };
+  }
+
+  let anchorPaneRef = anchorPaneRefFromSurface;
+  if (!anchorPaneRef || !geometry.byRef.has(anchorPaneRef)) {
+    const excludedForAnchor = new Set(columnPaneRefs);
+    excludedForAnchor.add(browserPaneRef);
+    anchorPaneRef = fallbackPaneRefByPosition(geometry.frames, excludedForAnchor, 'right');
+  }
+  if (!anchorPaneRef || !geometry.byRef.has(anchorPaneRef)) {
+    return { rebalanced: false, reason: 'missing right anchor pane frame' };
+  }
+
+  const orderedColumns = columns
+    .map((column) => {
+      const refs = gridColumnPaneRefs(column);
+      const bounds = paneBoundsForRefs(geometry.byRef, refs);
+      return {
+        column,
+        refs,
+        bounds,
+        resizePaneRef: gridColumnResizePaneRef(column, geometry.byRef),
+      };
+    })
+    .filter((item) => item.bounds && item.resizePaneRef)
+    .sort((a, b) => a.bounds.x - b.bounds.x);
+  if (orderedColumns.length !== columns.length) {
+    return { rebalanced: false, reason: 'missing column pane frames' };
+  }
+
+  const container = boundsForFrames(geometry.frames);
+  if (!container || container.width <= 0) return { rebalanced: false, reason: 'missing container frame' };
+
+  const browserWidth = Math.max(1, Math.round(container.width * GRID_DASHBOARD_SPLIT));
+  const maxAnchorWidth = Math.max(1, container.width - browserWidth - orderedColumns.length);
+  const anchorWidth = Math.min(maxAnchorWidth, Math.max(40, Math.round(container.width * 0.02)));
+  const columnsWidth = container.width - browserWidth - anchorWidth;
+  if (columnsWidth <= 0) return { rebalanced: false, reason: 'insufficient container width' };
+
+  const columnWidth = columnsWidth / orderedColumns.length;
+  const boundaries = [
+    { paneRef: browserPaneRef, targetRightPx: container.x + browserWidth },
+    ...orderedColumns.map((item, idx) => ({
+      paneRef: item.resizePaneRef,
+      targetRightPx: container.x + browserWidth + columnWidth * (idx + 1),
+    })),
+  ];
+
+  const operations = [];
+  for (const boundary of boundaries) {
+    operations.push(await resizeGridBoundary(ref, boundary.paneRef, boundary.targetRightPx, geometry.cellWidthPx));
+  }
+  return {
+    rebalanced: operations.some((item) => item && item.resized),
+    operations,
+    target: {
+      containerWidth: container.width,
+      browserWidth,
+      anchorWidth,
+      columnWidth,
+      columnCount: orderedColumns.length,
+    },
+  };
+}
+
+async function rebalanceGridColumnsBestEffort(wsRef) {
+  try { return await rebalanceGridColumns(wsRef); }
+  catch (err) {
+    console.warn(`grid column rebalance failed: ${summarizeError(err)}`);
+    return { rebalanced: false, error: summarizeError(err) };
+  }
+}
+
 async function createAnchoredGridSplitSurface(wsRef, anchorSurfaceRef, direction) {
   const anchor = cleanRef(anchorSurfaceRef);
   if (!wsRef) throw new Error('grid workspace ref is required');
@@ -2865,6 +3126,7 @@ async function addProjectColumn(projectId, { focus = false } = {}) {
   const next = await validateGridRuntimeState();
   const column = next.columns.find((item) => item && item.projectId === projectId);
   if (!column) throw new Error('grid column was not created: ' + projectId);
+  await rebalanceGridColumnsBestEffort(next.wsRef);
   const response = { ...column, added: true, already: false, rebuilt: false, incremental: true };
   if (focus) response.focus = await focusGridWorkspace({ wsRef: next.wsRef });
   return response;
@@ -2912,6 +3174,7 @@ async function removeProjectColumn(projectId) {
   reindexGridColumns();
   await settle();
   const result = await validateGridRuntimeState();
+  await rebalanceGridColumnsBestEffort(result.wsRef);
   return {
     projectId,
     removed: true,
@@ -3235,7 +3498,7 @@ module.exports = {
   agmsgDbPath, getTeamMessages,
   createCmuxHealthTracker, getCmuxHealth, pingCmuxForRecovery,
   getState, getWorkspaceYaml, getProjectState, ensureSlot, ensureCollabSlots, sendToSurface, submitToSurface, loadConfig, saveConfig, openProject, closeProject, focusProject,
-  workspaceRefExists, ensureGridWorkspace, focusGridWorkspace, addProjectColumn, removeProjectColumn, getGridState, gridWorkspaceLayout,
+  workspaceRefExists, ensureGridWorkspace, focusGridWorkspace, addProjectColumn, removeProjectColumn, rebalanceGridColumns, getGridState, gridWorkspaceLayout,
   openAll, closeAll, reorderProjects, addProject, removeProject, expandHome, rowCwd, rowCwdInfo, normalizeCollabProjectDir, normalizeCollabProjectDirInfo,
   projectKind, isGlobalProject, configuredRows, configuredProjectRows, configuredGlobalRows,
 };
