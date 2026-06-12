@@ -175,6 +175,10 @@ async function api(req, res, urlPath) {
     if (req.method === 'GET' && urlPath === '/api/grid') {
       return sendJson(res, 200, await ctl.getGridState());
     }
+    if (req.method === 'POST' && urlPath === '/api/grid/rebuild') {
+      const body = await readBody(req);
+      return sendJson(res, 200, await ctl.rebuildGridSafely(body));
+    }
     if (req.method === 'POST' && urlPath === '/api/grid/focus') {
       return defer(res, () => ctl.focusGridWorkspace(), 'grid:focus');
     }

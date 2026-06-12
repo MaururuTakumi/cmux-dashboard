@@ -14,6 +14,7 @@ const GRID_ID = '__grid__';
 const GRID_TAG = TAG + GRID_ID;
 const GRID_MARK_PREFIX = `${TAG}grid:`;
 const GRID_CONCIERGE_MARKER = `${GRID_MARK_PREFIX}${GRID_ID}:concierge`;
+const GRID_RIGHT_ANCHOR_MARKER = `${GRID_MARK_PREFIX}${GRID_ID}:right-anchor`;
 const DEFAULT_DASHBOARD_PORT = 7799;
 const PROJECTS_FILE = process.env.CMUX_DASH_PROJECTS_FILE || path.join(__dirname, 'projects.json');
 const PROJECTS_EXAMPLE_FILE = process.env.CMUX_DASH_PROJECTS_EXAMPLE_FILE || path.join(__dirname, 'projects.example.json');
@@ -1185,6 +1186,7 @@ const gridRuntimeState = {
     marker: GRID_CONCIERGE_MARKER,
   },
   columns: [],
+  orphans: [],
   lastRebalance: null,
   lastRebalanceRepairAt: null,
 };
@@ -1197,6 +1199,7 @@ const GRID_REBALANCE_MAX_PASSES = 8;
 const GRID_REBALANCE_TOLERANCE = 0.05;
 const GRID_REBALANCE_REPAIR_TOLERANCE = 0.10;
 const GRID_RESIZE_FALLBACK_PX_PER_AMOUNT = 0.5;
+const GRID_RIGHT_ANCHOR_SLIVER_RATIO = 0.01;
 const GRID_REBALANCE_REPAIR_THROTTLE_MS = 3000;
 const GRID_REBALANCE_PANE_READ_ATTEMPTS = 5;
 const GRID_REBALANCE_PANE_READ_DELAY_MS = 600;
@@ -1322,6 +1325,18 @@ function panePixelFrame(pane) {
     pane.framePixels ||
     pane.pixelFramePx ||
     (pane.frame && (pane.frame.pixel || pane.frame.pixels || pane.frame.pixel_frame))
+  );
+}
+
+function surfacePixelFrame(surface) {
+  if (!surface) return null;
+  return normalizeFrame(
+    surface.pixel_frame ||
+    surface.pixelFrame ||
+    surface.frame_pixels ||
+    surface.framePixels ||
+    surface.pixelFramePx ||
+    (surface.frame && (surface.frame.pixel || surface.frame.pixels || surface.frame.pixel_frame))
   );
 }
 
@@ -1908,6 +1923,10 @@ function gridConciergeTitleCommand() {
   return `printf '\\033]0;${GRID_CONCIERGE_MARKER}\\007'`;
 }
 
+function gridRightAnchorTitleCommand() {
+  return `printf '\\033]0;${GRID_RIGHT_ANCHOR_MARKER}\\007'`;
+}
+
 function shellQuote(value) {
   return `'${String(value || '').replace(/'/g, "'\\''")}'`;
 }
@@ -1933,7 +1952,7 @@ function gridConciergeLaunchCommand() {
   return `${gridConciergeTitleCommand()}; ${claudeGuard}; mkdir -p ${cwd} && cd ${cwd} && exec ${SLOT_DEFS.cc.defaultCommand}`;
 }
 
-function slotMarkerSearchText(surface) {
+function surfaceMarkerSearchText(surface) {
   return [
     surface && surface.title,
     surface && surface.name,
@@ -1942,7 +1961,11 @@ function slotMarkerSearchText(surface) {
     surface && surface.paneTitle,
     surface && surface.paneName,
     surface && surface.paneDescription,
-  ].filter(Boolean).join('\n').toLowerCase();
+  ].filter(Boolean).join('\n');
+}
+
+function slotMarkerSearchText(surface) {
+  return surfaceMarkerSearchText(surface).toLowerCase();
 }
 
 function normalizedPath(value) {
@@ -2451,6 +2474,9 @@ function gridStateSnapshot(wsRef, columns = gridRuntimeState.columns) {
     columns: (Array.isArray(columns) ? columns : [])
       .map((column, idx) => gridColumnSnapshot(column, idx))
       .filter(Boolean),
+    orphans: (Array.isArray(gridRuntimeState.orphans) ? gridRuntimeState.orphans : [])
+      .map((orphan) => ({ ...orphan }))
+      .filter((orphan) => orphan.surfaceRef || orphan.paneRef),
     lastRebalance: gridRuntimeState.lastRebalance || null,
   };
 }
@@ -2518,6 +2544,7 @@ async function ensureGridWorkspace() {
   gridRuntimeState.anchorSurfaceRef = null;
   resetGridConcierge();
   gridRuntimeState.columns = [];
+  gridRuntimeState.orphans = [];
   gridRuntimeState.lastRebalance = null;
   gridRuntimeState.lastRebalanceRepairAt = null;
   await ensureConciergeSurface(ref);
@@ -2687,6 +2714,223 @@ function gridColumnSurfaceRefSet(columns = gridRuntimeState.columns) {
   return refs;
 }
 
+function parseGridColumnMarker(surface) {
+  const text = surfaceMarkerSearchText(surface);
+  if (!text) return null;
+  const current = text.match(/cmuxdash:grid:__grid__:column:([^:\s'"]+):slot:(cc|cdx)\b/i);
+  if (current) {
+    return {
+      columnId: current[1],
+      projectId: current[1],
+      slot: current[2].toLowerCase(),
+      marker: current[0],
+      style: 'grid-column',
+    };
+  }
+  const legacy = text.match(/cmuxdash:grid:([^:\s'"]+):slot:(cc|cdx)\b/i);
+  if (legacy && legacy[1] !== GRID_ID) {
+    return {
+      columnId: legacy[1],
+      projectId: legacy[1],
+      slot: legacy[2].toLowerCase(),
+      marker: legacy[0],
+      style: 'legacy-column',
+    };
+  }
+  return null;
+}
+
+function hasUnrecognizedGridMarker(surface) {
+  const text = slotMarkerSearchText(surface);
+  return text.includes(GRID_MARK_PREFIX) &&
+    !parseGridColumnMarker(surface) &&
+    !text.includes(GRID_CONCIERGE_MARKER.toLowerCase()) &&
+    !text.includes(GRID_RIGHT_ANCHOR_MARKER.toLowerCase());
+}
+
+function isGridRightAnchorSurface(surface) {
+  if (!surface || !surface.ref) return false;
+  const knownRef = cleanRef(gridRuntimeState.anchorSurfaceRef);
+  if (knownRef && cleanRef(surface.ref) === knownRef) return true;
+  return slotMarkerSearchText(surface).includes(GRID_RIGHT_ANCHOR_MARKER.toLowerCase());
+}
+
+function markedGridRightAnchorSurface(surfaces) {
+  return markerSurface(surfaces, GRID_RIGHT_ANCHOR_MARKER);
+}
+
+function gridProjectOrderIndex(cfg) {
+  const order = new Map();
+  configuredRows(cfg).forEach((project, idx) => {
+    if (project && project.id && !order.has(project.id)) order.set(project.id, idx);
+  });
+  return order;
+}
+
+function gridOrphanSurface(surface, reason, extra = {}) {
+  return {
+    surfaceRef: cleanRef(surface && surface.ref),
+    paneRef: cleanRef(surface && surface.paneRef),
+    title: surface && surface.title || null,
+    type: surface && surface.type || null,
+    process: surface && surface.process || null,
+    reason,
+    ...extra,
+  };
+}
+
+function validExistingGridColumn(column, byRef, wsRef) {
+  const ccRef = cleanRef(column && column.cc && column.cc.surfaceRef);
+  const cdxRef = cleanRef(column && column.cdx && column.cdx.surfaceRef);
+  if (!column || !ccRef || !cdxRef || !byRef.has(ccRef) || !byRef.has(cdxRef)) return null;
+  const cc = byRef.get(ccRef);
+  const cdx = byRef.get(cdxRef);
+  return {
+    ...column,
+    wsRef,
+    cc: { ...column.cc, paneRef: cc && cc.paneRef || column.cc.paneRef || null },
+    cdx: { ...column.cdx, paneRef: cdx && cdx.paneRef || column.cdx.paneRef || null },
+  };
+}
+
+function buildAdoptedGridColumns(wsRef, surfaces, cfg, now = new Date().toISOString()) {
+  const byRef = liveSurfaceIndex(surfaces);
+  const records = new Map();
+  const markerOrphans = [];
+  const surfaceOrder = new Map();
+  (Array.isArray(surfaces) ? surfaces : []).forEach((surface, idx) => {
+    if (surface && surface.ref) surfaceOrder.set(surface.ref, idx);
+    const marker = parseGridColumnMarker(surface);
+    if (!marker) {
+      if (hasUnrecognizedGridMarker(surface)) markerOrphans.push(gridOrphanSurface(surface, 'unrecognized_grid_marker'));
+      return;
+    }
+    const projectId = cleanRef(marker.projectId);
+    if (!projectId) {
+      markerOrphans.push(gridOrphanSurface(surface, 'empty_grid_column_marker', { marker: marker.marker, slot: marker.slot }));
+      return;
+    }
+    const record = records.get(projectId) || {
+      columnId: gridColumnId(marker.columnId || projectId),
+      projectId,
+      firstIndex: idx,
+      markers: {},
+      cc: null,
+      cdx: null,
+      duplicateSurfaces: [],
+    };
+    if (record[marker.slot]) {
+      record.duplicateSurfaces.push({ surface, marker });
+    } else {
+      record[marker.slot] = surface;
+      record.markers[marker.slot] = marker.marker;
+      record.firstIndex = Math.min(record.firstIndex, idx);
+    }
+    records.set(projectId, record);
+  });
+
+  const existingByProject = new Map();
+  for (const column of Array.isArray(gridRuntimeState.columns) ? gridRuntimeState.columns : []) {
+    const live = validExistingGridColumn(column, byRef, wsRef);
+    if (live && live.projectId && !existingByProject.has(live.projectId)) {
+      existingByProject.set(live.projectId, {
+        ...live,
+        firstIndex: Math.min(
+          surfaceOrder.get(live.cc.surfaceRef) ?? Number.MAX_SAFE_INTEGER,
+          surfaceOrder.get(live.cdx.surfaceRef) ?? Number.MAX_SAFE_INTEGER,
+        ),
+      });
+    }
+  }
+
+  const merged = new Map(existingByProject);
+  for (const record of records.values()) {
+    for (const duplicate of record.duplicateSurfaces) {
+      markerOrphans.push(gridOrphanSurface(duplicate.surface, 'duplicate_grid_column_marker', {
+        projectId: record.projectId,
+        slot: duplicate.marker && duplicate.marker.slot || null,
+        marker: duplicate.marker && duplicate.marker.marker || null,
+      }));
+    }
+    if (!record.cc || !record.cdx) {
+      for (const slot of ['cc', 'cdx']) {
+        if (record[slot]) {
+          markerOrphans.push(gridOrphanSurface(record[slot], 'incomplete_grid_column_marker', {
+            projectId: record.projectId,
+            slot,
+            marker: record.markers[slot] || null,
+          }));
+        }
+      }
+      continue;
+    }
+    const existing = existingByProject.get(record.projectId);
+    merged.set(record.projectId, {
+      columnId: gridColumnId(record.columnId || record.projectId),
+      projectId: record.projectId,
+      wsRef,
+      firstIndex: record.firstIndex,
+      cc: {
+        surfaceRef: record.cc.ref,
+        paneRef: record.cc.paneRef || null,
+        marker: gridSlotMarker(record.columnId || record.projectId, 'cc'),
+      },
+      cdx: {
+        surfaceRef: record.cdx.ref,
+        paneRef: record.cdx.paneRef || null,
+        marker: gridSlotMarker(record.columnId || record.projectId, 'cdx'),
+      },
+      createdAt: existing && existing.createdAt || now,
+      updatedAt: now,
+      adopted: !existing,
+    });
+  }
+
+  const order = gridProjectOrderIndex(cfg);
+  const columns = Array.from(merged.values()).sort((a, b) => {
+    const ai = order.has(a.projectId) ? order.get(a.projectId) : Number.MAX_SAFE_INTEGER;
+    const bi = order.has(b.projectId) ? order.get(b.projectId) : Number.MAX_SAFE_INTEGER;
+    if (ai !== bi) return ai - bi;
+    const af = Number.isFinite(a.firstIndex) ? a.firstIndex : Number.MAX_SAFE_INTEGER;
+    const bf = Number.isFinite(b.firstIndex) ? b.firstIndex : Number.MAX_SAFE_INTEGER;
+    if (af !== bf) return af - bf;
+    return String(a.projectId || '').localeCompare(String(b.projectId || ''));
+  }).map((column, idx) => {
+    const { firstIndex, adopted, ...rest } = column;
+    return { ...rest, order: idx, ...(adopted ? { adopted: true } : {}) };
+  });
+
+  return { columns, markerOrphans };
+}
+
+function gridRuntimeOrphansFromSurfaces(surfaces, columns, known = {}, extra = []) {
+  const interpreted = gridColumnSurfaceRefSet(columns);
+  for (const ref of [
+    known.browserSurfaceRef,
+    known.conciergeSurfaceRef,
+    known.rightAnchorSurfaceRef,
+  ]) {
+    const clean = cleanRef(ref);
+    if (clean) interpreted.add(clean);
+  }
+  const orphans = [...extra];
+  for (const surface of Array.isArray(surfaces) ? surfaces : []) {
+    if (!surface || !surface.ref || interpreted.has(surface.ref)) continue;
+    if (!isGridTerminalSurface(surface)) continue;
+    if (parseGridColumnMarker(surface)) continue;
+    if (slotMarkerSearchText(surface).includes(GRID_CONCIERGE_MARKER.toLowerCase())) continue;
+    if (slotMarkerSearchText(surface).includes(GRID_RIGHT_ANCHOR_MARKER.toLowerCase())) continue;
+    orphans.push(gridOrphanSurface(surface, hasUnrecognizedGridMarker(surface) ? 'unrecognized_grid_marker' : 'unmanaged_grid_terminal'));
+  }
+  const seen = new Set();
+  return orphans.filter((orphan) => {
+    const key = `${orphan.surfaceRef || ''}:${orphan.paneRef || ''}:${orphan.reason || ''}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function isGridConciergeSurface(surface) {
   if (!surface || !surface.ref) return false;
   const state = gridRuntimeState.concierge || {};
@@ -2733,12 +2977,15 @@ function gridRightAnchorSurface(surfaces, columns = gridRuntimeState.columns) {
   const list = Array.isArray(surfaces) ? surfaces : [];
   const columnRefs = gridColumnSurfaceRefSet(columns);
   const knownRef = cleanRef(gridRuntimeState.anchorSurfaceRef);
+  const marked = markedGridRightAnchorSurface(list);
+  if (marked && marked.ref) return marked;
   const candidates = list.filter((surface) => (
     surface &&
     surface.ref &&
     isGridTerminalSurface(surface) &&
     !columnRefs.has(surface.ref) &&
     !isGridConciergeSurface(surface) &&
+    !parseGridColumnMarker(surface) &&
     !isGridColumnLikeTerminalSurface(surface)
   ));
   if (knownRef) {
@@ -2871,6 +3118,30 @@ function gridResizeCalibrationFromSnapshot(operations, snapshot) {
   };
 }
 
+function gridResizeObservationsFromSnapshot(operations, snapshot) {
+  if (!snapshot || !snapshot.ok || !Array.isArray(snapshot.boundaries)) return [];
+  const byName = new Map(snapshot.boundaries.map((boundary) => [boundary.name, boundary]));
+  const minMovePx = Math.max(1, Number(snapshot.geometry && snapshot.geometry.cellWidthPx) * 0.25 || 1);
+  return (Array.isArray(operations) ? operations : []).map((op) => {
+    if (!op || !op.resized || !op.name) return null;
+    const before = Number(op.actualBoundaryPx);
+    const next = byName.get(op.name);
+    const after = Number(next && next.actualPx);
+    if (!Number.isFinite(before) || !Number.isFinite(after)) return null;
+    const observedMovePx = after - before;
+    return {
+      name: op.name,
+      beforePx: Math.round(before),
+      afterPx: Math.round(after),
+      observedMovePx: Math.round(observedMovePx),
+      absObservedMovePx: Math.abs(observedMovePx),
+      moved: Math.abs(observedMovePx) >= minMovePx,
+      minMovePx,
+      operation: op,
+    };
+  }).filter(Boolean);
+}
+
 function fallbackPaneRefByPosition(frames, excludedRefs, side) {
   const candidates = (Array.isArray(frames) ? frames : [])
     .filter((item) => item && item.ref && !(excludedRefs || new Set()).has(item.ref));
@@ -2995,6 +3266,9 @@ function gridRebalanceBoundarySummary(boundaries) {
     diffPx: item.diffPx,
     tolerancePx: item.tolerancePx,
     withinTolerance: item.withinTolerance,
+    ...(item.anchorSliver ? { anchorSliver: true } : {}),
+    ...(item.sliverThresholdPx != null ? { sliverThresholdPx: item.sliverThresholdPx } : {}),
+    ...(item.frameSource ? { frameSource: item.frameSource } : {}),
     ...(item.index != null ? { index: item.index } : {}),
   }));
 }
@@ -3132,7 +3406,11 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
     .map(cleanRef)
     .filter((paneRef) => paneRef && geometry.byRef.has(paneRef));
   const browserFrame = paneBoundsForRefs(geometry.byRef, leftAreaPaneRefs) || geometry.byRef.get(browserPaneRef);
-  const anchorFrame = geometry.byRef.get(anchorPaneRef);
+  const anchorSurfaceFrame = surfacePixelFrame(anchorSurface);
+  const anchorFrame = anchorSurfaceFrame || geometry.byRef.get(anchorPaneRef);
+  const anchorFrameSource = anchorSurfaceFrame ? 'surface_frame' : 'pane_frame_re_read';
+  const anchorSliverThresholdPx = Math.max(1, container.width * GRID_RIGHT_ANCHOR_SLIVER_RATIO);
+  const anchorSliver = !!(anchorFrame && anchorFrame.width < anchorSliverThresholdPx);
   const measurements = [
     gridRebalanceMetric('browser', browserFrame.width, target.browserWidth, geometry.cellWidthPx, { paneRef: browserPaneRef }),
     ...orderedColumns.map((item, idx) => gridRebalanceMetric(
@@ -3142,7 +3420,12 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
       geometry.cellWidthPx,
       { paneRef: item.resizePaneRef, index: idx },
     )),
-    gridRebalanceMetric('rightAnchor', anchorFrame.width, target.anchorWidth, geometry.cellWidthPx, { paneRef: anchorPaneRef }),
+    gridRebalanceMetric('rightAnchor', anchorFrame.width, target.anchorWidth, geometry.cellWidthPx, {
+      paneRef: anchorPaneRef,
+      frameSource: anchorFrameSource,
+      sliver: anchorSliver,
+      sliverThresholdPx: Math.round(anchorSliverThresholdPx),
+    }),
   ];
   const boundarySpecs = [
     {
@@ -3165,6 +3448,16 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
     }),
   ];
   const boundaries = boundarySpecs.map((boundary) => gridRebalanceBoundaryRecord(boundary, geometry, geometry.cellWidthPx));
+  if (anchorSliver && boundaries.length) {
+    const last = boundaries[boundaries.length - 1];
+    boundaries[boundaries.length - 1] = {
+      ...last,
+      withinTolerance: false,
+      anchorSliver: true,
+      sliverThresholdPx: Math.round(anchorSliverThresholdPx),
+      frameSource: anchorFrameSource,
+    };
+  }
   return {
     ok: true,
     geometry,
@@ -3172,7 +3465,15 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
     target,
     measurements,
     boundaries,
-    withinTolerance: boundaries.every((item) => item.withinTolerance),
+    rightAnchor: {
+      paneRef: anchorPaneRef,
+      surfaceRef: anchorSurface && anchorSurface.ref || null,
+      widthPx: Math.round(anchorFrame.width),
+      sliver: anchorSliver,
+      sliverThresholdPx: Math.round(anchorSliverThresholdPx),
+      frameSource: anchorFrameSource,
+    },
+    withinTolerance: boundaries.every((item) => item.withinTolerance) && !anchorSliver,
   };
 }
 
@@ -3196,8 +3497,9 @@ async function resizeGridBoundary(wsRef, boundaryOrPaneRef, targetRightPx, cellW
   const actualBoundaryPx = gridBoundaryActualPx(leftFrame, rightFrame);
   if (!Number.isFinite(actualBoundaryPx)) return { resized: false, reason: 'missing boundary measurement', leftPaneRef, rightPaneRef };
   const diffPx = target - actualBoundaryPx;
-  const resizeTolerancePx = Math.max(1, Number(boundary.tolerancePx) || Number(opts.tolerancePx) || cellWidthPx);
-  if (Math.abs(diffPx) <= resizeTolerancePx) {
+  const forceResize = !!(opts.forceResize || boundary.anchorSliver);
+  const resizeTolerancePx = forceResize ? 0 : Math.max(1, Number(boundary.tolerancePx) || Number(opts.tolerancePx) || cellWidthPx);
+  if (!forceResize && Math.abs(diffPx) <= resizeTolerancePx) {
     return {
       resized: false,
       reason: 'within tolerance',
@@ -3212,9 +3514,17 @@ async function resizeGridBoundary(wsRef, boundaryOrPaneRef, targetRightPx, cellW
   }
   const pxPerAmount = gridResizeCoefficientPxPerAmount(opts.pxPerAmount);
   const amount = Math.max(1, Math.ceil(Math.abs(diffPx) / pxPerAmount));
-  const direction = diffPx > 0 ? '-R' : '-L';
-  const ref = diffPx > 0 ? leftPaneRef : rightPaneRef;
-  const resizeFrame = diffPx > 0 ? leftFrame : rightFrame;
+  const primary = diffPx > 0
+    ? { ref: leftPaneRef, frame: leftFrame, direction: '-R', convention: 'left-pane-R' }
+    : { ref: rightPaneRef, frame: rightFrame, direction: '-L', convention: 'right-pane-L' };
+  const alternate = diffPx > 0
+    ? { ref: rightPaneRef, frame: rightFrame, direction: '-L', convention: 'right-pane-L' }
+    : { ref: leftPaneRef, frame: leftFrame, direction: '-R', convention: 'left-pane-R' };
+  const strategy = opts.strategy === 'alternate' && alternate.ref && alternate.frame ? 'alternate' : 'primary';
+  const instruction = strategy === 'alternate' ? alternate : primary;
+  const direction = instruction.direction;
+  const ref = instruction.ref;
+  const resizeFrame = instruction.frame;
   if (!ref || !resizeFrame) {
     return {
       resized: false,
@@ -3224,9 +3534,11 @@ async function resizeGridBoundary(wsRef, boundaryOrPaneRef, targetRightPx, cellW
       diffPx,
       actualBoundaryPx: Math.round(actualBoundaryPx),
       targetRightPx: target,
+      strategy,
     };
   }
   await cmux(['resize-pane', '--workspace', ws, '--pane', ref, direction, '--amount', String(amount)]);
+  const signature = [boundary.name || 'boundary', ref, direction, amount].join('|');
   return {
     resized: true,
     workspace: ws,
@@ -3236,6 +3548,9 @@ async function resizeGridBoundary(wsRef, boundaryOrPaneRef, targetRightPx, cellW
     direction,
     amount,
     pxPerAmount,
+    strategy,
+    convention: instruction.convention,
+    signature,
     estimatedMovePx: Math.round(amount * pxPerAmount),
     diffPx,
     actualBoundaryPx: Math.round(actualBoundaryPx),
@@ -3257,9 +3572,37 @@ async function rebalanceGridColumns(wsRef) {
   let snapshot = null;
   let pxPerAmount = GRID_RESIZE_FALLBACK_PX_PER_AMOUNT;
   let pendingCalibration = null;
+  const stagnantBoundaries = new Map();
+  const abandonedBoundaries = new Map();
   for (let pass = 1; pass <= GRID_REBALANCE_MAX_PASSES; pass += 1) {
     snapshot = await readGridRebalanceSnapshot(ref, columns, surfaces);
     if (pendingCalibration && snapshot.ok) {
+      for (const observation of gridResizeObservationsFromSnapshot(pendingCalibration.operations, snapshot)) {
+        if (observation.moved) {
+          stagnantBoundaries.delete(observation.name);
+          continue;
+        }
+        const previous = stagnantBoundaries.get(observation.name) || { count: 0 };
+        const next = {
+          count: previous.count + 1,
+          lastObservation: observation,
+          lastOperation: observation.operation,
+          nextStrategy: 'alternate',
+        };
+        stagnantBoundaries.set(observation.name, next);
+        if (next.count >= 2) {
+          abandonedBoundaries.set(observation.name, {
+            name: observation.name,
+            reason: 'boundary did not move after two resize attempts',
+            observation: {
+              beforePx: observation.beforePx,
+              afterPx: observation.afterPx,
+              observedMovePx: observation.observedMovePx,
+            },
+            lastOperation: observation.operation,
+          });
+        }
+      }
       const calibration = gridResizeCalibrationFromSnapshot(pendingCalibration.operations, snapshot);
       if (calibration) {
         pxPerAmount = calibration.pxPerAmount;
@@ -3291,9 +3634,24 @@ async function rebalanceGridColumns(wsRef) {
 
     const operations = [];
     for (const boundary of snapshot.boundaries) {
+      if (abandonedBoundaries.has(boundary.name)) {
+        operations.push({
+          resized: false,
+          name: boundary.name,
+          leftPaneRef: boundary.leftPaneRef,
+          rightPaneRef: boundary.rightPaneRef,
+          actualBoundaryPx: boundary.actualPx,
+          targetRightPx: boundary.targetRightPx,
+          reason: 'unconverged boundary abandoned after no movement',
+          unconverged: true,
+        });
+        continue;
+      }
+      const stagnant = stagnantBoundaries.get(boundary.name);
       operations.push(await resizeGridBoundary(ref, boundary, boundary.targetRightPx, snapshot.geometry.cellWidthPx, {
         pxPerAmount,
         tolerancePx: boundary.tolerancePx,
+        strategy: stagnant && stagnant.count === 1 ? 'alternate' : 'primary',
       }));
     }
     const passChanged = operations.some((item) => item && item.resized);
@@ -3323,10 +3681,20 @@ async function rebalanceGridColumns(wsRef) {
   const finalPasses = passes.concat(gridRebalancePassRecord(finalPass, snapshot, { operations: [], final: true, pxPerAmount }));
   if (!snapshot.ok) return { rebalanced: false, error: snapshot.reason, passes: finalPasses };
   const operations = finalPasses.reduce((acc, item) => acc.concat(item.operations || []), []);
+  const unconvergedBoundaries = Array.from(abandonedBoundaries.values());
   return {
     rebalanced: snapshot.withinTolerance,
     changed,
     converged: snapshot.withinTolerance,
+    ...(unconvergedBoundaries.length ? {
+      unconverged: true,
+      unconvergedBoundaries,
+      repair: {
+        recommendation: 'POST /api/grid/rebuild',
+        requiresConfirm: false,
+        reason: 'one or more grid boundaries did not move after resize commands',
+      },
+    } : {}),
     operations,
     passes: finalPasses,
     passCount: finalPasses.length,
@@ -3634,6 +4002,114 @@ async function closeGridColumnSurfaces(wsRef, column) {
   };
 }
 
+async function closeGridOrphanSurfaces(wsRef, orphans) {
+  const refs = [];
+  for (const orphan of Array.isArray(orphans) ? orphans : []) {
+    const ref = cleanRef(orphan && (orphan.surfaceRef || orphan.ref));
+    const paneRef = cleanRef(orphan && orphan.paneRef);
+    if (ref) refs.push({ ref, kind: 'surface' });
+    else if (paneRef) refs.push({ ref: paneRef, kind: 'pane' });
+  }
+  const seen = new Set();
+  const closed = [];
+  for (const item of refs) {
+    if (!item.ref || seen.has(item.ref)) continue;
+    seen.add(item.ref);
+    try {
+      await cmux(['close-surface', '--workspace', wsRef, '--surface', item.ref]);
+      closed.push(item);
+    } catch (err) {
+      closed.push({ ...item, error: summarizeError(err) });
+    }
+  }
+  return closed;
+}
+
+function normalizeGridRebuildProjectIds(value, currentColumns, cfg) {
+  if (Array.isArray(value)) {
+    const ids = [];
+    const seen = new Set();
+    for (const item of value) {
+      const id = cleanRef(item);
+      if (!id || seen.has(id)) continue;
+      if (!findConfiguredRow(cfg, id)) throw new Error('unknown project: ' + id);
+      seen.add(id);
+      ids.push(id);
+    }
+    return ids;
+  }
+  return (Array.isArray(currentColumns) ? currentColumns : [])
+    .map((column) => cleanRef(column && column.projectId))
+    .filter(Boolean);
+}
+
+async function rebuildGridSafely(opts = {}) {
+  const cfg = loadConfig();
+  const confirm = opts && opts.confirm === true;
+  const state = await validateGridRuntimeState();
+  const desiredIds = normalizeGridRebuildProjectIds(opts && opts.projectIds, state.columns, cfg);
+  const currentIds = (Array.isArray(gridRuntimeState.columns) ? gridRuntimeState.columns : [])
+    .map((column) => cleanRef(column && column.projectId))
+    .filter(Boolean);
+  const desiredSet = new Set(desiredIds);
+  const liveColumnsToClose = currentIds.filter((id) => !desiredSet.has(id));
+  if (liveColumnsToClose.length && !confirm) {
+    return {
+      requiresConfirm: true,
+      safe: false,
+      destructive: true,
+      strategy: 'adopt-close-orphans-add-missing',
+      detail: {
+        reason: 'rebuild would close live grid column surfaces',
+        projectIds: liveColumnsToClose,
+        confirmHint: 'repeat with confirm:true to close live grid columns',
+      },
+      ...gridStateSnapshot(state.wsRef),
+    };
+  }
+
+  const result = {
+    requiresConfirm: false,
+    safe: true,
+    rebuilt: false,
+    destructive: liveColumnsToClose.length > 0,
+    strategy: 'adopt-close-orphans-add-missing',
+    moveSupported: false,
+    closedOrphans: [],
+    removedColumns: [],
+    addedColumns: [],
+  };
+
+  for (const projectId of liveColumnsToClose) {
+    const removed = await removeProjectColumn(projectId);
+    result.removedColumns.push({ projectId, ...removed });
+  }
+
+  let next = await validateGridRuntimeState();
+  const wsRef = cleanRef(next.wsRef || gridRuntimeState.wsRef);
+  const orphans = Array.isArray(gridRuntimeState.orphans) ? gridRuntimeState.orphans.slice() : [];
+  if (wsRef && orphans.length) {
+    result.closedOrphans = await closeGridOrphanSurfaces(wsRef, orphans);
+    next = await validateGridRuntimeState();
+  }
+
+  const liveAfterClose = new Set((Array.isArray(gridRuntimeState.columns) ? gridRuntimeState.columns : [])
+    .map((column) => cleanRef(column && column.projectId))
+    .filter(Boolean));
+  for (const projectId of desiredIds) {
+    if (liveAfterClose.has(projectId)) continue;
+    const added = await addProjectColumn(projectId, { focus: false });
+    result.addedColumns.push({ projectId, ...added });
+    liveAfterClose.add(projectId);
+  }
+
+  next = await getGridState();
+  return {
+    ...result,
+    ...next,
+  };
+}
+
 async function rebuildGridWorkspace(columns, cfg = loadConfig()) {
   const desired = (Array.isArray(columns) ? columns : []).map((column) => ({
     columnId: gridColumnId(column.projectId),
@@ -3647,6 +4123,7 @@ async function rebuildGridWorkspace(columns, cfg = loadConfig()) {
     gridRuntimeState.anchorSurfaceRef = null;
     resetGridConcierge();
     gridRuntimeState.columns = [];
+    gridRuntimeState.orphans = [];
     gridRuntimeState.lastRebalance = null;
     gridRuntimeState.lastRebalanceRepairAt = null;
     return { ...gridStateSnapshot(null, []), closedWs, rebuilt: true };
@@ -3685,6 +4162,7 @@ async function rebuildGridWorkspace(columns, cfg = loadConfig()) {
   await settle();
   gridRuntimeState.wsRef = wsRef;
   gridRuntimeState.columns = rebuilt;
+  gridRuntimeState.orphans = [];
   try {
     const anchor = await findGridRightAnchorSurface(wsRef);
     gridRuntimeState.anchorSurfaceRef = anchor && anchor.ref || null;
@@ -3725,6 +4203,7 @@ async function validateGridRuntimeState() {
     gridRuntimeState.anchorSurfaceRef = null;
     resetGridConcierge();
     gridRuntimeState.columns = [];
+    gridRuntimeState.orphans = [];
     gridRuntimeState.lastRebalance = null;
     gridRuntimeState.lastRebalanceRepairAt = null;
     return gridStateSnapshot(null, []);
@@ -3740,8 +4219,9 @@ async function validateGridRuntimeState() {
     return gridStateSnapshot(ws.ref);
   }
   const surfaces = surfaceState.surfaces;
-  const byRef = liveSurfaceIndex(surfaces);
+  const cfg = loadConfig();
   const anchorRef = cleanRef(gridRuntimeState.anchorSurfaceRef);
+  const byRef = liveSurfaceIndex(surfaces);
   if (anchorRef && !byRef.has(anchorRef)) gridRuntimeState.anchorSurfaceRef = null;
   const concierge = markedOrKnownGridConciergeSurface(surfaces);
   if (concierge && concierge.ref) {
@@ -3749,22 +4229,18 @@ async function validateGridRuntimeState() {
   } else {
     resetGridConcierge();
   }
-  gridRuntimeState.columns = gridRuntimeState.columns.filter((column) => (
-    column &&
-    column.cc &&
-    column.cdx &&
-    byRef.has(column.cc.surfaceRef) &&
-    byRef.has(column.cdx.surfaceRef)
-  )).map((column) => {
-    const cc = byRef.get(column.cc.surfaceRef);
-    const cdx = byRef.get(column.cdx.surfaceRef);
-    return {
-      ...column,
-      wsRef: ws.ref,
-      cc: { ...column.cc, paneRef: cc && cc.paneRef || column.cc.paneRef || null },
-      cdx: { ...column.cdx, paneRef: cdx && cdx.paneRef || column.cdx.paneRef || null },
-    };
-  });
+  const resync = buildAdoptedGridColumns(ws.ref, surfaces, cfg);
+  gridRuntimeState.columns = resync.columns;
+  const rightAnchor = markedGridRightAnchorSurface(surfaces) || gridRightAnchorSurface(surfaces, gridRuntimeState.columns);
+  if (rightAnchor && rightAnchor.ref) {
+    gridRuntimeState.anchorSurfaceRef = rightAnchor.ref;
+  }
+  const browser = gridBrowserAnchorSurface(surfaces);
+  gridRuntimeState.orphans = gridRuntimeOrphansFromSurfaces(surfaces, gridRuntimeState.columns, {
+    browserSurfaceRef: browser && browser.ref || null,
+    conciergeSurfaceRef: gridRuntimeState.concierge && gridRuntimeState.concierge.surfaceRef || null,
+    rightAnchorSurfaceRef: gridRuntimeState.anchorSurfaceRef,
+  }, resync.markerOrphans);
   reindexGridColumns();
   return gridStateSnapshot(ws.ref);
 }
@@ -3937,6 +4413,7 @@ async function addProjectColumn(projectId, { focus = false } = {}) {
       gridRuntimeState.anchorSurfaceRef = null;
       resetGridConcierge();
       gridRuntimeState.columns = [];
+      gridRuntimeState.orphans = [];
       gridRuntimeState.lastRebalance = null;
       gridRuntimeState.lastRebalanceRepairAt = null;
     }
@@ -3977,6 +4454,7 @@ async function removeProjectColumn(projectId) {
     gridRuntimeState.anchorSurfaceRef = null;
     resetGridConcierge();
     gridRuntimeState.columns = [];
+    gridRuntimeState.orphans = [];
     gridRuntimeState.lastRebalance = null;
     gridRuntimeState.lastRebalanceRepairAt = null;
     return {
@@ -4324,7 +4802,7 @@ module.exports = {
   agmsgDbPath, getTeamMessages,
   createCmuxHealthTracker, getCmuxHealth, pingCmuxForRecovery,
   getState, getWorkspaceYaml, getProjectState, ensureSlot, ensureCollabSlots, sendToSurface, submitToSurface, loadConfig, saveConfig, openProject, closeProject, focusProject,
-  workspaceRefExists, ensureGridWorkspace, ensureConciergeSurface, ensureConciergeReadySurface, conciergeAsk, focusGridWorkspace, addProjectColumn, removeProjectColumn, rebalanceGridColumns, getGridState, gridWorkspaceLayout,
+  workspaceRefExists, ensureGridWorkspace, ensureConciergeSurface, ensureConciergeReadySurface, conciergeAsk, focusGridWorkspace, addProjectColumn, removeProjectColumn, rebalanceGridColumns, getGridState, gridWorkspaceLayout, rebuildGridSafely,
   openAll, closeAll, reorderProjects, addProject, removeProject, expandHome, rowCwd, rowCwdInfo, normalizeCollabProjectDir, normalizeCollabProjectDirInfo,
   projectKind, isGlobalProject, configuredRows, configuredProjectRows, configuredGlobalRows,
 };
