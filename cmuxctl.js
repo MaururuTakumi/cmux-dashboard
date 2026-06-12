@@ -4053,16 +4053,21 @@ async function rebuildGridSafely(opts = {}) {
     .filter(Boolean);
   const desiredSet = new Set(desiredIds);
   const liveColumnsToClose = currentIds.filter((id) => !desiredSet.has(id));
-  if (liveColumnsToClose.length && !confirm) {
+  const wsRef = cleanRef(state.wsRef || gridRuntimeState.wsRef);
+  const orphansToClose = Array.isArray(gridRuntimeState.orphans) ? gridRuntimeState.orphans.slice() : [];
+  if ((liveColumnsToClose.length || orphansToClose.length) && !confirm) {
     return {
       requiresConfirm: true,
       safe: false,
       destructive: true,
       strategy: 'adopt-close-orphans-add-missing',
       detail: {
-        reason: 'rebuild would close live grid column surfaces',
+        reason: liveColumnsToClose.length
+          ? 'rebuild would close live grid column surfaces'
+          : 'rebuild would close unmanaged grid orphan surfaces',
         projectIds: liveColumnsToClose,
-        confirmHint: 'repeat with confirm:true to close live grid columns',
+        orphanRefs: orphansToClose.map((orphan) => cleanRef(orphan && (orphan.surfaceRef || orphan.ref || orphan.paneRef))).filter(Boolean),
+        confirmHint: 'repeat with confirm:true to allow destructive grid closes',
       },
       ...gridStateSnapshot(state.wsRef),
     };
@@ -4072,7 +4077,7 @@ async function rebuildGridSafely(opts = {}) {
     requiresConfirm: false,
     safe: true,
     rebuilt: false,
-    destructive: liveColumnsToClose.length > 0,
+    destructive: liveColumnsToClose.length > 0 || orphansToClose.length > 0,
     strategy: 'adopt-close-orphans-add-missing',
     moveSupported: false,
     closedOrphans: [],
@@ -4086,7 +4091,6 @@ async function rebuildGridSafely(opts = {}) {
   }
 
   let next = await validateGridRuntimeState();
-  const wsRef = cleanRef(next.wsRef || gridRuntimeState.wsRef);
   const orphans = Array.isArray(gridRuntimeState.orphans) ? gridRuntimeState.orphans.slice() : [];
   if (wsRef && orphans.length) {
     result.closedOrphans = await closeGridOrphanSurfaces(wsRef, orphans);

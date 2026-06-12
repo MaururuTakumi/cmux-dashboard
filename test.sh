@@ -2557,7 +2557,8 @@ const fs = require("fs");
 let obj;
 try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2); }
 const alpha = (Array.isArray(obj.columns) ? obj.columns : []).find((c) => c && c.projectId === "alpha");
-process.exit(obj && obj.requiresConfirm === true && obj.destructive === true && alpha ? 0 : 1);
+const orphanRefs = obj && obj.detail && Array.isArray(obj.detail.orphanRefs) ? obj.detail.orphanRefs : [];
+process.exit(obj && obj.requiresConfirm === true && obj.destructive === true && alpha && orphanRefs.includes("surface:api-grid-orphan") ? 0 : 1);
 ' 2>/dev/null && "$NODE_BIN" - "$state_file" <<'NODE' 2>/dev/null
 const fs = require("fs");
 let s;
@@ -2575,7 +2576,7 @@ NODE
     return 1
   fi
 
-  body="$(curl -fsS -X POST --max-time 30 -H 'Content-Type: application/json' --data '{"projectIds":["alpha","cc-general"]}' "$api_url/api/grid/rebuild" 2>/dev/null || true)"
+  body="$(curl -fsS -X POST --max-time 30 -H 'Content-Type: application/json' --data '{"projectIds":["alpha","cc-general"],"confirm":true}' "$api_url/api/grid/rebuild" 2>/dev/null || true)"
   if printf '%s' "$body" | "$NODE_BIN" -e '
 const fs = require("fs");
 let obj;
@@ -2583,7 +2584,7 @@ try { obj = JSON.parse(fs.readFileSync(0, "utf8")); } catch (_) { process.exit(2
 const ids = (Array.isArray(obj.columns) ? obj.columns : []).map((c) => c && c.projectId).join(",");
 const closedOrphan = (Array.isArray(obj.closedOrphans) ? obj.closedOrphans : []).some((item) => item && item.ref === "surface:api-grid-orphan");
 const addedGeneral = (Array.isArray(obj.addedColumns) ? obj.addedColumns : []).some((item) => item && item.projectId === "cc-general");
-process.exit(obj && obj.requiresConfirm === false && obj.safe === true && ids === "alpha,cc-general" && closedOrphan && addedGeneral ? 0 : 1);
+process.exit(obj && obj.requiresConfirm === false && obj.safe === true && obj.destructive === true && ids === "alpha,cc-general" && closedOrphan && addedGeneral ? 0 : 1);
 ' 2>/dev/null && "$NODE_BIN" - "$state_file" <<'NODE' 2>/dev/null
 const fs = require("fs");
 let s;
@@ -2594,9 +2595,9 @@ const generalLive = surfaces.some((surface) => surface && /cmuxdash:grid:__grid_
 process.exit(!orphanLive && generalLive ? 0 : 1);
 NODE
   then
-    pass "R4 API: POST /api/grid/rebuild safely closes orphans and adds missing columns"
+    pass "R4 API: POST /api/grid/rebuild confirm=true closes orphans and adds missing columns"
   else
-    fail "R4 API: rebuild safe orphan/missing-column path failed"
+    fail "R4 API: rebuild confirmed orphan/missing-column path failed"
     info "R4 API rebuild safe payload: ${body:-empty}"
     return 1
   fi
