@@ -9,8 +9,8 @@
 - **PR #6** https://github.com/MaururuTakumi/cmux-dashboard/pull/6 （branch `tickets-sweep`, 10コミット）= #4/#3/#5。`./test.sh` **FINAL: PASS (320 checks)/0 FAIL（実cmux）**。
 - **#4 ✅ / #3 ✅MVP / #5 ✅完全（死活・grid列含む）** — マージ可。
 - **#2 ✅** スキルを setup専用に縮小（`~/.claude/skills/claude-codex-collab`: `start`/`run`/`run-once` 無効化、SKILL.md/bridge に非推奨明記）。git管理外なのでディスク反映済み。
-- **#1**: 実装済＋collab配送テスト(320内)通過。実機で `/api/statusline` は動作確認。ただし **`/api/state`（getState=cmux走査）が稼働中サーバー＋delivery loop下でハング**（cmux本体の競合・既存問題、当方コード外）。**残=この getState ハングの調査＋claude↔codex 会話の目視**。
-- **残課題**: (a) #1 の getState ハング調査（delivery loop と cmux直列キューの競合疑い）、(b) #1 会話E2E目視、(c) #3 PID粒度の任意調整、(d) PR#6 マージ。
+- **#1 ✅ 実質完了**: 実装済＋配送テスト通過＋実機 `/api/statusline` 動作。**getState ハングの実バグを特定・修正**: front-desk(concierge)配送が既定ONで delivery loop が concierge surface を毎tick待ち→直列cmuxチェーン占有→`/api/state` 30秒ハング。**front-desk をオプトイン化**(`CMUX_DASH_FRONT_DESK_TEAM` 明示時のみ)して解消（live `/api/state` 1-3秒応答）。commit e702d7b（PR#6）。**残=claude↔codex 会話の目視のみ**（quota消費するため人間が実機GUIで確認推奨）。
+- **残課題**: (a) #1 会話E2E目視（任意・人間推奨）、(b) #3 PID粒度の任意調整、(c) **PR#6 マージ**。テスト: 実cmuxで 320 PASS（grid-alpha のみ負荷時flaky、再実行で通る）。
 
 ## 進捗（2026-06-14 時点）
 - ✅ **T4(#4) 完了**: grid rebalance の amount クランプ＋係数1.0＋killswitch＋UI「今すぐ整形」ボタン。node/fake-cmux テスト PASS。
