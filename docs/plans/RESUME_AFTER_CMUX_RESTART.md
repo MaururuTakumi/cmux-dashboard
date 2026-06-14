@@ -5,6 +5,13 @@
 ## いまの状況（一言で）
 **cmux-dashboard の GitHub Issue #1–#5 を実装し完成させる**作業。collab(codex)がハング＋cmux停止のため、ユーザー承認のもと **claude(Opus)が直接実装中**。branch `tickets-sweep` に commit 済み（push はゴール末にまとめて人間承認）。
 
+## ✅ 最終状態（2026-06-15 更新）
+- **PR #6** https://github.com/MaururuTakumi/cmux-dashboard/pull/6 （branch `tickets-sweep`, 10コミット）= #4/#3/#5。`./test.sh` **FINAL: PASS (320 checks)/0 FAIL（実cmux）**。
+- **#4 ✅ / #3 ✅MVP / #5 ✅完全（死活・grid列含む）** — マージ可。
+- **#2 ✅** スキルを setup専用に縮小（`~/.claude/skills/claude-codex-collab`: `start`/`run`/`run-once` 無効化、SKILL.md/bridge に非推奨明記）。git管理外なのでディスク反映済み。
+- **#1**: 実装済＋collab配送テスト(320内)通過。実機で `/api/statusline` は動作確認。ただし **`/api/state`（getState=cmux走査）が稼働中サーバー＋delivery loop下でハング**（cmux本体の競合・既存問題、当方コード外）。**残=この getState ハングの調査＋claude↔codex 会話の目視**。
+- **残課題**: (a) #1 の getState ハング調査（delivery loop と cmux直列キューの競合疑い）、(b) #1 会話E2E目視、(c) #3 PID粒度の任意調整、(d) PR#6 マージ。
+
 ## 進捗（2026-06-14 時点）
 - ✅ **T4(#4) 完了**: grid rebalance の amount クランプ＋係数1.0＋killswitch＋UI「今すぐ整形」ボタン。node/fake-cmux テスト PASS。
 - ✅ **T3(#3) MVP 完了**: 休眠していた claude↔codex 会話 thread を全プロジェクト行に「💬 会話」1アクションで配線（/api/agmsg, PID非依存）。
