@@ -216,6 +216,13 @@
   .thread-error{color:#ffb1bd;font-size:11.5px}
   .thread-toggle{margin-left:auto;height:22px;border-radius:7px;border:1px solid var(--line);background:var(--panel2);color:var(--dim);font-size:10.5px;font-weight:850;cursor:pointer;padding:0 9px;white-space:nowrap}
   .thread-toggle.on{background:var(--accent);border-color:transparent;color:#041126}
+  .ctxbar{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;color:var(--dim)}
+  .ctxbar .track{width:46px;height:6px;border-radius:3px;background:var(--line);overflow:hidden}
+  .ctxbar .fill{height:100%;background:var(--accent);transition:width .3s}
+  .ctxbar.warn{color:#f5c518}
+  .ctxbar.warn .fill{background:#f5c518}
+  .ctxbar.danger{color:#ff8585}
+  .ctxbar.danger .fill{background:#ff6b6b}
   .empty{color:var(--faint);text-align:center;margin:60px auto;max-width:360px}
   /* add modal */
   .modal-bg{position:fixed;inset:0;background:rgba(3,6,12,.66);backdrop-filter:blur(3px);display:none;place-items:center;z-index:30}
@@ -402,6 +409,7 @@ let lastState=null;
 let lastMetrics=null;
 let pollTimer=null;
 let metricsTimer=null;
+let lastStatusline=null;   // T5: per-project transcript metrics (context%/cost)
 let actionInFlight=0;   // アクション実行中はポーリングを止める（cmuxアプリのsocket競合を避ける）
 let lastToastError='';
 let projectRowCache = new Map();
@@ -475,8 +483,16 @@ function captureScrollGuard(){
 }
 function startPoll(){ stopPoll(); pollTimer=setInterval(()=>{ if(!actionInFlight) refresh(); }, 4000); }
 function stopPoll(){ if(pollTimer){ clearInterval(pollTimer); pollTimer=null; } }
-function startMetricsPoll(){ stopMetricsPoll(); metricsTimer=setInterval(()=>{ if(!actionInFlight && document.visibilityState!=='hidden') refreshMetrics(); }, 5000); }
+function startMetricsPoll(){ stopMetricsPoll(); metricsTimer=setInterval(()=>{ if(!actionInFlight && document.visibilityState!=='hidden'){ refreshMetrics(); refreshStatusline(); } }, 5000); }
 function stopMetricsPoll(){ if(metricsTimer){ clearInterval(metricsTimer); metricsTimer=null; } }
+async function refreshStatusline(){
+  if(actionInFlight || document.visibilityState==='hidden') return;
+  try{ lastStatusline=await jget('/api/statusline'); if(lastState) render(lastState); }catch(e){}
+}
+function statuslineFor(id){
+  const p = lastStatusline && lastStatusline.projects ? lastStatusline.projects[id] : null;
+  return p && p.metrics && p.metrics.ok ? p.metrics : null;
+}
 async function refresh(){
   if(actionInFlight) return;
   let s; try{ s=await jget('/api/state'); }catch(e){ return; }
@@ -848,6 +864,7 @@ function renderProjectRow(p, index, s){
   const err = projectError(p) || collab.error;
   const health = projectHealth(p);
   const threadOpen = threadFor(p.id).open;
+  const sl = statuslineFor(p.id);
   const failed = !!err || ((p.action || {}).status === 'failed');
   const openCount = SLOT_DEFS.filter(({key})=>slotValue(p,key)).length;
   const status = p.open ? `open/${openCount}` : `${openCount}`;
@@ -893,6 +910,7 @@ function renderProjectRow(p, index, s){
       <span><b>health</b> ${esc(health)}</span>
       <span><b>collab</b> ${esc(collab.enabled ? (collab.active ? 'enabled/active' : 'enabled/pending') : 'disabled')}</span>
       ${err?`<span class="err"><b>lastError</b> ${esc(err)}</span>`:`<span><b>lastError</b> none</span>`}
+      ${sl?`<span class="ctxbar ${esc(sl.context.level)}" title="context ${esc(sl.context.pct)}% of ${esc(Math.round(sl.context.windowTokens/100000)/10)}M tokens · ${esc(sl.model||'')} · session $${esc(sl.cost.session)} / week $${esc(sl.cost.week)}"><b>ctx</b><span class="track"><span class="fill" style="width:${Math.min(100,Number(sl.context.pct)||0)}%"></span></span>${esc(sl.context.pct)}% · $${esc(sl.cost.session)}</span>`:''}
       <button class="thread-toggle ${threadOpen?'on':''}" data-action="thread" title="claude→codex の指示と返信を表示（read-only）" onclick="event.stopPropagation();toggleThread(${jsArg(p.id)})">💬 ${threadOpen?'会話を閉じる':'会話'}</button>
     </div>
     ${threadOpen ? threadPanel(p.id) : ''}
@@ -1287,9 +1305,9 @@ $('#modal').addEventListener('click',e=>{ if(e.target.id==='modal') closeModal()
 $('#onboarding').addEventListener('click',e=>{ if(e.target.id==='onboarding') closeOnboarding(); });
 $('#workspaceYamlModal').addEventListener('click',e=>{ if(e.target.id==='workspaceYamlModal') closeWorkspaceYaml(); });
 
-document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden') stopMetricsPoll(); else { refreshMetrics(); startMetricsPoll(); } });
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden') stopMetricsPoll(); else { refreshMetrics(); refreshStatusline(); startMetricsPoll(); } });
 initConciergeComposer();
-refresh(); refreshMetrics(); startPoll(); startMetricsPoll();
+refresh(); refreshMetrics(); refreshStatusline(); startPoll(); startMetricsPoll();
 </script>
 </body>
 </html>

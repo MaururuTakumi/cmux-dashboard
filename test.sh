@@ -652,6 +652,35 @@ if ! run_t5_api_wiring_checks; then
   finish
 fi
 
+run_t5_ui_checks() {
+  if "$NODE_BIN" - "$DIR/public/index.html" <<'NODE' 2>/dev/null
+const fs = require("fs");
+const html = fs.readFileSync(process.argv[2], "utf8");
+const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+if (!scriptMatch) process.exit(2);
+const script = scriptMatch[1];
+const checks = [
+  script.includes("async function refreshStatusline()"),
+  script.includes("/api/statusline"),
+  script.includes("function statuslineFor(id)"),
+  script.includes("const sl = statuslineFor(p.id)"),
+  html.includes("ctxbar"),
+  script.includes("refreshStatusline()"),
+];
+process.exit(checks.every(Boolean) ? 0 : 1);
+NODE
+  then
+    pass "R T5: per-project context% bar is wired into rows (polls /api/statusline)"
+  else
+    fail "R T5: statusline UI wiring failed"
+    return 1
+  fi
+}
+
+if ! run_t5_ui_checks; then
+  finish
+fi
+
 run_scroll_reset_static_checks() {
   local index_file="$DIR/public/index.html"
 
