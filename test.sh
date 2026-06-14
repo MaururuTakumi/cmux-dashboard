@@ -694,6 +694,34 @@ if ! run_t5_ui_checks; then
   finish
 fi
 
+run_frontdesk_optin_checks() {
+  if "$NODE_BIN" - "$DIR" <<'NODE' 2>/dev/null
+const path = require("path");
+const m = require(path.join(process.argv[2], "collab-delivery.js"));
+const f = m.frontDeskDeliveryTargetFromEnv;
+let ok = typeof f === "function";
+// #1 fix: front-desk/concierge delivery is opt-in. Defaulting it ON made the
+// delivery loop await the concierge surface every tick, clogging the serial
+// cmux chain and hanging /api/state. With no explicit team -> no front-desk target.
+ok = ok && f({}) === null;                                   // default: off
+ok = ok && f({ CMUX_DASH_FRONT_DESK_TEAM: "" }) === null;    // empty: off
+ok = ok && f({ CMUX_DASH_FRONT_DESK_TEAM: "off" }) === null; // explicit off
+const t = f({ CMUX_DASH_FRONT_DESK_TEAM: "front-desk" });    // explicit: on
+ok = ok && t && t.type === "front-desk" && t.team === "front-desk" && t.agent === "concierge";
+process.exit(ok ? 0 : 1);
+NODE
+  then
+    pass "R #1: front-desk/concierge delivery is opt-in (off unless CMUX_DASH_FRONT_DESK_TEAM set) — prevents getState chain starvation"
+  else
+    fail "R #1: front-desk opt-in contract failed"
+    return 1
+  fi
+}
+
+if ! run_frontdesk_optin_checks; then
+  finish
+fi
+
 run_scroll_reset_static_checks() {
   local index_file="$DIR/public/index.html"
 

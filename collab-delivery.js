@@ -270,8 +270,13 @@ function deliveryTargetsFromState(state, ctlRef = ctl) {
 function frontDeskDeliveryTargetFromEnv(env = process.env, opts = {}) {
   if (opts.frontDeskEnabled === false) return null;
   const teamValue = opts.frontDeskTeam != null ? opts.frontDeskTeam : env.CMUX_DASH_FRONT_DESK_TEAM;
+  // Opt-in: front-desk/concierge delivery only runs when a team is explicitly
+  // configured. Defaulting it ON made the delivery loop ensure/await the concierge
+  // surface every tick, which clogged the serial cmux chain (cmuxChain) and hung
+  // /api/state (getState) for 30s+. With no explicit team, skip front-desk entirely.
+  if (teamValue == null || String(teamValue).trim() === '') return null;
   const agentValue = opts.frontDeskAgent != null ? opts.frontDeskAgent : env.CMUX_DASH_FRONT_DESK_AGENT;
-  const team = String(teamValue || DEFAULT_FRONT_DESK_TEAM).trim();
+  const team = String(teamValue).trim();
   const agent = String(agentValue || DEFAULT_FRONT_DESK_AGENT).trim();
   if (!team || !agent || offValue(team) || offValue(agent)) return null;
   return {
