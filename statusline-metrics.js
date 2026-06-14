@@ -160,6 +160,40 @@ function newestTranscript(cwd, baseDir) {
   return best;
 }
 
+// Token-usage sparklines derived purely from transcript timestamps — no live
+// data needed. Returns small arrays of per-bucket total tokens (input+output)
+// for the last 5h (session window) and last 7 days (weekly window).
+function sparklines(entries, nowMs, opts = {}) {
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const session = bucketTokens(entries, now, 5 * 60 * 60 * 1000, opts.sessionBuckets || 12);
+  const week = bucketTokens(entries, now, 7 * 24 * 60 * 60 * 1000, opts.weekBuckets || 7);
+  return { session, week };
+}
+
+function bucketTokens(entries, now, spanMs, n) {
+  const buckets = new Array(n).fill(0);
+  const start = now - spanMs;
+  const width = spanMs / n;
+  for (const e of entries) {
+    if (e.tsMs == null || e.tsMs < start || e.tsMs > now) continue;
+    let idx = Math.floor((e.tsMs - start) / width);
+    if (idx < 0) idx = 0;
+    if (idx >= n) idx = n - 1;
+    buckets[idx] += e.usage.input + e.usage.output;
+  }
+  return buckets;
+}
+
+// Render a numeric series as a unicode block sparkline. UI-independent so it can
+// be unit-tested and reused server-side.
+function renderSparkline(series) {
+  const blocks = '▁▂▃▄▅▆▇█';
+  const arr = Array.isArray(series) ? series : [];
+  const max = Math.max(0, ...arr);
+  if (max <= 0) return '▁'.repeat(arr.length);
+  return arr.map((v) => blocks[Math.min(blocks.length - 1, Math.round((v / max) * (blocks.length - 1)))]).join('');
+}
+
 // Top-level: summarize a transcript file. Graceful degrade — returns
 // { ok:false } rather than throwing when data is missing/empty.
 function summarizeTranscript(filePath, opts = {}) {
@@ -169,12 +203,15 @@ function summarizeTranscript(filePath, opts = {}) {
   const pricing = opts.pricing || loadPricing();
   const ctx = contextUsage(entries);
   const cost = aggregateCost(entries, pricing, opts.nowMs);
+  const spark = sparklines(entries, opts.nowMs);
   const last = entries[entries.length - 1];
   return {
     ok: true,
     model: ctx.model,
     context: ctx,
     cost,
+    spark,
+    sparkText: { session: renderSparkline(spark.session), week: renderSparkline(spark.week) },
     lastTs: last.ts,
     lastTsMs: last.tsMs,
     messageCount: entries.length,
@@ -199,6 +236,8 @@ module.exports = {
   contextUsage,
   costOfUsage,
   aggregateCost,
+  sparklines,
+  renderSparkline,
   transcriptDirForCwd,
   newestTranscript,
   summarizeTranscript,

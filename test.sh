@@ -620,6 +620,15 @@ try {
     {x:{input:2,output:0,cacheWrite:0,cacheRead:0}}, Date.parse("2026-06-14T12:00:00Z"));
   ok = ok && overridden.session === 2;
   ok = ok && m.contextWindowFor("claude-haiku-4-5") === 200000;
+  // sparklines: cmux-independent, derived from timestamps
+  const sp = m.sparklines([
+    {tsMs:Date.parse("2026-06-14T11:55:00Z"),model:"x",usage:{input:100,output:50,cacheRead:0,cacheWrite:0}},
+    {tsMs:Date.parse("2026-06-10T12:00:00Z"),model:"x",usage:{input:500,output:500,cacheRead:0,cacheWrite:0}},
+  ], Date.parse("2026-06-14T12:00:00Z"));
+  ok = ok && sp.session.length === 12 && sp.week.length === 7;
+  ok = ok && sp.session[sp.session.length-1] > 0;       // most recent 5h bucket has tokens
+  ok = ok && m.renderSparkline([0,0,0]) === "▁▁▁";
+  ok = ok && m.renderSparkline([1,2,4]).length === 3;
 } catch (e) { ok = false; }
 finally { try { fs.unlinkSync(fx); } catch (_) {} }
 process.exit(ok ? 0 : 1);

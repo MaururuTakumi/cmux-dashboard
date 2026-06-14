@@ -223,6 +223,7 @@
   .ctxbar.warn .fill{background:#f5c518}
   .ctxbar.danger{color:#ff8585}
   .ctxbar.danger .fill{background:#ff6b6b}
+  .ctxbar .spark{font-family:ui-monospace,monospace;letter-spacing:-1px;opacity:.85}
   .empty{color:var(--faint);text-align:center;margin:60px auto;max-width:360px}
   /* add modal */
   .modal-bg{position:fixed;inset:0;background:rgba(3,6,12,.66);backdrop-filter:blur(3px);display:none;place-items:center;z-index:30}
@@ -910,7 +911,7 @@ function renderProjectRow(p, index, s){
       <span><b>health</b> ${esc(health)}</span>
       <span><b>collab</b> ${esc(collab.enabled ? (collab.active ? 'enabled/active' : 'enabled/pending') : 'disabled')}</span>
       ${err?`<span class="err"><b>lastError</b> ${esc(err)}</span>`:`<span><b>lastError</b> none</span>`}
-      ${sl?`<span class="ctxbar ${esc(sl.context.level)}" title="context ${esc(sl.context.pct)}% of ${esc(Math.round(sl.context.windowTokens/100000)/10)}M tokens · ${esc(sl.model||'')} · session $${esc(sl.cost.session)} / week $${esc(sl.cost.week)}"><b>ctx</b><span class="track"><span class="fill" style="width:${Math.min(100,Number(sl.context.pct)||0)}%"></span></span>${esc(sl.context.pct)}% · $${esc(sl.cost.session)}</span>`:''}
+      ${sl?`<span class="ctxbar ${esc(sl.context.level)}" title="context ${esc(sl.context.pct)}% of ${esc(Math.round(sl.context.windowTokens/100000)/10)}M tokens · ${esc(sl.model||'')} · session $${esc(sl.cost.session)} / week $${esc(sl.cost.week)}${sl.sparkText?` · 5h ${esc(sl.sparkText.session)} · 7d ${esc(sl.sparkText.week)}`:''}"><b>ctx</b><span class="track"><span class="fill" style="width:${Math.min(100,Number(sl.context.pct)||0)}%"></span></span>${esc(sl.context.pct)}% · $${esc(sl.cost.session)}${sl.sparkText?` <span class="spark">${esc(sl.sparkText.week)}</span>`:''}</span>`:''}
       <button class="thread-toggle ${threadOpen?'on':''}" data-action="thread" title="claude→codex の指示と返信を表示（read-only）" onclick="event.stopPropagation();toggleThread(${jsArg(p.id)})">💬 ${threadOpen?'会話を閉じる':'会話'}</button>
     </div>
     ${threadOpen ? threadPanel(p.id) : ''}
