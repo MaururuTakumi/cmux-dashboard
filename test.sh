@@ -636,6 +636,22 @@ if ! run_t5_metrics_checks; then
   finish
 fi
 
+run_t5_api_wiring_checks() {
+  local server_file="$DIR/server.js"
+  if grep -F "require('./statusline-metrics')" "$server_file" >/dev/null 2>&1 \
+    && grep -F "urlPath === '/api/statusline'" "$server_file" >/dev/null 2>&1 \
+    && grep -F "statuslineSnapshot()" "$server_file" >/dev/null 2>&1; then
+    pass "R T5: /api/statusline endpoint is wired in server.js (per-project transcript metrics)"
+  else
+    fail "R T5: /api/statusline wiring missing"
+    return 1
+  fi
+}
+
+if ! run_t5_api_wiring_checks; then
+  finish
+fi
+
 run_scroll_reset_static_checks() {
   local index_file="$DIR/public/index.html"
 

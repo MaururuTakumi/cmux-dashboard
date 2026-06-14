@@ -6,6 +6,25 @@ const fs = require('fs');
 const path = require('path');
 const ctl = require('./cmuxctl');
 const { createCollabDelivery } = require('./collab-delivery');
+const statusline = require('./statusline-metrics');
+
+// Per-project statusline metrics (context%/cost) derived from Claude Code
+// transcripts. cmux-independent: reads config for project cwds and transcript
+// jsonl files directly. Graceful — a project with no transcript yields ok:false.
+async function statuslineSnapshot() {
+  let cfg;
+  try { cfg = await ctl.loadConfig(); } catch (e) { return { ok: false, error: String(e && e.message || e), projects: {} }; }
+  const rows = [].concat(ctl.configuredProjectRows(cfg) || [], ctl.configuredGlobalRows(cfg) || []);
+  const projects = {};
+  for (const p of rows) {
+    let cwd = null;
+    try { cwd = ctl.rowCwd(p, cfg); } catch (_) { cwd = null; }
+    let metrics = { ok: false, reason: 'no cwd' };
+    if (cwd) { try { metrics = statusline.summarizeForCwd(cwd); } catch (e) { metrics = { ok: false, reason: String(e && e.message || e) }; } }
+    projects[p.id] = { team: ctl.teamName(p.id), cwd, metrics };
+  }
+  return { ok: true, projects, updatedAt: new Date().toISOString() };
+}
 
 const PORT = parseInt(process.env.CMUX_DASH_PORT || '7799', 10);
 const HOST = process.env.CMUX_DASH_HOST || '127.0.0.1';
@@ -171,6 +190,9 @@ async function api(req, res, urlPath) {
     }
     if (req.method === 'GET' && urlPath === '/api/metrics') {
       return sendJson(res, 200, await ctl.getMetrics());
+    }
+    if (req.method === 'GET' && urlPath === '/api/statusline') {
+      return sendJson(res, 200, await statuslineSnapshot());
     }
     if (req.method === 'GET' && urlPath === '/api/grid') {
       return sendJson(res, 200, await ctl.getGridState());
