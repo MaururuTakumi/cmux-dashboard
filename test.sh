@@ -2041,7 +2041,7 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       check("grid G2: rebalance calibrates second-pass resize amount from observed movement", (
         alphaLeftPass1 &&
         alphaLeftPass2 &&
-        Math.abs(Number(alphaLeftPass1.pxPerAmount) - 0.5) < 0.0001 &&
+        Math.abs(Number(alphaLeftPass1.pxPerAmount) - 1.0) < 0.0001 &&
         Number(alphaLeftPass2.pxPerAmount) > 0.20 &&
         Number(alphaLeftPass2.pxPerAmount) < 0.30 &&
         Number(alphaLeftPass2.amount) >= Math.floor(Number(alphaLeftPass1.amount) * 0.9)
@@ -2133,6 +2133,53 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         );
         check("grid right anchor: sliver width is re-read before tolerance and corrected with resize", (
           sliverOk
+        ));
+      }
+      {
+        // T4 (#4): kill switch disables rebalance entirely (no resize-pane issued).
+        const killBefore = (rawCmuxState().commands || [])
+          .filter((item) => item && item.cmd === "resize-pane" && item.workspace === initialGridRef).length;
+        const prevKill = process.env.CMUX_DASH_GRID_REBALANCE;
+        let killResult = null;
+        try {
+          process.env.CMUX_DASH_GRID_REBALANCE = "off";
+          killResult = await ctl.rebalanceGridColumns(initialGridRef);
+        } finally {
+          if (prevKill == null) delete process.env.CMUX_DASH_GRID_REBALANCE;
+          else process.env.CMUX_DASH_GRID_REBALANCE = prevKill;
+        }
+        const killAfter = (rawCmuxState().commands || [])
+          .filter((item) => item && item.cmd === "resize-pane" && item.workspace === initialGridRef).length;
+        check("grid T4: CMUX_DASH_GRID_REBALANCE=off disables rebalance and issues no resize", (
+          killResult &&
+          killResult.disabled === true &&
+          killResult.rebalanced === false &&
+          killAfter === killBefore
+        ));
+      }
+      {
+        const raw = rawCmuxState();
+        raw.gridBoundaries = raw.gridBoundaries && typeof raw.gridBoundaries === "object" ? raw.gridBoundaries : {};
+        raw.gridBoundaries[initialGridRef] = [1240, 1255, 1270];
+        writeCmuxState(raw);
+        const prevScale = process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT;
+        let clampResult = null;
+        try {
+          process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT = "0.25";
+          clampResult = await ctl.rebalanceGridColumns(initialGridRef);
+        } finally {
+          if (prevScale == null) delete process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT;
+          else process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT = prevScale;
+        }
+        const clampPassOps = clampResult && Array.isArray(clampResult.passes)
+          ? clampResult.passes.flatMap((p) => Array.isArray(p.operations) ? p.operations : []).filter((o) => o && o.resized)
+          : [];
+        const clampedOps = clampPassOps.filter((o) => o && o.clamped === true);
+        check("grid T4: oversized resize amount is clamped and boundary still moves", (
+          clampPassOps.length >= 1 &&
+          clampPassOps.every((o) => Number(o.appliedAmount) <= Number(o.requestedAmount)) &&
+          clampedOps.length >= 1 &&
+          clampedOps.every((o) => Number.isFinite(Number(o.maxAmount)) && Number(o.appliedAmount) <= Number(o.maxAmount) && Number(o.appliedAmount) < Number(o.requestedAmount))
         ));
       }
       {

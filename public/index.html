@@ -835,7 +835,7 @@ function renderGridSidePanel(s){
     <div class="grid-side-head"><span>Grid</span><span>${columns.length}${grid.wsRef?' on':''}</span></div>
     <div class="grid-projects">${projectRows || '<div class="thread-empty">No projects</div>'}</div>
     <div class="grid-live">
-      <div class="grid-live-title">Columns</div>
+      <div class="grid-live-title">Columns${grid.wsRef?` <button class="grid-toggle" data-action="grid-rebalance" title="列幅を均等に整形（今すぐ rebalance）" onclick="event.stopPropagation();rebalanceGrid()">⚖️ 今すぐ整形</button>`:''}</div>
       <div class="grid-columns">${liveRows}</div>
     </div>`;
 }
@@ -1122,6 +1122,22 @@ async function close_(id){ if(busy.has(id))return; busy.add(id); render(lastStat
   busy.delete(id); }
 async function focus(id){ await withQuiet(async()=>{ try{ await jpost('/api/focus/'+id); toast('フォーカスしました'); }catch(e){} }); }
 async function focusGrid(){ await withQuiet(async()=>{ try{ await jpost('/api/grid/focus'); toast('Gridを表示しました'); }catch(e){ toast('失敗: '+(e && e.message ? e.message : e)); } }); }
+async function rebalanceGrid(){
+  const btn = document.querySelector('[data-action="grid-rebalance"]');
+  if(btn){ btn.classList.add('pending'); btn.disabled = true; }
+  toast('グリッドを整形中…');
+  await withQuiet(async()=>{
+    try{
+      const r = await jpost('/api/grid/rebuild');
+      const rb = r && r.rebalance ? r.rebalance : r;
+      if(rb && rb.disabled){ toast('整形は無効化されています (CMUX_DASH_GRID_REBALANCE=off)'); }
+      else if(rb && rb.converged){ toast(`整形完了 ✓ (${rb.passCount||'?'}パス)`); }
+      else if(rb && rb.unconverged){ toast('整形しきれず（再試行してください）'); }
+      else { toast('整形を要求しました'); }
+    }catch(e){ toast('失敗: '+(e && e.message ? e.message : e)); }
+  });
+  if(btn){ btn.classList.remove('pending'); btn.disabled = false; }
+}
 async function toggleSlot(id, slot, on){
   const key = `${id}:${slot}`;
   if(busy.has(key)) return;
