@@ -8,8 +8,8 @@
 ## 進捗（2026-06-14 時点）
 - ✅ **T4(#4) 完了**: grid rebalance の amount クランプ＋係数1.0＋killswitch＋UI「今すぐ整形」ボタン。node/fake-cmux テスト PASS。
 - ✅ **T3(#3) MVP 完了**: 休眠していた claude↔codex 会話 thread を全プロジェクト行に「💬 会話」1アクションで配線（/api/agmsg, PID非依存）。
-- ✅ **T5(#5) コア完了**: `statusline-metrics.js`(context%/cost/window、単価override) ＋ `/api/statusline` ＋ 行ごと context% バー＋コスト。実データで動作確認済み。
-  - ⏳ 残: agent **死活**警告、grid列への配置、スパークライン → **live process/surface データ必須＝cmux復活後**。
+- ✅ **T5(#5) 大部分完了**: `statusline-metrics.js`(context%/cost/window/**スパークライン5h・7d**、単価override) ＋ `/api/statusline` ＋ 行ごと context% バー＋コスト＋週次スパークライン。実データで動作確認済み。
+  - ⏳ 残: agent **死活**警告、grid列への配置 → **live process/surface データ必須＝cmux復活後**。
 - ⏸ **T1(#1)**: 設計9項目は実装済み。残は**実機E2E検証**（cmux必須）。
 - ⏸ **T2(#2)**: スキルを setup専用に縮小（headlessブリッジ削除）。**リポジトリ外＋人間承認必須**。
 
