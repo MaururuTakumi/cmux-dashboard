@@ -590,6 +590,52 @@ if ! run_t3_thread_checks; then
   finish
 fi
 
+run_t5_metrics_checks() {
+  if "$NODE_BIN" - "$DIR" <<'NODE' 2>/dev/null
+const path = require("path");
+const fs = require("fs");
+const os = require("os");
+const repo = process.argv[2];
+const m = require(path.join(repo, "statusline-metrics.js"));
+const mk = (model,inp,out,cr,cw,ts)=>JSON.stringify({type:"assistant",timestamp:ts,message:{model,usage:{input_tokens:inp,output_tokens:out,cache_read_input_tokens:cr,cache_creation_input_tokens:cw}}});
+const fx = path.join(os.tmpdir(), "t5-fixture-"+process.pid+".jsonl");
+fs.writeFileSync(fx,[
+  mk("claude-opus-4-8",1000,200,5000,2000,"2026-06-14T10:00:00Z"),
+  "not json line",
+  mk("claude-fable-5",10000,300,800000,100000,"2026-06-14T11:00:00Z"),
+].join("\n"));
+let ok = true;
+try {
+  const s = m.summarizeTranscript(fx,{nowMs:Date.parse("2026-06-14T12:00:00Z")});
+  ok = ok && s.ok === true;
+  ok = ok && s.context.pct === 91;
+  ok = ok && s.context.level === "danger";
+  ok = ok && s.context.windowTokens === 1000000;
+  ok = ok && s.model === "claude-fable-5";
+  ok = ok && s.messageCount === 2;
+  ok = ok && s.cost.turn > 0 && s.cost.session >= s.cost.turn && s.cost.week >= s.cost.turn;
+  ok = ok && m.summarizeTranscript(path.join(os.tmpdir(),"nonexistent-"+process.pid+".jsonl")).ok === false;
+  const overridden = m.aggregateCost(
+    [{model:"x",tsMs:Date.parse("2026-06-14T11:00:00Z"),usage:{input:1000000,output:0,cacheRead:0,cacheWrite:0}}],
+    {x:{input:2,output:0,cacheWrite:0,cacheRead:0}}, Date.parse("2026-06-14T12:00:00Z"));
+  ok = ok && overridden.session === 2;
+  ok = ok && m.contextWindowFor("claude-haiku-4-5") === 200000;
+} catch (e) { ok = false; }
+finally { try { fs.unlinkSync(fx); } catch (_) {} }
+process.exit(ok ? 0 : 1);
+NODE
+  then
+    pass "R T5: statusline-metrics computes context%/level/cost from transcript (fixture, graceful degrade, pricing override)"
+  else
+    fail "R T5: statusline-metrics contract failed"
+    return 1
+  fi
+}
+
+if ! run_t5_metrics_checks; then
+  finish
+fi
+
 run_scroll_reset_static_checks() {
   local index_file="$DIR/public/index.html"
 
