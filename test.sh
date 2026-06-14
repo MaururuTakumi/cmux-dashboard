@@ -675,6 +675,10 @@ const checks = [
   script.includes("const sl = statuslineFor(p.id)"),
   html.includes("ctxbar"),
   script.includes("refreshStatusline()"),
+  script.includes("function metricsFor(id)"),
+  script.includes("function livenessBadges(p)"),
+  script.includes("function slotLiveness(p, slot)"),
+  html.includes("live-badge"),
 ];
 process.exit(checks.every(Boolean) ? 0 : 1);
 NODE

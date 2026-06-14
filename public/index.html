@@ -224,6 +224,9 @@
   .ctxbar.danger{color:#ff8585}
   .ctxbar.danger .fill{background:#ff6b6b}
   .ctxbar .spark{font-family:ui-monospace,monospace;letter-spacing:-1px;opacity:.85}
+  .live-badge{font-size:10px;font-weight:850;padding:1px 5px;border-radius:6px;border:1px solid var(--line)}
+  .live-badge.ok{color:#7ee787;border-color:color-mix(in srgb,#7ee787 35%,var(--line))}
+  .live-badge.dead{color:#ff6b6b;border-color:color-mix(in srgb,#ff6b6b 45%,var(--line));background:color-mix(in srgb,#ff6b6b 12%,var(--bg))}
   .empty{color:var(--faint);text-align:center;margin:60px auto;max-width:360px}
   /* add modal */
   .modal-bg{position:fixed;inset:0;background:rgba(3,6,12,.66);backdrop-filter:blur(3px);display:none;place-items:center;z-index:30}
@@ -493,6 +496,32 @@ async function refreshStatusline(){
 function statuslineFor(id){
   const p = lastStatusline && lastStatusline.projects ? lastStatusline.projects[id] : null;
   return p && p.metrics && p.metrics.ok ? p.metrics : null;
+}
+function metricsFor(id){
+  const arr = (lastMetrics && Array.isArray(lastMetrics.projects)) ? lastMetrics.projects : [];
+  return arr.find(p => p && (p.projectId === id || p.id === id)) || null;
+}
+// T5: agent liveness per slot. A slot that is ON (surface present) but has no
+// matching live process (C=claude / X=codex) is treated as dead.
+function slotLiveness(p, slot){
+  const on = !!(p.slotRefs && p.slotRefs[slot]);
+  if(!on) return null; // slot not active -> no liveness signal
+  const mt = metricsFor(p.id);
+  const key = slot === 'cc' ? 'C' : (slot === 'cdx' ? 'X' : null);
+  if(!key || !mt || !mt.byType) return { on:true, alive:null };
+  const cnt = Number((mt.byType[key]||{}).procCount) || 0;
+  return { on:true, alive: cnt > 0 };
+}
+function livenessBadges(p){
+  const out = [];
+  for(const slot of ['cc','cdx']){
+    const l = slotLiveness(p, slot);
+    if(!l) continue;
+    const label = slot === 'cc' ? 'CC' : 'Cdx';
+    if(l.alive === false) out.push(`<span class="live-badge dead" title="${label} のプロセスが見つかりません（死亡？）">${label}🔴</span>`);
+    else if(l.alive === true) out.push(`<span class="live-badge ok" title="${label} 稼働中">${label}🟢</span>`);
+  }
+  return out.join('');
 }
 async function refresh(){
   if(actionInFlight) return;
@@ -842,11 +871,12 @@ function renderGridSidePanel(s){
     const ccOn = !!(col.cc && col.cc.surfaceRef);
     const cdxOn = !!(col.cdx && col.cdx.surfaceRef);
     const order = Number.isFinite(Number(col.order)) ? Number(col.order) + 1 : '?';
+    const csl = statuslineFor(col.projectId);
+    const clive = livenessBadges(p);
     return `<div class="grid-column-row" data-grid-column-project="${esc(col.projectId)}">
-      <div class="grid-column-name">${order}. ${esc(p.name || col.projectId)}</div>
+      <div class="grid-column-name">${order}. ${esc(p.name || col.projectId)}${csl?`<span class="ctxbar ${esc(csl.context.level)}" title="context ${esc(csl.context.pct)}% · session $${esc(csl.cost.session)}"><span class="track"><span class="fill" style="width:${Math.min(100,Number(csl.context.pct)||0)}%"></span></span>${esc(csl.context.pct)}%</span>`:''}</div>
       <div class="grid-badges">
-        <span class="grid-badge cc ${ccOn?'on':''}">CC</span>
-        <span class="grid-badge cdx ${cdxOn?'on':''}">Cdx</span>
+        ${clive || `<span class="grid-badge cc ${ccOn?'on':''}">CC</span><span class="grid-badge cdx ${cdxOn?'on':''}">Cdx</span>`}
       </div>
     </div>`;
   }).join('') : '<div class="thread-empty">grid empty</div>';
@@ -911,6 +941,7 @@ function renderProjectRow(p, index, s){
       <span><b>health</b> ${esc(health)}</span>
       <span><b>collab</b> ${esc(collab.enabled ? (collab.active ? 'enabled/active' : 'enabled/pending') : 'disabled')}</span>
       ${err?`<span class="err"><b>lastError</b> ${esc(err)}</span>`:`<span><b>lastError</b> none</span>`}
+      ${livenessBadges(p)}
       ${sl?`<span class="ctxbar ${esc(sl.context.level)}" title="context ${esc(sl.context.pct)}% of ${esc(Math.round(sl.context.windowTokens/100000)/10)}M tokens · ${esc(sl.model||'')} · session $${esc(sl.cost.session)} / week $${esc(sl.cost.week)}${sl.sparkText?` · 5h ${esc(sl.sparkText.session)} · 7d ${esc(sl.sparkText.week)}`:''}"><b>ctx</b><span class="track"><span class="fill" style="width:${Math.min(100,Number(sl.context.pct)||0)}%"></span></span>${esc(sl.context.pct)}% · $${esc(sl.cost.session)}${sl.sparkText?` <span class="spark">${esc(sl.sparkText.week)}</span>`:''}</span>`:''}
       <button class="thread-toggle ${threadOpen?'on':''}" data-action="thread" title="claude→codex の指示と返信を表示（read-only）" onclick="event.stopPropagation();toggleThread(${jsArg(p.id)})">💬 ${threadOpen?'会話を閉じる':'会話'}</button>
     </div>
