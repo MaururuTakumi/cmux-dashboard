@@ -3,8 +3,27 @@
 > 作成: claude(Opus) 2026-06-14 / 目的: cmux.app 再起動でこのチャットが落ちるため、次の新セッションが**ここから迷わず続行**するための引き継ぎ。
 
 ## いまの状況（一言で）
-**cmux-dashboard の GitHub Issue #1–#5 を collab で1つずつ実装し、ダッシュボードを完成させる**作業。
-**計画は完成済み・実装は未着手**。理由＝(A) headless codex がハングして使えない → (B) 見える2ペイン方式に切替決定 → (C) その土台の cmux.sock が停止 → ユーザーが cmux.app を再起動するところ。
+**cmux-dashboard の GitHub Issue #1–#5 を実装し完成させる**作業。collab(codex)がハング＋cmux停止のため、ユーザー承認のもと **claude(Opus)が直接実装中**。branch `tickets-sweep` に commit 済み（push はゴール末にまとめて人間承認）。
+
+## 進捗（2026-06-14 時点）
+- ✅ **T4(#4) 完了**: grid rebalance の amount クランプ＋係数1.0＋killswitch＋UI「今すぐ整形」ボタン。node/fake-cmux テスト PASS。
+- ✅ **T3(#3) MVP 完了**: 休眠していた claude↔codex 会話 thread を全プロジェクト行に「💬 会話」1アクションで配線（/api/agmsg, PID非依存）。
+- ✅ **T5(#5) コア完了**: `statusline-metrics.js`(context%/cost/window、単価override) ＋ `/api/statusline` ＋ 行ごと context% バー＋コスト。実データで動作確認済み。
+  - ⏳ 残: agent **死活**警告、grid列への配置、スパークライン → **live process/surface データ必須＝cmux復活後**。
+- ⏸ **T1(#1)**: 設計9項目は実装済み。残は**実機E2E検証**（cmux必須）。
+- ⏸ **T2(#2)**: スキルを setup専用に縮小（headlessブリッジ削除）。**リポジトリ外＋人間承認必須**。
+
+branch `tickets-sweep` commits: docs / fix(grid #4) / feat(observability #3) / feat(statusline #5 ×3)。
+
+## cmux 再起動後の残タスク（このため再起動が要る）
+1. **T1 実機E2E**: 新規列を開く→手動設定ゼロで claude↔codex 双方向→人間→CC→agmsg→Cdxペイン→codex反応→返信、を実走確認。穴があれば塞ぐ。
+2. **T5 残**: 死活警告（surface marker live + プロセス存在）＋ grid列メトリクス配置 ＋ スパークライン。
+3. **T2**: スキル(`~/.claude/skills/claude-codex-collab`)の headless bridge 削除＋SKILL.md更新（人間承認の上で）。
+4. **全体**: `./test.sh` を cmux 健全下で完走させ FINAL PASS（今は API/実機フェーズが cmux停止でハング）。実機目視（grid整形/会話/ctxバー）。
+5. push 承認 → Issue #1–#5 クローズ（done分は先にクローズ可）。
+
+## 旧・初期状況（参考）
+当初: (A) headless codex ハング → (B) 見える2ペイン方式に切替決定 → (C) cmux.sock 停止 → 再起動待ち。その後ユーザーが「私(Opus)が直接実装」を選択し上記を実装。
 
 ## ユーザーの確定事項
 - 着手順: **基盤→可視化 = T4 → T1 → T3 → T5 → T2**
