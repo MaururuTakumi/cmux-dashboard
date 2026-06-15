@@ -18,6 +18,7 @@ const GRID_RIGHT_ANCHOR_MARKER = `${GRID_MARK_PREFIX}${GRID_ID}:right-anchor`;
 const DEFAULT_DASHBOARD_PORT = 7799;
 const PROJECTS_FILE = process.env.CMUX_DASH_PROJECTS_FILE || path.join(__dirname, 'projects.json');
 const PROJECTS_EXAMPLE_FILE = process.env.CMUX_DASH_PROJECTS_EXAMPLE_FILE || path.join(__dirname, 'projects.example.json');
+const GRID_STATE_FILE = process.env.CMUX_DASH_GRID_STATE_FILE || path.join(__dirname, '.grid-state.json');
 const AGMSG_DIR = path.join(os.homedir(), '.agents', 'skills', 'agmsg');
 const AGMSG_SCRIPTS = path.join(AGMSG_DIR, 'scripts');
 const COLLAB_SKILL_DIR = path.join(os.homedir(), '.claude', 'skills', 'claude-codex-collab');
@@ -1225,6 +1226,126 @@ const GRID_WORKSPACE_LOOKUP_ATTEMPTS = 3;
 function cleanRef(value) {
   const text = String(value || '').trim();
   return text || null;
+}
+
+function gridSlotStateForPersistence(slot) {
+  return {
+    surfaceRef: cleanRef(slot && slot.surfaceRef),
+    paneRef: cleanRef(slot && slot.paneRef),
+    marker: cleanRef(slot && slot.marker),
+  };
+}
+
+function gridColumnStateForPersistence(column, idx) {
+  if (!column) return null;
+  const projectId = cleanRef(column.projectId);
+  const columnId = gridColumnId(column.columnId || projectId);
+  const cc = gridSlotStateForPersistence(column.cc);
+  const cdx = gridSlotStateForPersistence(column.cdx);
+  if (!projectId || !columnId || !cc.surfaceRef || !cdx.surfaceRef) return null;
+  return {
+    projectId,
+    columnId,
+    order: Number.isFinite(column.order) ? column.order : idx,
+    createdAt: cleanRef(column.createdAt),
+    cc,
+    cdx,
+  };
+}
+
+function serializedGridRuntimeState() {
+  return {
+    version: 1,
+    wsRef: cleanRef(gridRuntimeState.wsRef),
+    anchorSurfaceRef: cleanRef(gridRuntimeState.anchorSurfaceRef),
+    concierge: gridConciergeSnapshot(),
+    columns: (Array.isArray(gridRuntimeState.columns) ? gridRuntimeState.columns : [])
+      .map((column, idx) => gridColumnStateForPersistence(column, idx))
+      .filter(Boolean),
+  };
+}
+
+function persistGridRuntimeState() {
+  try {
+    const dir = path.dirname(GRID_STATE_FILE);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = path.join(dir, `.${path.basename(GRID_STATE_FILE)}.${process.pid}.${Date.now()}.tmp`);
+    fs.writeFileSync(tmp, JSON.stringify(serializedGridRuntimeState(), null, 2) + '\n');
+    fs.renameSync(tmp, GRID_STATE_FILE);
+  } catch (err) {
+    console.warn(`grid state persist failed: ${summarizeError(err)}`);
+  }
+}
+
+function normalizeHydratedGridSlot(value) {
+  if (!value || typeof value !== 'object') return null;
+  if (typeof value.surfaceRef !== 'string') return null;
+  if (value.paneRef != null && typeof value.paneRef !== 'string') return null;
+  if (value.marker != null && typeof value.marker !== 'string') return null;
+  const surfaceRef = cleanRef(value.surfaceRef);
+  if (!surfaceRef) return null;
+  return {
+    surfaceRef,
+    paneRef: cleanRef(value.paneRef),
+    marker: cleanRef(value.marker),
+  };
+}
+
+function normalizeHydratedGridColumn(value, idx) {
+  if (!value || typeof value !== 'object') return null;
+  if (typeof value.projectId !== 'string') return null;
+  if (value.columnId != null && typeof value.columnId !== 'string') return null;
+  if (value.order != null && !Number.isFinite(value.order)) return null;
+  if (value.createdAt != null && typeof value.createdAt !== 'string') return null;
+  if (value.updatedAt != null && typeof value.updatedAt !== 'string') return null;
+  const projectId = cleanRef(value.projectId);
+  const columnId = gridColumnId(value.columnId || projectId);
+  const cc = normalizeHydratedGridSlot(value.cc);
+  const cdx = normalizeHydratedGridSlot(value.cdx);
+  if (!projectId || !columnId || !cc || !cdx) return null;
+  return {
+    columnId,
+    projectId,
+    wsRef: null,
+    order: Number.isFinite(value.order) ? value.order : idx,
+    cc,
+    cdx,
+    createdAt: cleanRef(value.createdAt),
+    updatedAt: cleanRef(value.updatedAt),
+  };
+}
+
+function normalizeHydratedGridConcierge(value) {
+  if (!value || typeof value !== 'object') return null;
+  if (value.surfaceRef != null && typeof value.surfaceRef !== 'string') return null;
+  if (value.paneRef != null && typeof value.paneRef !== 'string') return null;
+  return {
+    surfaceRef: cleanRef(value.surfaceRef),
+    paneRef: cleanRef(value.paneRef),
+    marker: GRID_CONCIERGE_MARKER,
+  };
+}
+
+function hydrateGridRuntimeState() {
+  try {
+    if (!fs.existsSync(GRID_STATE_FILE)) return;
+    const parsed = JSON.parse(fs.readFileSync(GRID_STATE_FILE, 'utf8'));
+    if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.columns)) return;
+    if (parsed.wsRef != null && typeof parsed.wsRef !== 'string') return;
+    if (parsed.anchorSurfaceRef != null && typeof parsed.anchorSurfaceRef !== 'string') return;
+    const concierge = normalizeHydratedGridConcierge(parsed.concierge);
+    if (!concierge) return;
+    const columns = parsed.columns.map(normalizeHydratedGridColumn);
+    if (columns.some((column) => !column)) return;
+    gridRuntimeState.wsRef = cleanRef(parsed.wsRef);
+    gridRuntimeState.anchorSurfaceRef = cleanRef(parsed.anchorSurfaceRef);
+    gridRuntimeState.concierge = concierge;
+    gridRuntimeState.columns = columns.map((column) => ({ ...column, wsRef: cleanRef(parsed.wsRef) }));
+    gridRuntimeState.orphans = [];
+    gridRuntimeState.lastRebalance = null;
+    gridRuntimeState.lastRebalanceRepairAt = null;
+    reindexGridColumns();
+  } catch (_) {}
 }
 
 async function workspaceRefExistsCheck(ref, { allowStale = true, quick = true } = {}) {
@@ -2486,6 +2607,7 @@ function gridConciergeSnapshot() {
 function gridStateSnapshot(wsRef, columns = gridRuntimeState.columns) {
   return {
     wsRef: cleanRef(wsRef),
+    anchorSurfaceRef: cleanRef(gridRuntimeState.anchorSurfaceRef),
     concierge: gridConciergeSnapshot(),
     columns: (Array.isArray(columns) ? columns : [])
       .map((column, idx) => gridColumnSnapshot(column, idx))
@@ -2503,6 +2625,8 @@ function reindexGridColumns() {
   });
 }
 
+hydrateGridRuntimeState();
+
 function dashboardBrowserUrl() {
   const port = parseInt(process.env.CMUX_DASH_PORT || String(DEFAULT_DASHBOARD_PORT), 10) || DEFAULT_DASHBOARD_PORT;
   const rawHost = String(process.env.CMUX_DASH_HOST || '127.0.0.1').trim() || '127.0.0.1';
@@ -2519,6 +2643,7 @@ async function ensureGridWorkspace() {
   const knownRef = cleanRef(gridRuntimeState.wsRef);
   if (knownRef && await workspaceRefExists(knownRef, { allowStale: true, quick: true })) {
     await ensureConciergeSurface(knownRef);
+    persistGridRuntimeState();
     return knownRef;
   }
   if (knownRef) {
@@ -2539,6 +2664,7 @@ async function ensureGridWorkspace() {
     }
     gridRuntimeState.wsRef = existing.ref;
     await ensureConciergeSurface(existing.ref);
+    persistGridRuntimeState();
     return existing.ref;
   }
 
@@ -2564,6 +2690,7 @@ async function ensureGridWorkspace() {
   gridRuntimeState.lastRebalance = null;
   gridRuntimeState.lastRebalanceRepairAt = null;
   await ensureConciergeSurface(ref);
+  persistGridRuntimeState();
   return ref;
 }
 
@@ -2869,6 +2996,7 @@ function buildAdoptedGridColumns(wsRef, surfaces, cfg, now = new Date().toISOStr
       }));
     }
     if (!record.cc || !record.cdx) {
+      if (existingByProject.has(record.projectId)) continue;
       for (const slot of ['cc', 'cdx']) {
         if (record[slot]) {
           markerOrphans.push(gridOrphanSurface(record[slot], 'incomplete_grid_column_marker', {
@@ -2881,6 +3009,7 @@ function buildAdoptedGridColumns(wsRef, surfaces, cfg, now = new Date().toISOStr
       continue;
     }
     const existing = existingByProject.get(record.projectId);
+    if (existing) continue;
     merged.set(record.projectId, {
       columnId: gridColumnId(record.columnId || record.projectId),
       projectId: record.projectId,
@@ -3819,11 +3948,27 @@ async function ensureGridRightAnchorSurface(wsRef) {
   try {
     return await findGridRightAnchorSurface(wsRef);
   } catch (err) {
-    if (gridRuntimeState.columns.length) throw err;
+    // Anchor surface was lost. Recreate it instead of deadlocking — previously this
+    // rethrew whenever any column existed, which permanently blocked opening new
+    // projects once the dedicated right-anchor terminal had been closed.
   }
-  const browserAnchor = await findGridBrowserAnchorSurface(wsRef);
-  const anchor = await createAnchoredGridSplitSurface(wsRef, browserAnchor.ref, 'right');
+  // When columns already exist, split the new anchor off the right edge of the
+  // rightmost existing column so it lands at the far right (rebalance fixes ordering).
+  // Otherwise fall back to splitting off the dashboard browser pane.
+  let splitFromRef = null;
+  const cols = Array.isArray(gridRuntimeState.columns) ? gridRuntimeState.columns : [];
+  if (cols.length) {
+    const rightmost = cols[cols.length - 1];
+    splitFromRef = cleanRef(rightmost && rightmost.cc && rightmost.cc.surfaceRef)
+      || cleanRef(rightmost && rightmost.cdx && rightmost.cdx.surfaceRef);
+  }
+  if (!splitFromRef) {
+    const browserAnchor = await findGridBrowserAnchorSurface(wsRef);
+    splitFromRef = browserAnchor.ref;
+  }
+  const anchor = await createAnchoredGridSplitSurface(wsRef, splitFromRef, 'right');
   gridRuntimeState.anchorSurfaceRef = anchor.surfaceRef;
+  persistGridRuntimeState();
   return { ref: anchor.surfaceRef, paneRef: anchor.paneRef || null };
 }
 
@@ -3912,6 +4057,7 @@ async function ensureConciergeSurface(wsRef) {
   const known = markedOrKnownGridConciergeSurface(surfaces);
   if (known && known.ref) {
     const state = setGridConciergeSurface(known);
+    persistGridRuntimeState();
     return { ref: state.surfaceRef, surfaceRef: state.surfaceRef, paneRef: state.paneRef, marker: state.marker, existing: true };
   }
 
@@ -3923,6 +4069,7 @@ async function ensureConciergeSurface(wsRef) {
     surfaces = await listWorkspaceSurfaces(ref);
     const launched = markedOrKnownGridConciergeSurface(surfaces) || adoptable;
     const next = setGridConciergeSurface(launched);
+    persistGridRuntimeState();
     return { ref: next.surfaceRef, surfaceRef: next.surfaceRef, paneRef: next.paneRef, marker: next.marker, existing: true, launched: true };
   }
 
@@ -3934,6 +4081,7 @@ async function ensureConciergeSurface(wsRef) {
   surfaces = await listWorkspaceSurfaces(ref);
   const launched = markedOrKnownGridConciergeSurface(surfaces);
   const next = setGridConciergeSurface(launched || state);
+  persistGridRuntimeState();
   return {
     ref: next.surfaceRef,
     surfaceRef: next.surfaceRef,
@@ -4165,6 +4313,7 @@ async function rebuildGridWorkspace(columns, cfg = loadConfig()) {
     gridRuntimeState.orphans = [];
     gridRuntimeState.lastRebalance = null;
     gridRuntimeState.lastRebalanceRepairAt = null;
+    persistGridRuntimeState();
     return { ...gridStateSnapshot(null, []), closedWs, rebuilt: true };
   }
 
@@ -4208,6 +4357,7 @@ async function rebuildGridWorkspace(columns, cfg = loadConfig()) {
   } catch (_) {
     gridRuntimeState.anchorSurfaceRef = null;
   }
+  persistGridRuntimeState();
   return { ...gridStateSnapshot(wsRef, rebuilt), layout, rebuilt: true };
 }
 
@@ -4245,6 +4395,7 @@ async function validateGridRuntimeState() {
     gridRuntimeState.orphans = [];
     gridRuntimeState.lastRebalance = null;
     gridRuntimeState.lastRebalanceRepairAt = null;
+    persistGridRuntimeState();
     return gridStateSnapshot(null, []);
   }
 
@@ -4281,6 +4432,7 @@ async function validateGridRuntimeState() {
     rightAnchorSurfaceRef: gridRuntimeState.anchorSurfaceRef,
   }, resync.markerOrphans);
   reindexGridColumns();
+  persistGridRuntimeState();
   return gridStateSnapshot(ws.ref);
 }
 
@@ -4392,6 +4544,7 @@ async function focusGridWorkspace({ ensure = false, wsRef = null } = {}) {
   if (!ws || !ws.ref) return { focused: false };
   await cmux(['select-workspace', '--workspace', ws.ref]);
   gridRuntimeState.wsRef = ws.ref;
+  persistGridRuntimeState();
   return { focused: true, ref: ws.ref, wsRef: ws.ref };
 }
 
@@ -4496,6 +4649,7 @@ async function removeProjectColumn(projectId) {
     gridRuntimeState.orphans = [];
     gridRuntimeState.lastRebalance = null;
     gridRuntimeState.lastRebalanceRepairAt = null;
+    persistGridRuntimeState();
     return {
       projectId,
       removed: true,
