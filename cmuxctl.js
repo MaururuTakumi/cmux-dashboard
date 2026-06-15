@@ -1198,7 +1198,23 @@ const GRID_RIGHT_ANCHOR_SPLIT = 0.94;
 const GRID_REBALANCE_MAX_PASSES = 8;
 const GRID_REBALANCE_TOLERANCE = 0.05;
 const GRID_REBALANCE_REPAIR_TOLERANCE = 0.10;
-const GRID_RESIZE_FALLBACK_PX_PER_AMOUNT = 0.5;
+// First-pass resize calibration coefficient (px moved per `resize-pane --amount` unit).
+// Observed reality on this display is ~1.0; the previous 0.5 doubled the requested amount,
+// so large first-pass moves (e.g. shrinking a 2800px browser block) overshot cmux's
+// per-command resize limit and were rejected, stranding that boundary as "unmovable".
+// Env-overridable for displays with a different cell-to-pixel ratio.
+const GRID_RESIZE_FALLBACK_PX_PER_AMOUNT = (() => {
+  const n = Number.parseFloat(process.env.CMUX_DASH_GRID_PX_PER_AMOUNT || '');
+  return Number.isFinite(n) && n > 0 ? n : 1;
+})();
+// Clamp a single `resize-pane --amount` move to a safe fraction of total workspace width.
+// cmux rejects over-large amounts outright (the boundary then reads as "unmovable" and gets
+// abandoned, which is the root cause of grid columns collapsing). Large divergences are instead
+// covered incrementally across rebalance passes. Env-overridable for unusual layouts.
+const GRID_RESIZE_MAX_AMOUNT_RATIO = (() => {
+  const n = Number.parseFloat(process.env.CMUX_DASH_GRID_MAX_RESIZE_RATIO || '');
+  return Number.isFinite(n) && n > 0 && n <= 1 ? n : 0.5;
+})();
 const GRID_RIGHT_ANCHOR_SLIVER_RATIO = 0.01;
 const GRID_REBALANCE_REPAIR_THROTTLE_MS = 3000;
 const GRID_REBALANCE_PANE_READ_ATTEMPTS = 5;
@@ -3513,7 +3529,19 @@ async function resizeGridBoundary(wsRef, boundaryOrPaneRef, targetRightPx, cellW
     };
   }
   const pxPerAmount = gridResizeCoefficientPxPerAmount(opts.pxPerAmount);
-  const amount = Math.max(1, Math.ceil(Math.abs(diffPx) / pxPerAmount));
+  const requestedAmount = Math.max(1, Math.ceil(Math.abs(diffPx) / pxPerAmount));
+  // Clamp the per-command move so cmux never rejects an over-large amount (which would strand
+  // this boundary as "unmovable"). Bound by a fraction of total workspace width; the remaining
+  // distance is closed on subsequent rebalance passes.
+  const totalWidthPx = (() => {
+    const bounds = boundsForFrames(geometry.frames);
+    return bounds && Number.isFinite(bounds.width) ? bounds.width : 0;
+  })();
+  const maxAmount = totalWidthPx > 0
+    ? Math.max(1, Math.floor((totalWidthPx * GRID_RESIZE_MAX_AMOUNT_RATIO) / pxPerAmount))
+    : requestedAmount;
+  const amount = Math.min(requestedAmount, maxAmount);
+  const clamped = amount < requestedAmount;
   const primary = diffPx > 0
     ? { ref: leftPaneRef, frame: leftFrame, direction: '-R', convention: 'left-pane-R' }
     : { ref: rightPaneRef, frame: rightFrame, direction: '-L', convention: 'right-pane-L' };
@@ -3551,6 +3579,10 @@ async function resizeGridBoundary(wsRef, boundaryOrPaneRef, targetRightPx, cellW
     strategy,
     convention: instruction.convention,
     signature,
+    requestedAmount,
+    appliedAmount: amount,
+    clamped,
+    ...(clamped ? { maxAmount } : {}),
     estimatedMovePx: Math.round(amount * pxPerAmount),
     diffPx,
     actualBoundaryPx: Math.round(actualBoundaryPx),
@@ -3560,6 +3592,9 @@ async function resizeGridBoundary(wsRef, boundaryOrPaneRef, targetRightPx, cellW
 }
 
 async function rebalanceGridColumns(wsRef) {
+  if (process.env.CMUX_DASH_GRID_REBALANCE === 'off') {
+    return { rebalanced: false, disabled: true, reason: 'rebalance disabled via CMUX_DASH_GRID_REBALANCE=off' };
+  }
   const ref = cleanRef(wsRef);
   if (!ref) return { rebalanced: false, error: 'missing workspace ref' };
   const columns = (Array.isArray(gridRuntimeState.columns) ? gridRuntimeState.columns : [])

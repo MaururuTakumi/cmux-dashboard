@@ -214,6 +214,19 @@
   .thread-more{border:0;background:transparent;color:var(--accent);padding:0;margin-top:2px;font-size:11px;cursor:pointer}
   .thread-empty{color:var(--faint);font-size:12px;text-align:center;padding:12px 0}
   .thread-error{color:#ffb1bd;font-size:11.5px}
+  .thread-toggle{margin-left:auto;height:22px;border-radius:7px;border:1px solid var(--line);background:var(--panel2);color:var(--dim);font-size:10.5px;font-weight:850;cursor:pointer;padding:0 9px;white-space:nowrap}
+  .thread-toggle.on{background:var(--accent);border-color:transparent;color:#041126}
+  .ctxbar{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;color:var(--dim)}
+  .ctxbar .track{width:46px;height:6px;border-radius:3px;background:var(--line);overflow:hidden}
+  .ctxbar .fill{height:100%;background:var(--accent);transition:width .3s}
+  .ctxbar.warn{color:#f5c518}
+  .ctxbar.warn .fill{background:#f5c518}
+  .ctxbar.danger{color:#ff8585}
+  .ctxbar.danger .fill{background:#ff6b6b}
+  .ctxbar .spark{font-family:ui-monospace,monospace;letter-spacing:-1px;opacity:.85}
+  .live-badge{font-size:10px;font-weight:850;padding:1px 5px;border-radius:6px;border:1px solid var(--line)}
+  .live-badge.ok{color:#7ee787;border-color:color-mix(in srgb,#7ee787 35%,var(--line))}
+  .live-badge.dead{color:#ff6b6b;border-color:color-mix(in srgb,#ff6b6b 45%,var(--line));background:color-mix(in srgb,#ff6b6b 12%,var(--bg))}
   .empty{color:var(--faint);text-align:center;margin:60px auto;max-width:360px}
   /* add modal */
   .modal-bg{position:fixed;inset:0;background:rgba(3,6,12,.66);backdrop-filter:blur(3px);display:none;place-items:center;z-index:30}
@@ -400,6 +413,7 @@ let lastState=null;
 let lastMetrics=null;
 let pollTimer=null;
 let metricsTimer=null;
+let lastStatusline=null;   // T5: per-project transcript metrics (context%/cost)
 let actionInFlight=0;   // アクション実行中はポーリングを止める（cmuxアプリのsocket競合を避ける）
 let lastToastError='';
 let projectRowCache = new Map();
@@ -473,8 +487,42 @@ function captureScrollGuard(){
 }
 function startPoll(){ stopPoll(); pollTimer=setInterval(()=>{ if(!actionInFlight) refresh(); }, 4000); }
 function stopPoll(){ if(pollTimer){ clearInterval(pollTimer); pollTimer=null; } }
-function startMetricsPoll(){ stopMetricsPoll(); metricsTimer=setInterval(()=>{ if(!actionInFlight && document.visibilityState!=='hidden') refreshMetrics(); }, 5000); }
+function startMetricsPoll(){ stopMetricsPoll(); metricsTimer=setInterval(()=>{ if(!actionInFlight && document.visibilityState!=='hidden'){ refreshMetrics(); refreshStatusline(); } }, 5000); }
 function stopMetricsPoll(){ if(metricsTimer){ clearInterval(metricsTimer); metricsTimer=null; } }
+async function refreshStatusline(){
+  if(actionInFlight || document.visibilityState==='hidden') return;
+  try{ lastStatusline=await jget('/api/statusline'); if(lastState) render(lastState); }catch(e){}
+}
+function statuslineFor(id){
+  const p = lastStatusline && lastStatusline.projects ? lastStatusline.projects[id] : null;
+  return p && p.metrics && p.metrics.ok ? p.metrics : null;
+}
+function metricsFor(id){
+  const arr = (lastMetrics && Array.isArray(lastMetrics.projects)) ? lastMetrics.projects : [];
+  return arr.find(p => p && (p.projectId === id || p.id === id)) || null;
+}
+// T5: agent liveness per slot. A slot that is ON (surface present) but has no
+// matching live process (C=claude / X=codex) is treated as dead.
+function slotLiveness(p, slot){
+  const on = !!(p.slotRefs && p.slotRefs[slot]);
+  if(!on) return null; // slot not active -> no liveness signal
+  const mt = metricsFor(p.id);
+  const key = slot === 'cc' ? 'C' : (slot === 'cdx' ? 'X' : null);
+  if(!key || !mt || !mt.byType) return { on:true, alive:null };
+  const cnt = Number((mt.byType[key]||{}).procCount) || 0;
+  return { on:true, alive: cnt > 0 };
+}
+function livenessBadges(p){
+  const out = [];
+  for(const slot of ['cc','cdx']){
+    const l = slotLiveness(p, slot);
+    if(!l) continue;
+    const label = slot === 'cc' ? 'CC' : 'Cdx';
+    if(l.alive === false) out.push(`<span class="live-badge dead" title="${label} のプロセスが見つかりません（死亡？）">${label}🔴</span>`);
+    else if(l.alive === true) out.push(`<span class="live-badge ok" title="${label} 稼働中">${label}🟢</span>`);
+  }
+  return out.join('');
+}
 async function refresh(){
   if(actionInFlight) return;
   let s; try{ s=await jget('/api/state'); }catch(e){ return; }
@@ -823,11 +871,12 @@ function renderGridSidePanel(s){
     const ccOn = !!(col.cc && col.cc.surfaceRef);
     const cdxOn = !!(col.cdx && col.cdx.surfaceRef);
     const order = Number.isFinite(Number(col.order)) ? Number(col.order) + 1 : '?';
+    const csl = statuslineFor(col.projectId);
+    const clive = livenessBadges(p);
     return `<div class="grid-column-row" data-grid-column-project="${esc(col.projectId)}">
-      <div class="grid-column-name">${order}. ${esc(p.name || col.projectId)}</div>
+      <div class="grid-column-name">${order}. ${esc(p.name || col.projectId)}${csl?`<span class="ctxbar ${esc(csl.context.level)}" title="context ${esc(csl.context.pct)}% · session $${esc(csl.cost.session)}"><span class="track"><span class="fill" style="width:${Math.min(100,Number(csl.context.pct)||0)}%"></span></span>${esc(csl.context.pct)}%</span>`:''}</div>
       <div class="grid-badges">
-        <span class="grid-badge cc ${ccOn?'on':''}">CC</span>
-        <span class="grid-badge cdx ${cdxOn?'on':''}">Cdx</span>
+        ${clive || `<span class="grid-badge cc ${ccOn?'on':''}">CC</span><span class="grid-badge cdx ${cdxOn?'on':''}">Cdx</span>`}
       </div>
     </div>`;
   }).join('') : '<div class="thread-empty">grid empty</div>';
@@ -835,7 +884,7 @@ function renderGridSidePanel(s){
     <div class="grid-side-head"><span>Grid</span><span>${columns.length}${grid.wsRef?' on':''}</span></div>
     <div class="grid-projects">${projectRows || '<div class="thread-empty">No projects</div>'}</div>
     <div class="grid-live">
-      <div class="grid-live-title">Columns</div>
+      <div class="grid-live-title">Columns${grid.wsRef?` <button class="grid-toggle" data-action="grid-rebalance" title="列幅を均等に整形（今すぐ rebalance）" onclick="event.stopPropagation();rebalanceGrid()">⚖️ 今すぐ整形</button>`:''}</div>
       <div class="grid-columns">${liveRows}</div>
     </div>`;
 }
@@ -845,6 +894,8 @@ function renderProjectRow(p, index, s){
   const action = projectAction(p);
   const err = projectError(p) || collab.error;
   const health = projectHealth(p);
+  const threadOpen = threadFor(p.id).open;
+  const sl = statuslineFor(p.id);
   const failed = !!err || ((p.action || {}).status === 'failed');
   const openCount = SLOT_DEFS.filter(({key})=>slotValue(p,key)).length;
   const status = p.open ? `open/${openCount}` : `${openCount}`;
@@ -890,7 +941,11 @@ function renderProjectRow(p, index, s){
       <span><b>health</b> ${esc(health)}</span>
       <span><b>collab</b> ${esc(collab.enabled ? (collab.active ? 'enabled/active' : 'enabled/pending') : 'disabled')}</span>
       ${err?`<span class="err"><b>lastError</b> ${esc(err)}</span>`:`<span><b>lastError</b> none</span>`}
+      ${livenessBadges(p)}
+      ${sl?`<span class="ctxbar ${esc(sl.context.level)}" title="context ${esc(sl.context.pct)}% of ${esc(Math.round(sl.context.windowTokens/100000)/10)}M tokens · ${esc(sl.model||'')} · session $${esc(sl.cost.session)} / week $${esc(sl.cost.week)}${sl.sparkText?` · 5h ${esc(sl.sparkText.session)} · 7d ${esc(sl.sparkText.week)}`:''}"><b>ctx</b><span class="track"><span class="fill" style="width:${Math.min(100,Number(sl.context.pct)||0)}%"></span></span>${esc(sl.context.pct)}% · $${esc(sl.cost.session)}${sl.sparkText?` <span class="spark">${esc(sl.sparkText.week)}</span>`:''}</span>`:''}
+      <button class="thread-toggle ${threadOpen?'on':''}" data-action="thread" title="claude→codex の指示と返信を表示（read-only）" onclick="event.stopPropagation();toggleThread(${jsArg(p.id)})">💬 ${threadOpen?'会話を閉じる':'会話'}</button>
     </div>
+    ${threadOpen ? threadPanel(p.id) : ''}
   </div>`;
 }
 function renderProjectRows(s){
@@ -1122,6 +1177,22 @@ async function close_(id){ if(busy.has(id))return; busy.add(id); render(lastStat
   busy.delete(id); }
 async function focus(id){ await withQuiet(async()=>{ try{ await jpost('/api/focus/'+id); toast('フォーカスしました'); }catch(e){} }); }
 async function focusGrid(){ await withQuiet(async()=>{ try{ await jpost('/api/grid/focus'); toast('Gridを表示しました'); }catch(e){ toast('失敗: '+(e && e.message ? e.message : e)); } }); }
+async function rebalanceGrid(){
+  const btn = document.querySelector('[data-action="grid-rebalance"]');
+  if(btn){ btn.classList.add('pending'); btn.disabled = true; }
+  toast('グリッドを整形中…');
+  await withQuiet(async()=>{
+    try{
+      const r = await jpost('/api/grid/rebuild');
+      const rb = r && r.rebalance ? r.rebalance : r;
+      if(rb && rb.disabled){ toast('整形は無効化されています (CMUX_DASH_GRID_REBALANCE=off)'); }
+      else if(rb && rb.converged){ toast(`整形完了 ✓ (${rb.passCount||'?'}パス)`); }
+      else if(rb && rb.unconverged){ toast('整形しきれず（再試行してください）'); }
+      else { toast('整形を要求しました'); }
+    }catch(e){ toast('失敗: '+(e && e.message ? e.message : e)); }
+  });
+  if(btn){ btn.classList.remove('pending'); btn.disabled = false; }
+}
 async function toggleSlot(id, slot, on){
   const key = `${id}:${slot}`;
   if(busy.has(key)) return;
@@ -1266,9 +1337,9 @@ $('#modal').addEventListener('click',e=>{ if(e.target.id==='modal') closeModal()
 $('#onboarding').addEventListener('click',e=>{ if(e.target.id==='onboarding') closeOnboarding(); });
 $('#workspaceYamlModal').addEventListener('click',e=>{ if(e.target.id==='workspaceYamlModal') closeWorkspaceYaml(); });
 
-document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden') stopMetricsPoll(); else { refreshMetrics(); startMetricsPoll(); } });
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden') stopMetricsPoll(); else { refreshMetrics(); refreshStatusline(); startMetricsPoll(); } });
 initConciergeComposer();
-refresh(); refreshMetrics(); startPoll(); startMetricsPoll();
+refresh(); refreshMetrics(); refreshStatusline(); startPoll(); startMetricsPoll();
 </script>
 </body>
 </html>

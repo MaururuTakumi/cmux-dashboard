@@ -558,6 +558,170 @@ if ! run_r2_metrics_checks; then
   finish
 fi
 
+run_t3_thread_checks() {
+  if "$NODE_BIN" - "$DIR/public/index.html" <<'NODE' 2>/dev/null
+const fs = require("fs");
+const html = fs.readFileSync(process.argv[2], "utf8");
+const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+if (!scriptMatch) process.exit(2);
+const script = scriptMatch[1];
+const checks = [
+  script.includes("function toggleThread(id)"),
+  script.includes("function threadPanel(id)"),
+  script.includes("function fetchThread(id"),
+  script.includes("/api/agmsg/"),
+  script.includes("to-codex"),
+  script.includes("to-claude"),
+  script.includes("toggleThread(${jsArg(p.id)})"),
+  script.includes("threadOpen ? threadPanel(p.id)"),
+  html.includes("data-action=\"thread\""),
+];
+process.exit(checks.every(Boolean) ? 0 : 1);
+NODE
+  then
+    pass "R T3: claude/codex instruction thread is wired into project rows (1-action, read-only /api/agmsg)"
+  else
+    fail "R T3: thread wiring contract failed"
+    return 1
+  fi
+}
+
+if ! run_t3_thread_checks; then
+  finish
+fi
+
+run_t5_metrics_checks() {
+  if "$NODE_BIN" - "$DIR" <<'NODE' 2>/dev/null
+const path = require("path");
+const fs = require("fs");
+const os = require("os");
+const repo = process.argv[2];
+const m = require(path.join(repo, "statusline-metrics.js"));
+const mk = (model,inp,out,cr,cw,ts)=>JSON.stringify({type:"assistant",timestamp:ts,message:{model,usage:{input_tokens:inp,output_tokens:out,cache_read_input_tokens:cr,cache_creation_input_tokens:cw}}});
+const fx = path.join(os.tmpdir(), "t5-fixture-"+process.pid+".jsonl");
+fs.writeFileSync(fx,[
+  mk("claude-opus-4-8",1000,200,5000,2000,"2026-06-14T10:00:00Z"),
+  "not json line",
+  mk("claude-fable-5",10000,300,800000,100000,"2026-06-14T11:00:00Z"),
+].join("\n"));
+let ok = true;
+try {
+  const s = m.summarizeTranscript(fx,{nowMs:Date.parse("2026-06-14T12:00:00Z")});
+  ok = ok && s.ok === true;
+  ok = ok && s.context.pct === 91;
+  ok = ok && s.context.level === "danger";
+  ok = ok && s.context.windowTokens === 1000000;
+  ok = ok && s.model === "claude-fable-5";
+  ok = ok && s.messageCount === 2;
+  ok = ok && s.cost.turn > 0 && s.cost.session >= s.cost.turn && s.cost.week >= s.cost.turn;
+  ok = ok && m.summarizeTranscript(path.join(os.tmpdir(),"nonexistent-"+process.pid+".jsonl")).ok === false;
+  const overridden = m.aggregateCost(
+    [{model:"x",tsMs:Date.parse("2026-06-14T11:00:00Z"),usage:{input:1000000,output:0,cacheRead:0,cacheWrite:0}}],
+    {x:{input:2,output:0,cacheWrite:0,cacheRead:0}}, Date.parse("2026-06-14T12:00:00Z"));
+  ok = ok && overridden.session === 2;
+  ok = ok && m.contextWindowFor("claude-haiku-4-5") === 200000;
+  // sparklines: cmux-independent, derived from timestamps
+  const sp = m.sparklines([
+    {tsMs:Date.parse("2026-06-14T11:55:00Z"),model:"x",usage:{input:100,output:50,cacheRead:0,cacheWrite:0}},
+    {tsMs:Date.parse("2026-06-10T12:00:00Z"),model:"x",usage:{input:500,output:500,cacheRead:0,cacheWrite:0}},
+  ], Date.parse("2026-06-14T12:00:00Z"));
+  ok = ok && sp.session.length === 12 && sp.week.length === 7;
+  ok = ok && sp.session[sp.session.length-1] > 0;       // most recent 5h bucket has tokens
+  ok = ok && m.renderSparkline([0,0,0]) === "▁▁▁";
+  ok = ok && m.renderSparkline([1,2,4]).length === 3;
+} catch (e) { ok = false; }
+finally { try { fs.unlinkSync(fx); } catch (_) {} }
+process.exit(ok ? 0 : 1);
+NODE
+  then
+    pass "R T5: statusline-metrics computes context%/level/cost from transcript (fixture, graceful degrade, pricing override)"
+  else
+    fail "R T5: statusline-metrics contract failed"
+    return 1
+  fi
+}
+
+if ! run_t5_metrics_checks; then
+  finish
+fi
+
+run_t5_api_wiring_checks() {
+  local server_file="$DIR/server.js"
+  if grep -F "require('./statusline-metrics')" "$server_file" >/dev/null 2>&1 \
+    && grep -F "urlPath === '/api/statusline'" "$server_file" >/dev/null 2>&1 \
+    && grep -F "statuslineSnapshot()" "$server_file" >/dev/null 2>&1; then
+    pass "R T5: /api/statusline endpoint is wired in server.js (per-project transcript metrics)"
+  else
+    fail "R T5: /api/statusline wiring missing"
+    return 1
+  fi
+}
+
+if ! run_t5_api_wiring_checks; then
+  finish
+fi
+
+run_t5_ui_checks() {
+  if "$NODE_BIN" - "$DIR/public/index.html" <<'NODE' 2>/dev/null
+const fs = require("fs");
+const html = fs.readFileSync(process.argv[2], "utf8");
+const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+if (!scriptMatch) process.exit(2);
+const script = scriptMatch[1];
+const checks = [
+  script.includes("async function refreshStatusline()"),
+  script.includes("/api/statusline"),
+  script.includes("function statuslineFor(id)"),
+  script.includes("const sl = statuslineFor(p.id)"),
+  html.includes("ctxbar"),
+  script.includes("refreshStatusline()"),
+  script.includes("function metricsFor(id)"),
+  script.includes("function livenessBadges(p)"),
+  script.includes("function slotLiveness(p, slot)"),
+  html.includes("live-badge"),
+];
+process.exit(checks.every(Boolean) ? 0 : 1);
+NODE
+  then
+    pass "R T5: per-project context% bar is wired into rows (polls /api/statusline)"
+  else
+    fail "R T5: statusline UI wiring failed"
+    return 1
+  fi
+}
+
+if ! run_t5_ui_checks; then
+  finish
+fi
+
+run_frontdesk_optin_checks() {
+  if "$NODE_BIN" - "$DIR" <<'NODE' 2>/dev/null
+const path = require("path");
+const m = require(path.join(process.argv[2], "collab-delivery.js"));
+const f = m.frontDeskDeliveryTargetFromEnv;
+let ok = typeof f === "function";
+// #1 fix: front-desk/concierge delivery is opt-in. Defaulting it ON made the
+// delivery loop await the concierge surface every tick, clogging the serial
+// cmux chain and hanging /api/state. With no explicit team -> no front-desk target.
+ok = ok && f({}) === null;                                   // default: off
+ok = ok && f({ CMUX_DASH_FRONT_DESK_TEAM: "" }) === null;    // empty: off
+ok = ok && f({ CMUX_DASH_FRONT_DESK_TEAM: "off" }) === null; // explicit off
+const t = f({ CMUX_DASH_FRONT_DESK_TEAM: "front-desk" });    // explicit: on
+ok = ok && t && t.type === "front-desk" && t.team === "front-desk" && t.agent === "concierge";
+process.exit(ok ? 0 : 1);
+NODE
+  then
+    pass "R #1: front-desk/concierge delivery is opt-in (off unless CMUX_DASH_FRONT_DESK_TEAM set) — prevents getState chain starvation"
+  else
+    fail "R #1: front-desk opt-in contract failed"
+    return 1
+  fi
+}
+
+if ! run_frontdesk_optin_checks; then
+  finish
+fi
+
 run_scroll_reset_static_checks() {
   local index_file="$DIR/public/index.html"
 
@@ -2041,7 +2205,7 @@ async function exerciseAllSlots(id, expectedCwd, label) {
       check("grid G2: rebalance calibrates second-pass resize amount from observed movement", (
         alphaLeftPass1 &&
         alphaLeftPass2 &&
-        Math.abs(Number(alphaLeftPass1.pxPerAmount) - 0.5) < 0.0001 &&
+        Math.abs(Number(alphaLeftPass1.pxPerAmount) - 1.0) < 0.0001 &&
         Number(alphaLeftPass2.pxPerAmount) > 0.20 &&
         Number(alphaLeftPass2.pxPerAmount) < 0.30 &&
         Number(alphaLeftPass2.amount) >= Math.floor(Number(alphaLeftPass1.amount) * 0.9)
@@ -2133,6 +2297,53 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         );
         check("grid right anchor: sliver width is re-read before tolerance and corrected with resize", (
           sliverOk
+        ));
+      }
+      {
+        // T4 (#4): kill switch disables rebalance entirely (no resize-pane issued).
+        const killBefore = (rawCmuxState().commands || [])
+          .filter((item) => item && item.cmd === "resize-pane" && item.workspace === initialGridRef).length;
+        const prevKill = process.env.CMUX_DASH_GRID_REBALANCE;
+        let killResult = null;
+        try {
+          process.env.CMUX_DASH_GRID_REBALANCE = "off";
+          killResult = await ctl.rebalanceGridColumns(initialGridRef);
+        } finally {
+          if (prevKill == null) delete process.env.CMUX_DASH_GRID_REBALANCE;
+          else process.env.CMUX_DASH_GRID_REBALANCE = prevKill;
+        }
+        const killAfter = (rawCmuxState().commands || [])
+          .filter((item) => item && item.cmd === "resize-pane" && item.workspace === initialGridRef).length;
+        check("grid T4: CMUX_DASH_GRID_REBALANCE=off disables rebalance and issues no resize", (
+          killResult &&
+          killResult.disabled === true &&
+          killResult.rebalanced === false &&
+          killAfter === killBefore
+        ));
+      }
+      {
+        const raw = rawCmuxState();
+        raw.gridBoundaries = raw.gridBoundaries && typeof raw.gridBoundaries === "object" ? raw.gridBoundaries : {};
+        raw.gridBoundaries[initialGridRef] = [1240, 1255, 1270];
+        writeCmuxState(raw);
+        const prevScale = process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT;
+        let clampResult = null;
+        try {
+          process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT = "0.25";
+          clampResult = await ctl.rebalanceGridColumns(initialGridRef);
+        } finally {
+          if (prevScale == null) delete process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT;
+          else process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT = prevScale;
+        }
+        const clampPassOps = clampResult && Array.isArray(clampResult.passes)
+          ? clampResult.passes.flatMap((p) => Array.isArray(p.operations) ? p.operations : []).filter((o) => o && o.resized)
+          : [];
+        const clampedOps = clampPassOps.filter((o) => o && o.clamped === true);
+        check("grid T4: oversized resize amount is clamped and boundary still moves", (
+          clampPassOps.length >= 1 &&
+          clampPassOps.every((o) => Number(o.appliedAmount) <= Number(o.requestedAmount)) &&
+          clampedOps.length >= 1 &&
+          clampedOps.every((o) => Number.isFinite(Number(o.maxAmount)) && Number(o.appliedAmount) <= Number(o.maxAmount) && Number(o.appliedAmount) < Number(o.requestedAmount))
         ));
       }
       {
