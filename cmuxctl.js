@@ -3036,7 +3036,24 @@ function validExistingGridColumn(column, byRef, wsRef) {
   };
 }
 
-function buildAdoptedGridColumns(wsRef, surfaces, cfg, now = new Date().toISOString()) {
+function classifyGridColumnProcessSlot(surface, processMap = {}) {
+  const matches = new Set();
+  for (const value of surfaceProcessValues(surface, processMap)) {
+    if (SLOT_DEFS.cc.processRe.test(value) || classifyProcess(value) === 'C') matches.add('cc');
+    if (SLOT_DEFS.cdx.processRe.test(value) || classifyProcess(value) === 'X') matches.add('cdx');
+  }
+  return matches.size === 1 ? Array.from(matches)[0] : null;
+}
+
+function addGridColumnSurfaceRefs(set, column) {
+  for (const slot of ['cc', 'cdx']) {
+    const ref = cleanRef(column && column[slot] && column[slot].surfaceRef);
+    if (ref) set.add(ref);
+  }
+}
+
+function buildAdoptedGridColumns(wsRef, surfaces, cfg, now = new Date().toISOString(), opts = {}) {
+  const processMap = opts && opts.processMap || {};
   const byRef = liveSurfaceIndex(surfaces);
   const records = new Map();
   const markerOrphans = [];
@@ -3129,6 +3146,71 @@ function buildAdoptedGridColumns(wsRef, surfaces, cfg, now = new Date().toISOStr
       updatedAt: now,
       adopted: !existing,
     });
+  }
+
+  const claimedSurfaceRefs = new Set();
+  for (const column of merged.values()) addGridColumnSurfaceRefs(claimedSurfaceRefs, column);
+  for (const record of records.values()) {
+    for (const slot of ['cc', 'cdx']) {
+      const ref = cleanRef(record[slot] && record[slot].ref);
+      if (ref) claimedSurfaceRefs.add(ref);
+    }
+    for (const duplicate of record.duplicateSurfaces) {
+      const ref = cleanRef(duplicate && duplicate.surface && duplicate.surface.ref);
+      if (ref) claimedSurfaceRefs.add(ref);
+    }
+  }
+  for (const surface of [
+    gridBrowserAnchorSurface(surfaces),
+    markedOrKnownGridConciergeSurface(surfaces),
+    markedGridRightAnchorSurface(surfaces),
+    gridRuntimeState.anchorSurfaceRef ? { ref: gridRuntimeState.anchorSurfaceRef } : null,
+  ]) {
+    const ref = cleanRef(surface && surface.ref);
+    if (ref) claimedSurfaceRefs.add(ref);
+  }
+
+  for (const project of configuredProjectRows(cfg)) {
+    const projectId = cleanRef(project && project.id);
+    if (!projectId || merged.has(projectId)) continue;
+    const candidates = { cc: [], cdx: [] };
+    for (const surface of Array.isArray(surfaces) ? surfaces : []) {
+      if (!isGridTerminalSurface(surface)) continue;
+      const ref = cleanRef(surface && surface.ref);
+      if (!ref || claimedSurfaceRefs.has(ref)) continue;
+      if (parseGridColumnMarker(surface) || hasUnrecognizedGridMarker(surface)) continue;
+      if (!surfaceMatchesProjectCwd(surface, project)) continue;
+      const slot = classifyGridColumnProcessSlot(surface, processMap);
+      if (slot === 'cc' || slot === 'cdx') candidates[slot].push(surface);
+    }
+    if (candidates.cc.length !== 1 || candidates.cdx.length !== 1) continue;
+    const cc = candidates.cc[0];
+    const cdx = candidates.cdx[0];
+    const columnId = gridColumnId(projectId);
+    merged.set(projectId, {
+      columnId,
+      projectId,
+      wsRef,
+      firstIndex: Math.min(
+        surfaceOrder.get(cc.ref) ?? Number.MAX_SAFE_INTEGER,
+        surfaceOrder.get(cdx.ref) ?? Number.MAX_SAFE_INTEGER,
+      ),
+      cc: {
+        surfaceRef: cc.ref,
+        paneRef: cc.paneRef || null,
+        marker: gridSlotMarker(columnId, 'cc'),
+      },
+      cdx: {
+        surfaceRef: cdx.ref,
+        paneRef: cdx.paneRef || null,
+        marker: gridSlotMarker(columnId, 'cdx'),
+      },
+      createdAt: now,
+      updatedAt: now,
+      adopted: true,
+    });
+    claimedSurfaceRefs.add(cc.ref);
+    claimedSurfaceRefs.add(cdx.ref);
   }
 
   const order = gridProjectOrderIndex(cfg);
@@ -4532,7 +4614,8 @@ async function validateGridRuntimeState() {
   } else {
     resetGridConcierge();
   }
-  const resync = buildAdoptedGridColumns(ws.ref, surfaces, cfg);
+  const processMap = await surfaceProcessMap(ws.ref);
+  const resync = buildAdoptedGridColumns(ws.ref, surfaces, cfg, undefined, { processMap });
   gridRuntimeState.columns = resync.columns;
   const rightAnchor = markedGridRightAnchorSurface(surfaces) || gridRightAnchorSurface(surfaces, gridRuntimeState.columns);
   if (rightAnchor && rightAnchor.ref) {
