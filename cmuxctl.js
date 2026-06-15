@@ -301,6 +301,9 @@ const CMUX_BACKOFF_JITTER = Math.max(0, Math.min(1, Number(process.env.CMUX_DASH
 const CMUX_SETTLE_MS = intEnv('CMUX_DASH_SETTLE_MS', 750);
 const CMUX_OPENALL_GAP_MS = intEnv('CMUX_DASH_OPENALL_GAP_MS', 750);
 const CMUX_HEALTH_FAILURE_THRESHOLD = intEnv('CMUX_DASH_HEALTH_FAILURE_THRESHOLD', 5);
+const AWAITING_SCREEN_LINES = intEnv('CMUX_DASH_AWAITING_SCREEN_LINES', 40);
+const AWAITING_READ_TIMEOUT_MS = intEnv('CMUX_DASH_AWAITING_READ_TIMEOUT_MS', 900);
+const AWAITING_READ_TTL_MS = intEnv('CMUX_DASH_AWAITING_READ_TTL_MS', 1800);
 const GRID_CONCIERGE_READY_TIMEOUT_MAX_MS = 20000;
 const GRID_CONCIERGE_READY_TIMEOUT_DEFAULT_MS = 20000;
 const GRID_CONCIERGE_READY_POLL_DEFAULT_MS = 1000;
@@ -392,6 +395,78 @@ async function cmuxJson(args, opts) {
 }
 async function settle(ms = CMUX_SETTLE_MS) {
   if (ms > 0) await sleep(ms);
+}
+
+const awaitingScreenCache = new Map();
+
+function awaitingCacheKey(wsRef, surfaceRef, lines) {
+  return [cleanRef(wsRef) || '', cleanRef(surfaceRef) || '', Number(lines) || AWAITING_SCREEN_LINES].join('|');
+}
+
+async function readSurfaceScreen(wsRef, surfaceRef, opts = {}) {
+  const ref = cleanRef(surfaceRef);
+  if (!ref) return null;
+  const lines = Math.max(1, Number(opts.lines) || AWAITING_SCREEN_LINES);
+  const key = awaitingCacheKey(wsRef, ref, lines);
+  const now = Date.now();
+  const cached = awaitingScreenCache.get(key);
+  if (cached && cached.expiresAt > now && Object.prototype.hasOwnProperty.call(cached, 'value')) {
+    return cached.value;
+  }
+  if (cached && cached.promise) return cached.promise;
+
+  const args = ['read-screen', '--surface', ref, '--lines', String(lines)];
+  const workspace = cleanRef(wsRef);
+  if (workspace) args.splice(1, 0, '--workspace', workspace);
+  const promise = run(CMUX, args, {
+    timeout: Math.max(1, Number(opts.timeout) || AWAITING_READ_TIMEOUT_MS),
+    killSignal: 'SIGKILL',
+    env: buildCmuxEnv(),
+  })
+    .then((out) => out || '')
+    .catch(() => null)
+    .then((value) => {
+      awaitingScreenCache.set(key, {
+        value,
+        expiresAt: Date.now() + Math.max(1, Number(opts.ttlMs) || AWAITING_READ_TTL_MS),
+      });
+      return value;
+    });
+  awaitingScreenCache.set(key, { promise, expiresAt: now + Math.max(1, AWAITING_READ_TTL_MS) });
+  return promise;
+}
+
+function screenHasNumberedChoices(text) {
+  return /(?:^|\n)\s*(?:❯\s*)?\d+[.)]\s+\S/m.test(text);
+}
+
+function classifyClaudeApproval(text) {
+  const context = /\b(?:do you want to proceed|do you want to make this edit|permission|tool use|allow|approve)\b/i.test(text);
+  const yesChoice = /(?:^|\n)\s*(?:❯\s*)?\d+[.)]\s+(?:yes|allow|approve)\b/i.test(text);
+  const yesNoShape = /(?:^|\n)\s*\d+[.)]\s+yes\b[\s\S]*(?:^|\n)\s*\d+[.)]\s+no\b/im.test(text)
+    || /(?:^|\n)\s*\d+[.)]\s+yes,\s*and\s+don't\s+ask\s+again\b/im.test(text)
+    || /\b(?:allow|approve)\b/i.test(text);
+  return context && yesChoice && yesNoShape;
+}
+
+function classifyInputAwaiting(text) {
+  if (screenHasNumberedChoices(text)) return false;
+  const hasPromptLine = /(?:^|\n)[ \t]*❯[ \t]*(?:\n|$)/.test(text);
+  const hasFooter = /\b(?:auto mode on|\? for shortcuts)\b/i.test(text);
+  const hasBox = /[─━]{5,}[\s\S]*❯[\s\S]*[─━]{5,}/.test(text);
+  return hasPromptLine && hasFooter && hasBox;
+}
+
+function classifyAwaiting(screenText, role) {
+  const text = String(screenText || '').slice(-12000);
+  if (!text.trim()) return null;
+  if (/\b(?:thinking|gesticulating|esc to interrupt)\b/i.test(text)) return null;
+  const normalizedRole = String(role || '').toLowerCase();
+  if ((normalizedRole === 'cc' || normalizedRole === 'concierge') && classifyClaudeApproval(text)) {
+    return 'approval';
+  }
+  if (classifyInputAwaiting(text)) return 'input';
+  return null;
 }
 
 // ---- agmsg ----
@@ -2619,6 +2694,31 @@ function gridStateSnapshot(wsRef, columns = gridRuntimeState.columns) {
   };
 }
 
+function gridAwaitingTargets(state) {
+  const targets = [];
+  const wsRef = cleanRef(state && state.wsRef);
+  if (!wsRef) return targets;
+  for (const column of (Array.isArray(state.columns) ? state.columns : [])) {
+    const ccRef = cleanRef(column && column.cc && column.cc.surfaceRef);
+    const cdxRef = cleanRef(column && column.cdx && column.cdx.surfaceRef);
+    if (ccRef) targets.push({ role: 'cc', surfaceRef: ccRef, target: column.cc });
+    if (cdxRef) targets.push({ role: 'cdx', surfaceRef: cdxRef, target: column.cdx });
+  }
+  const conciergeRef = cleanRef(state && state.concierge && state.concierge.surfaceRef);
+  if (conciergeRef) targets.push({ role: 'concierge', surfaceRef: conciergeRef, target: state.concierge });
+  return targets;
+}
+
+async function attachGridAwaiting(state) {
+  if (!state || !cleanRef(state.wsRef)) return state;
+  const targets = gridAwaitingTargets(state);
+  await Promise.all(targets.map(async (item) => {
+    const screen = await readSurfaceScreen(state.wsRef, item.surfaceRef, { lines: AWAITING_SCREEN_LINES });
+    item.target.awaiting = classifyAwaiting(screen, item.role);
+  }));
+  return state;
+}
+
 function reindexGridColumns() {
   gridRuntimeState.columns.forEach((column, idx) => {
     column.order = idx;
@@ -4505,7 +4605,7 @@ async function maybeRepairGridColumnsAfterValidation(state) {
 async function getGridState() {
   const state = await validateGridRuntimeState();
   const repair = await maybeRepairGridColumnsAfterValidation(state);
-  return repair ? gridStateSnapshot(cleanRef(gridRuntimeState.wsRef), gridRuntimeState.columns) : state;
+  return attachGridAwaiting(repair ? gridStateSnapshot(cleanRef(gridRuntimeState.wsRef), gridRuntimeState.columns) : state);
 }
 
 function conciergeKickoffText(text) {
