@@ -2690,8 +2690,9 @@ async function exerciseAllSlots(id, expectedCwd, label) {
           staleGridState.columns.length === 0
         ));
       }
+      const stateBeforeSprint4 = rawCmuxState();
       await runSprint4GridPersistenceRegressions();
-      writeCmuxState(blankCmuxState());
+      writeCmuxState(stateBeforeSprint4);
       fs.writeFileSync(cfgFile, JSON.stringify(saved, null, 2) + "\n");
       } finally {
         delete process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE;
