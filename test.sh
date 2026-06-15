@@ -1821,6 +1821,126 @@ async function runSprint4GridPersistenceRegressions() {
         r2Results.every((item) => item.ok === true)
       ));
     }
+
+    {
+      const projects = writeSprint4Config(2);
+      writeCmuxState(blankCmuxState());
+      const gridStateFile = path.join(phaseDir, "grid-sprint4-legacy-cwd-process-state.json");
+      let legacyCtl = freshCtlWithGridState(gridStateFile);
+      for (const project of projects) await legacyCtl.addProjectColumn(project.id);
+      const before = await legacyCtl.getGridState();
+      const refsBefore = gridColumnRefs(before);
+      const liveBefore = liveGridSurfaceRefs();
+      const columnRefsBefore = new Set(refsBefore);
+      {
+        const raw = rawCmuxState();
+        raw.surfaces = (raw.surfaces || []).map((surface) => {
+          if (!surface || !columnRefsBefore.has(surface.ref)) return surface;
+          return { ...surface, title: "terminal", sendText: null };
+        });
+        writeCmuxState(raw);
+      }
+      fs.rmSync(gridStateFile, { force: true });
+      const ctlPath = require.resolve(path.join(repo, "cmuxctl.js"));
+      delete require.cache[ctlPath];
+      legacyCtl = require(ctlPath);
+      const restarted = await legacyCtl.getGridState();
+      const persisted = JSON.parse(fs.readFileSync(gridStateFile, "utf8"));
+      const liveAfter = liveGridSurfaceRefs();
+      check("grid issue #11: legacy markerless cwd+process pair re-adopts all configured project columns", (
+        before &&
+        before.columns.length === projects.length &&
+        restarted &&
+        restarted.wsRef === before.wsRef &&
+        gridProjectIds(restarted).join(",") === projects.map((project) => project.id).join(",") &&
+        gridColumnRefs(restarted).join(",") === refsBefore.join(",") &&
+        Array.isArray(restarted.orphans) &&
+        restarted.orphans.length === 0
+      ));
+      check("grid issue #11: legacy cwd+process adoption preserves live refs and persists canonical grid state", (
+        liveBefore.size > 0 &&
+        liveAfter.size === liveBefore.size &&
+        refsBefore.every((ref) => liveAfter.has(ref)) &&
+        persisted &&
+        persisted.wsRef === before.wsRef &&
+        Array.isArray(persisted.columns) &&
+        gridColumnRefs(persisted).join(",") === refsBefore.join(",")
+      ));
+    }
+
+    {
+      const projects = writeSprint4Config(4);
+      const gridStateFile = path.join(phaseDir, "grid-sprint4-legacy-cwd-process-negative-state.json");
+      process.env.CMUX_DASH_GRID_STATE_FILE = gridStateFile;
+      const gridMarker = (projectId, slot) => "cmuxdash:grid:__grid__:column:" + projectId + ":slot:" + slot;
+      const surface = (ref, pane, cwd, processName, extra = {}) => ({
+        ref,
+        workspace: "workspace:legacy-negative",
+        pane,
+        title: "terminal",
+        type: "terminal",
+        process: processName,
+        cwd,
+        sendText: null,
+        ...extra,
+      });
+      const runLegacyNegative = async (label, surfaces, persistedState = null) => {
+        fs.rmSync(gridStateFile, { force: true });
+        if (persistedState) fs.writeFileSync(gridStateFile, JSON.stringify(persistedState, null, 2) + "\n");
+        writeCmuxState({
+          workspaces: [{ ref: "workspace:legacy-negative", description: "cmuxdash:__grid__", selected: true }],
+          panes: surfaces.map((item, idx) => ({ ref: item.pane, workspace: "workspace:legacy-negative", index: idx })),
+          surfaces,
+          nextWorkspace: 2,
+          nextPane: surfaces.length + 1,
+          nextSurface: surfaces.length + 1,
+        });
+        const ctlPath = require.resolve(path.join(repo, "cmuxctl.js"));
+        delete require.cache[ctlPath];
+        const testCtl = require(ctlPath);
+        return { label, state: await testCtl.getGridState() };
+      };
+      const mismatch = await runLegacyNegative("cwd mismatch", [
+        surface("surface:neg-mismatch-cc", "pane:neg-mismatch-cc", path.join(phaseDir, "elsewhere"), "claude"),
+        surface("surface:neg-mismatch-cdx", "pane:neg-mismatch-cdx", path.join(phaseDir, "elsewhere"), "codex"),
+      ]);
+      const half = await runLegacyNegative("half pair", [
+        surface("surface:neg-half-cc", "pane:neg-half-cc", projects[0].path, "claude"),
+      ]);
+      const duplicate = await runLegacyNegative("duplicate slot", [
+        surface("surface:neg-dupe-cc-1", "pane:neg-dupe-cc-1", projects[1].path, "claude"),
+        surface("surface:neg-dupe-cc-2", "pane:neg-dupe-cc-2", projects[1].path, "claude"),
+        surface("surface:neg-dupe-cdx", "pane:neg-dupe-cdx", projects[1].path, "codex"),
+      ]);
+      const excluded = await runLegacyNegative("excluded surfaces", [
+        surface("surface:neg-browser-cc", "pane:neg-browser-cc", projects[2].path, "claude", { type: "browser", url: "http://127.0.0.1:7799" }),
+        surface("surface:neg-concierge-cdx", "pane:neg-concierge-cdx", projects[2].path, "codex", { title: "cmuxdash:grid:__grid__:concierge" }),
+        surface("surface:neg-anchor-cc", "pane:neg-anchor-cc", projects[3].path, "claude", { title: "cmuxdash:grid:__grid__:right-anchor" }),
+        surface("surface:neg-anchor-cdx", "pane:neg-anchor-cdx", projects[3].path, "codex", { title: "cmuxdash:grid:__grid__:right-anchor" }),
+      ]);
+      const claimed = await runLegacyNegative("claimed marker refs", [
+        surface("surface:neg-claimed-marker-cc", "pane:neg-claimed-marker-cc", projects[0].path, "zsh", { title: gridMarker(projects[0].id, "cc") }),
+        surface("surface:neg-claimed-marker-cdx", "pane:neg-claimed-marker-cdx", projects[0].path, "zsh", { title: gridMarker(projects[0].id, "cdx") }),
+        surface("surface:neg-claimed-extra-cc", "pane:neg-claimed-extra-cc", projects[0].path, "claude"),
+        surface("surface:neg-claimed-extra-cdx", "pane:neg-claimed-extra-cdx", projects[0].path, "codex"),
+      ]);
+      check("grid issue #11: cwd+process fallback rejects cwd mismatch, half pair, duplicate slot, and excluded surfaces", (
+        [mismatch, half, duplicate, excluded].every((item) => (
+          item &&
+          item.state &&
+          Array.isArray(item.state.columns) &&
+          item.state.columns.length === 0
+        ))
+      ));
+      check("grid issue #11: cwd+process fallback does not create a second column for already claimed marker refs", (
+        claimed &&
+        claimed.state &&
+        claimed.state.columns.length === 1 &&
+        claimed.state.columns[0].projectId === projects[0].id &&
+        claimed.state.columns[0].cc.surfaceRef === "surface:neg-claimed-marker-cc" &&
+        claimed.state.columns[0].cdx.surfaceRef === "surface:neg-claimed-marker-cdx"
+      ));
+    }
   } finally {
     if (previousOverwrite == null) delete process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE;
     else process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE = previousOverwrite;
