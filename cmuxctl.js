@@ -4,7 +4,7 @@
 // R1 rebuild: workspace 内の terminal surface を slot として扱う。
 //   cc=claude, cdx=codex, yazi=yazi, term=shell
 // workspace.description タグ "cmuxdash:<id>" で識別する。
-const { execFile } = require('child_process');
+const { execFile, execFileSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -304,6 +304,7 @@ const CMUX_HEALTH_FAILURE_THRESHOLD = intEnv('CMUX_DASH_HEALTH_FAILURE_THRESHOLD
 const AWAITING_SCREEN_LINES = intEnv('CMUX_DASH_AWAITING_SCREEN_LINES', 40);
 const AWAITING_READ_TIMEOUT_MS = intEnv('CMUX_DASH_AWAITING_READ_TIMEOUT_MS', 900);
 const AWAITING_READ_TTL_MS = intEnv('CMUX_DASH_AWAITING_READ_TTL_MS', 1800);
+const PROCESS_CWD_TTL_MS = intEnv('CMUX_DASH_PROCESS_CWD_TTL_MS', 5000);
 const GRID_CONCIERGE_READY_TIMEOUT_MAX_MS = 20000;
 const GRID_CONCIERGE_READY_TIMEOUT_DEFAULT_MS = 20000;
 const GRID_CONCIERGE_READY_POLL_DEFAULT_MS = 1000;
@@ -1836,13 +1837,72 @@ async function surfaceProcessMap(wsRef) {
       if (!line.trim()) continue;
       const cols = line.split('\t');
       if (cols.length < 7 || cols[3] !== 'process') continue;
+      const processRef = cleanRef(cols[4]);
       const surfaceRef = cols[5];
       if (!surfaceRef) continue;
       if (!bySurface[surfaceRef]) bySurface[surfaceRef] = [];
-      bySurface[surfaceRef].push(cols.slice(6).join('\t'));
+      bySurface[surfaceRef].push({
+        pid: pidFromProcessRef(processRef),
+        processRef,
+        command: cols.slice(6).join('\t'),
+      });
     }
   } catch (_) {}
   return bySurface;
+}
+
+function pidFromProcessRef(ref) {
+  const match = String(ref || '').match(/(?:^|:)pid:(\d+)$|(?:^|:)process:(\d+)$|^(\d+)$/i);
+  return match ? (match[1] || match[2] || match[3]) : null;
+}
+
+const processCwdCache = new Map();
+let processCwdResolverOverride = null;
+
+function processCwdMapOverride() {
+  const raw = process.env.CMUX_DASH_PROCESS_CWD_MAP;
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function resolveProcessCwdUncached(pid) {
+  const cleanPid = String(pid || '').trim();
+  if (!/^\d+$/.test(cleanPid)) return null;
+  if (processCwdResolverOverride) return processCwdResolverOverride(cleanPid);
+  const map = processCwdMapOverride();
+  if (map && hasOwn(map, cleanPid)) return map[cleanPid];
+  try {
+    const out = execFileSync('lsof', ['-a', '-p', cleanPid, '-d', 'cwd', '-Fn'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: Math.max(250, Math.min(CMUX_READ_TIMEOUT, 2500)),
+    });
+    for (const line of String(out || '').split(/\r?\n/)) {
+      if (line.startsWith('n')) return line.slice(1).trim() || null;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function resolveProcessCwd(pid) {
+  const cleanPid = String(pid || '').trim();
+  if (!/^\d+$/.test(cleanPid)) return null;
+  const now = Date.now();
+  const cached = processCwdCache.get(cleanPid);
+  if (cached && now - cached.at <= PROCESS_CWD_TTL_MS) return cached.cwd;
+  const cwd = cleanRef(resolveProcessCwdUncached(cleanPid));
+  processCwdCache.set(cleanPid, { cwd: cwd || null, at: now });
+  return cwd || null;
+}
+
+function setProcessCwdResolverForTest(fn) {
+  processCwdResolverOverride = typeof fn === 'function' ? fn : null;
+  processCwdCache.clear();
 }
 
 function emptyTypeBreakdown() {
@@ -2202,6 +2262,37 @@ function surfaceMatchesProjectCwd(surface, project) {
   const cwd = normalizedPath(surfaceCwd(surface));
   const expected = normalizedPath(rowCwd(project));
   return !!(cwd && expected && cwd === expected);
+}
+
+function processEntryCommand(entry) {
+  if (entry && typeof entry === 'object') {
+    return String(entry.command || entry.fullCommand || entry.title || '').trim();
+  }
+  return String(entry || '').trim();
+}
+
+function surfaceProcessEntries(surface, processMap = {}) {
+  const entries = [];
+  if (!surface) return entries;
+  for (const key of ['process', 'processName', 'command']) {
+    if (surface[key]) entries.push({ command: surface[key], pid: null, source: 'surface' });
+  }
+  if (Array.isArray(surface.processes)) {
+    for (const value of surface.processes) entries.push(value);
+  }
+  if (surface.ref && Array.isArray(processMap[surface.ref])) entries.push(...processMap[surface.ref]);
+  return entries;
+}
+
+function surfaceProcessEntriesMatchingProjectCwd(surface, processMap = {}, project) {
+  const expected = normalizedPath(rowCwd(project));
+  if (!expected) return [];
+  return surfaceProcessEntries(surface, processMap).filter((entry) => {
+    const pid = entry && typeof entry === 'object' ? entry.pid : null;
+    if (!pid) return false;
+    const cwd = normalizedPath(resolveProcessCwd(pid));
+    return !!(cwd && cwd === expected);
+  });
 }
 
 function firstPaneRef(panes) {
@@ -3179,8 +3270,11 @@ function buildAdoptedGridColumns(wsRef, surfaces, cfg, now = new Date().toISOStr
       const ref = cleanRef(surface && surface.ref);
       if (!ref || claimedSurfaceRefs.has(ref)) continue;
       if (parseGridColumnMarker(surface) || hasUnrecognizedGridMarker(surface)) continue;
-      if (!surfaceMatchesProjectCwd(surface, project)) continue;
-      const slot = classifyGridColumnProcessSlot(surface, processMap);
+      const cwdProcesses = surfaceProcessEntriesMatchingProjectCwd(surface, processMap, project);
+      if (!cwdProcesses.length) continue;
+      const scopedProcessMap = {};
+      scopedProcessMap[ref] = cwdProcesses;
+      const slot = classifyGridColumnProcessSlot({ ref }, scopedProcessMap);
       if (slot === 'cc' || slot === 'cdx') candidates[slot].push(surface);
     }
     if (candidates.cc.length !== 1 || candidates.cdx.length !== 1) continue;
@@ -4195,7 +4289,7 @@ function surfaceProcessValues(surface, processMap = {}) {
     if (Array.isArray(surface.processes)) values.push(...surface.processes);
     if (surface.ref && Array.isArray(processMap[surface.ref])) values.push(...processMap[surface.ref]);
   }
-  return values.map((value) => String(value || '').trim()).filter(Boolean);
+  return values.map((value) => processEntryCommand(value)).filter(Boolean);
 }
 
 function conciergeSurfaceHasClaudeProcess(surface, processMap = {}) {
