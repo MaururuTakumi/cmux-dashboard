@@ -1717,6 +1717,30 @@ async function runSprint4GridPersistenceRegressions() {
         const refs = gridColumnRefs(state);
         r2Results.push({
           n,
+          passCount: rebalance && rebalance.passCount,
+          error: rebalance && rebalance.error,
+          boundaries: rebalance && Array.isArray(rebalance.boundaries)
+            ? rebalance.boundaries.map((item) => ({
+              name: item && item.name,
+              actualPx: item && item.actualPx,
+              targetPx: item && (item.targetRightPx != null ? item.targetRightPx : item.targetPx),
+              diffPx: item && item.diffPx,
+              tolerancePx: item && item.tolerancePx,
+              withinTolerance: item && item.withinTolerance,
+            }))
+            : [],
+          columns: rebalance && Array.isArray(rebalance.measurements)
+            ? rebalance.measurements
+              .filter((item) => item && String(item.name || "").startsWith("column:"))
+              .map((item) => ({
+                name: item && item.name,
+                actualPx: item && item.actualPx,
+                targetPx: item && item.targetPx,
+                diffPx: item && item.diffPx,
+                tolerancePx: item && item.tolerancePx,
+                withinTolerance: item && item.withinTolerance,
+              }))
+            : [],
           ok: (
             state &&
             state.columns.length === n &&
@@ -1731,6 +1755,10 @@ async function runSprint4GridPersistenceRegressions() {
             gridRebalanceBoundariesWithinTolerance(rebalance)
           ),
         });
+      }
+      for (const item of r2Results) {
+        if (item.ok === true) continue;
+        console.log("INFO\tgrid Sprint4 R2 detail: " + JSON.stringify(item));
       }
       check("grid Sprint4 R2: N=2..6 columns converge to equal widths within tolerance", (
         r2Results.length === 5 &&

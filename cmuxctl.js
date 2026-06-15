@@ -3468,11 +3468,16 @@ function gridRebalanceBoundaryRecord(boundary, geometry, cellWidthPx, tolerance 
   const leftPaneRef = cleanRef(boundary && boundary.leftPaneRef);
   const rightPaneRef = cleanRef(boundary && boundary.rightPaneRef);
   const targetRightPx = Number(boundary && boundary.targetRightPx);
+  const toleranceBasisPx = Number(boundary && boundary.toleranceBasisPx);
   const leftFrame = leftPaneRef ? geometry.byRef.get(leftPaneRef) : null;
   const rightFrame = rightPaneRef ? geometry.byRef.get(rightPaneRef) : null;
   const actual = gridBoundaryActualPx(leftFrame, rightFrame);
   const target = Number.isFinite(targetRightPx) ? targetRightPx : 0;
-  const tolerancePx = gridRebalanceTolerancePx(target, cellWidthPx, tolerance);
+  const tolerancePx = gridRebalanceTolerancePx(
+    Number.isFinite(toleranceBasisPx) && toleranceBasisPx > 0 ? toleranceBasisPx : target,
+    cellWidthPx,
+    tolerance,
+  );
   const diffPx = Number.isFinite(actual) ? actual - target : null;
   return {
     name: boundary && boundary.name || 'boundary',
@@ -3578,6 +3583,7 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
       leftPaneRef: browserPaneRef,
       rightPaneRef: orderedColumns[0].resizePaneRef,
       targetRightPx: container.x + target.browserWidth,
+      toleranceBasisPx: target.browserWidth,
     },
     ...orderedColumns.map((item, idx) => {
       const next = orderedColumns[idx + 1];
@@ -3588,6 +3594,7 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
         leftPaneRef: item.resizePaneRef,
         rightPaneRef: next ? next.resizePaneRef : anchorPaneRef,
         targetRightPx: container.x + target.browserWidth + target.columnWidth * (idx + 1),
+        toleranceBasisPx: target.columnWidth,
         index: idx,
       };
     }),
@@ -3618,7 +3625,11 @@ async function readGridRebalanceSnapshot(wsRef, columns, surfaces) {
       sliverThresholdPx: Math.round(anchorSliverThresholdPx),
       frameSource: anchorFrameSource,
     },
-    withinTolerance: boundaries.every((item) => item.withinTolerance) && !anchorSliver,
+    withinTolerance: (
+      measurements.every((item) => item.withinTolerance) &&
+      boundaries.every((item) => item.withinTolerance) &&
+      !anchorSliver
+    ),
   };
 }
 
