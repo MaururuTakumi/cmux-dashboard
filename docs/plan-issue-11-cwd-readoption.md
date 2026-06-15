@@ -39,3 +39,25 @@ buildAdoptedGridColumns に processMap opts を追加し、上記フォールバ
 
 ## ガードレール
 生セッション非殺害 / `rebuild confirm:true` 不使用 / grid 端末のみ / configured projects 限定。
+
+---
+
+## Revision 2 (2026-06-16) — 実機検証で判明した修正（cwd source）
+
+### 問題
+v1 実装は自動テスト緑だったが**実機で失敗**: `columns:[] / orphans:8` のまま再採用されず。
+根本原因: **cmux は既存 surface の cwd を一切出さない**（`list-pane-surfaces` は ref/title のみ、`top` も cwd 無し、capabilities に surface cwd 取得手段なし）。v1 の `surfaceMatchesProjectCwd` は `surface.cwd` 前提だったため live では常に不一致。fake cmux が cwd を注入していたためテストだけ通る**テスト不忠実**だった。
+
+### 確定した方針（PID→lsof で cwd 解決）
+- **process/PID**: `cmux top --processes --format tsv` のツリーは surface 配下に process 行（PID＋command）を持つ。各 grid surface の **claude/codex プロセス PID** を取得（既存 surfaceProcessMap を PID 付きに拡張 or 併用）。
+- **cwd**: その PID から OS で解決 — macOS `lsof -a -p <pid> -d cwd -Fn`（→ プロジェクトディレクトリ）。これを **stub 可能な seam** にする（例: `resolveProcessCwd(pid)` をモジュール関数 or env 差し替え可能に）。テストは実 lsof を呼べないため、この seam を fake で差し替えて pid→cwd を注入する。
+- **照合**: 解決した cwd を configured project に照合（既存ロジック）＋ process で slot（cc=claude/cdx=codex）。両 slot 一意確定＆未請求の時だけ採用（v1 と同じガード）。
+- **性能**: lsof を毎 poll 全 surface に走らせない。**orphan 判定された grid surface の採用時のみ**＋**TTL キャッシュ/fast-fail**（解決失敗は cwd 無し＝非採用に倒す）。#10 の read-screen と同じ作法。
+
+### テスト不忠実の是正（必須）
+- fake cmux の surface は **cwd フィールドを持たない**（実 cmux に合わせる）。
+- process/PID は fake `top` で供給、cwd は **stub した resolveProcessCwd(pid→cwd map)** で供給。
+- positive(legacy) は「surface.cwd 無し・top で PID 取得・stub resolver で cwd 解決 → 全カラム再採用・orphans=0・live ref 保持」を検証。negative 群は維持。
+
+### 受け入れ基準（追加・最重要）
+- **実機**: feat 反映後に `./cmux-dash restart` → workspace:5 の legacy orphan が cwd(PID→lsof)+process で columns に再採用され orphans→0（完全 cc+cdx ペアが揃う project 分）、claude/codex セッション生存維持。**自動テスト緑だけでは不可、実機 orphans→0 を claude が確認するまで done としない。**
