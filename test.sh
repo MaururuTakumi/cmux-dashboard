@@ -1379,6 +1379,62 @@ for (const item of (s.surfaces || [])) {
 fs.writeFileSync(file, JSON.stringify(s) + "\n");
 NODE
     ;;
+  read-screen)
+    surface=""
+    workspace=""
+    lines="40"
+    while [ "\$#" -gt 0 ]; do
+      case "\$1" in
+        --surface) surface="\${2:-}"; shift 2 ;;
+        --workspace) workspace="\${2:-}"; shift 2 ;;
+        --lines) lines="\${2:-}"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    "\$NODE_BIN" - "\$STATE" "\$surface" "\$workspace" "\$lines" <<'NODE'
+const fs = require("fs");
+const file = process.argv[2];
+const surface = process.argv[3] || "";
+const workspace = process.argv[4] || "";
+const lines = Math.max(1, Number(process.argv[5] || "40") || 40);
+const lock = file + ".read-screen.lock";
+let locked = false;
+for (let i = 0; i < 200; i += 1) {
+  try {
+    fs.mkdirSync(lock);
+    locked = true;
+    break;
+  } catch (_) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+}
+let s = { surfaces: [] };
+let exitCode = 0;
+let output = "";
+try {
+  try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
+  s.readScreenCalls = Array.isArray(s.readScreenCalls) ? s.readScreenCalls : [];
+  s.readScreenCalls.push({ surface, workspace, lines });
+  const fail = s.readScreenFailures && Number(s.readScreenFailures[surface] || 0) || 0;
+  if (fail > 0) {
+    s.readScreenFailures[surface] = fail - 1;
+    fs.writeFileSync(file, JSON.stringify(s) + "\n");
+    process.stderr.write("simulated read-screen failure\n");
+    exitCode = 65;
+  }
+  const screens = s.readScreens && typeof s.readScreens === "object" ? s.readScreens : {};
+  const text = String(screens[surface] || "");
+  fs.writeFileSync(file, JSON.stringify(s) + "\n");
+  output = text.split(/\r?\n/).slice(-lines).join("\n");
+} finally {
+  if (locked) {
+    try { fs.rmdirSync(lock); } catch (_) {}
+  }
+}
+if (exitCode) process.exit(exitCode);
+process.stdout.write(output);
+NODE
+    ;;
   close-surface)
     workspace=""
     surface=""
@@ -2202,6 +2258,87 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         .find((item) => item && item.paneRef === alphaResizePaneRef && item.direction === "-L" && item.resized)) || null;
       const alphaLeftPass1 = alphaLeftResizeForPass(1);
       const alphaLeftPass2 = alphaLeftResizeForPass(2);
+      const approvalScreen = [
+        "Do you want to proceed?",
+        "❯ 1. Yes",
+        "  2. Yes, and don't ask again for test in repo",
+        "  3. No, and tell Claude what to do differently (esc)",
+      ].join("\n");
+      const inputScreen = [
+        "─────────────────────────────",
+        "❯",
+        "─────────────────────────────",
+        "  ⏵⏵ auto mode on (shift+tab · ? for shortcuts)",
+      ].join("\n");
+      const logScreen = "build output: Yes appears in a log. Do you want is text. approval is just a word.";
+      const thinkingScreen = "✳ Working on tests (thinking)\nesc to interrupt";
+      const setReadScreenState = (screens, failures = {}) => {
+        const raw = rawCmuxState();
+        raw.readScreens = screens;
+        raw.readScreenFailures = failures;
+        raw.readScreenCalls = [];
+        writeCmuxState(raw);
+      };
+      const freshGridCtl = () => {
+        const ctlPath = require.resolve(path.join(repo, "cmuxctl.js"));
+        delete require.cache[ctlPath];
+        return require(ctlPath);
+      };
+      const readScreenCalls = () => rawCmuxState().readScreenCalls || [];
+      const callCountFor = (ref) => readScreenCalls().filter((item) => item && item.surface === ref).length;
+      const awaitingTargetRefs = [
+        alphaGridColumn && alphaGridColumn.cc && alphaGridColumn.cc.surfaceRef,
+        alphaGridColumn && alphaGridColumn.cdx && alphaGridColumn.cdx.surfaceRef,
+        generalGridColumn && generalGridColumn.cc && generalGridColumn.cc.surfaceRef,
+        generalGridColumn && generalGridColumn.cdx && generalGridColumn.cdx.surfaceRef,
+        gridState.concierge && gridState.concierge.surfaceRef,
+      ].filter(Boolean);
+      setReadScreenState({
+        [alphaGridColumn.cc.surfaceRef]: approvalScreen,
+        [alphaGridColumn.cdx.surfaceRef]: inputScreen,
+        [generalGridColumn.cc.surfaceRef]: logScreen,
+        [generalGridColumn.cdx.surfaceRef]: approvalScreen,
+        [gridState.concierge.surfaceRef]: approvalScreen,
+        [browserAnchor && browserAnchor.ref || ""]: approvalScreen,
+        [rightAnchor && rightAnchor.ref || ""]: approvalScreen,
+      });
+      const awaitingCtl = freshGridCtl();
+      const [awaitingStateA, awaitingStateB] = await Promise.all([
+        awaitingCtl.getGridState(),
+        awaitingCtl.getGridState(),
+      ]);
+      const awaitingAlpha = awaitingStateA.columns.find((column) => column.projectId === "alpha") || {};
+      const awaitingGeneral = awaitingStateA.columns.find((column) => column.projectId === "cc-general") || {};
+      const firstReadScreenCalls = readScreenCalls().slice();
+      const callsAfterConcurrent = readScreenCalls().length;
+      const calledSurfaceSet = new Set(firstReadScreenCalls.map((item) => item && item.surface).filter(Boolean));
+      const firstCallCountFor = (ref) => firstReadScreenCalls.filter((item) => item && item.surface === ref).length;
+      const ttlHitState = await awaitingCtl.getGridState();
+      const callsAfterTtlHit = readScreenCalls().length;
+      await new Promise((resolve) => setTimeout(resolve, 1900));
+      await awaitingCtl.getGridState();
+      const callsAfterTtlExpiry = readScreenCalls().length;
+      setReadScreenState({
+        [alphaGridColumn.cc.surfaceRef]: inputScreen,
+        [alphaGridColumn.cdx.surfaceRef]: inputScreen,
+        [generalGridColumn.cc.surfaceRef]: thinkingScreen,
+        [generalGridColumn.cdx.surfaceRef]: logScreen,
+        [gridState.concierge.surfaceRef]: inputScreen,
+      });
+      const inputCtl = freshGridCtl();
+      const inputState = await inputCtl.getGridState();
+      const inputAlpha = inputState.columns.find((column) => column.projectId === "alpha") || {};
+      const inputGeneral = inputState.columns.find((column) => column.projectId === "cc-general") || {};
+      setReadScreenState({
+        [alphaGridColumn.cc.surfaceRef]: approvalScreen,
+        [alphaGridColumn.cdx.surfaceRef]: inputScreen,
+        [generalGridColumn.cc.surfaceRef]: logScreen,
+        [generalGridColumn.cdx.surfaceRef]: logScreen,
+        [gridState.concierge.surfaceRef]: approvalScreen,
+      }, { [alphaGridColumn.cc.surfaceRef]: 1 });
+      const failureCtl = freshGridCtl();
+      const failureState = await failureCtl.getGridState();
+      const failureAlpha = failureState.columns.find((column) => column.projectId === "alpha") || {};
 
       check("grid C1: ensureGridWorkspace uses dedicated tag and stays out of project state", (
         initialGridRef &&
@@ -2267,6 +2404,58 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         askEnterSend &&
         askEnterSend.processBeforeSend === "claude" &&
         askEnterSend.text === "\\r"
+      ));
+      check("grid awaiting: Claude approval and idle input classify per role", (
+        awaitingAlpha.cc &&
+        awaitingAlpha.cc.awaiting === "approval" &&
+        awaitingAlpha.cdx &&
+        awaitingAlpha.cdx.awaiting === "input" &&
+        awaitingStateA.concierge &&
+        awaitingStateA.concierge.awaiting === "approval"
+      ));
+      check("grid awaiting: conservative negatives stay null including cdx approval-like text", (
+        awaitingGeneral.cc &&
+        awaitingGeneral.cc.awaiting === null &&
+        awaitingGeneral.cdx &&
+        awaitingGeneral.cdx.awaiting === null
+      ));
+      check("grid awaiting: input detection covers cc/cdx/concierge and thinking stays null", (
+        inputAlpha.cc &&
+        inputAlpha.cc.awaiting === "input" &&
+        inputAlpha.cdx &&
+        inputAlpha.cdx.awaiting === "input" &&
+        inputState.concierge &&
+        inputState.concierge.awaiting === "input" &&
+        inputGeneral.cc &&
+        inputGeneral.cc.awaiting === null
+      ));
+      check("grid awaiting: read-screen failure degrades only that surface and state still returns", (
+        failureState &&
+        failureState.wsRef === gridState.wsRef &&
+        failureAlpha.cc &&
+        failureAlpha.cc.awaiting === null &&
+        failureAlpha.cdx &&
+        failureAlpha.cdx.awaiting === "input"
+      ));
+      check("grid awaiting: read-screen scope is grid cc/cdx/concierge only", (
+        awaitingTargetRefs.length === 5 &&
+        calledSurfaceSet.size === awaitingTargetRefs.length &&
+        awaitingTargetRefs.every((ref) => calledSurfaceSet.has(ref)) &&
+        browserAnchor &&
+        !calledSurfaceSet.has(browserAnchor.ref) &&
+        rightAnchor &&
+        !calledSurfaceSet.has(rightAnchor.ref)
+      ));
+      check("grid awaiting: read-screen uses lines=40 and single-flight dedupes concurrent reads", (
+        awaitingStateB &&
+        firstReadScreenCalls.every((item) => item && item.lines === 40) &&
+        awaitingTargetRefs.every((ref) => firstCallCountFor(ref) === 1) &&
+        callsAfterConcurrent === awaitingTargetRefs.length
+      ));
+      check("grid awaiting: TTL cache reuses then expires read-screen values", (
+        ttlHitState &&
+        callsAfterTtlHit === callsAfterConcurrent &&
+        callsAfterTtlExpiry >= callsAfterConcurrent + awaitingTargetRefs.length
       ));
       check("grid C1: addProjectColumn creates ordered scoped cc/cdx columns", (
         afterAlphaGridRef === initialGridRef &&
