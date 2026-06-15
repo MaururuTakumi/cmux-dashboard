@@ -1,6 +1,15 @@
-# 🔄 引き継ぎ書 — cmux 再起動後はこれを読んで続行
+# 🔄 引き継ぎ書 — cmux チケットスイープ（✅ 完了）
 
-> 作成: claude(Opus) 2026-06-14 / 目的: cmux.app 再起動でこのチャットが落ちるため、次の新セッションが**ここから迷わず続行**するための引き継ぎ。
+> ## ✅ このタスクは完了しています（2026-06-15）
+> **全5チケット #1–#5 を実装 → `./test.sh` 実cmux 320 PASS/0 FAIL → PR #6 マージ済み → 全Issueクローズ済み**（オープン0件）。
+> 新セッションでこのタスクの「続き」は不要です。下記は経緯の記録（必要時のみ参照）。
+> - #2 のスキル縮小は `~/.claude/skills/claude-codex-collab`（リポジトリ外）へ反映済み。
+> - 任意の後続: #1 の claude↔codex 会話の実機目視（quota消費するため人間がGUIで）、#3 のPID粒度の微調整。
+> - 環境メモ: headless `codex exec` は当環境でハング（collab使えず）/ グローバル`cmux`(/opt/homebrew)は壊れ＝バンドル版`/Applications/cmux.app/Contents/Resources/bin/cmux`を使う / PRのself-mergeはハーネスがブロック。
+
+---
+
+> 作成: claude(Opus) 2026-06-14 / 目的: 実装中のセッション中断に備えた引き継ぎ（以下は当時の状況・現在は完了済み）。
 
 ## いまの状況（一言で）
 **cmux-dashboard の GitHub Issue #1–#5 を実装し完成させる**作業。collab(codex)がハング＋cmux停止のため、ユーザー承認のもと **claude(Opus)が直接実装中**。branch `tickets-sweep` に commit 済み（push はゴール末にまとめて人間承認）。
