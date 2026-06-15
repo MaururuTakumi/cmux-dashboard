@@ -806,6 +806,42 @@ if (emptyReads > 0) {
 process.stdout.write(JSON.stringify({ workspaces: Array.isArray(s.workspaces) ? s.workspaces : [] }) + "\n");
 NODE
     ;;
+  top)
+    workspace=""
+    while [ "\$#" -gt 0 ]; do
+      case "\$1" in
+        --workspace) workspace="\${2:-}"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    "\$NODE_BIN" - "\$STATE" "\$workspace" <<'NODE'
+const fs = require("fs");
+const file = process.argv[2];
+const workspace = process.argv[3] || "";
+let s = { workspaces: [], panes: [], surfaces: [] };
+try { s = JSON.parse(fs.readFileSync(file, "utf8")); } catch (_) {}
+const lines = ["cpu\trss\tproc\tkind\tref\tparentRef\tcommand"];
+let processIdx = 1;
+for (const ws of (Array.isArray(s.workspaces) ? s.workspaces : [])) {
+  if (!ws || !ws.ref || (workspace && ws.ref !== workspace)) continue;
+  lines.push(["0", "10485760", "1", "workspace", ws.ref, "", ws.name || ws.description || ws.ref].join("\t"));
+}
+for (const pane of (Array.isArray(s.panes) ? s.panes : [])) {
+  if (!pane || !pane.ref || (workspace && pane.workspace !== workspace)) continue;
+  lines.push(["0", "10485760", "1", "pane", pane.ref, pane.workspace || "", pane.ref].join("\t"));
+}
+for (const surface of (Array.isArray(s.surfaces) ? s.surfaces : [])) {
+  if (!surface || !surface.ref || (workspace && surface.workspace !== workspace)) continue;
+  lines.push(["0", "10485760", "1", "surface", surface.ref, surface.pane || "", surface.title || surface.ref].join("\t"));
+  const pid = surface.pid == null ? String(processIdx++) : String(surface.pid).trim();
+  const command = String(surface.topProcess || surface.process || surface.command || "zsh").trim();
+  if (/^[0-9]+$/.test(pid) && command) {
+    lines.push(["0", "10485760", "1", "process", "process:" + pid, surface.ref, command].join("\t"));
+  }
+}
+process.stdout.write(lines.join("\n") + "\n");
+NODE
+    ;;
   new-workspace)
     desc=""
     name=""
@@ -1554,6 +1590,7 @@ const phaseDir = process.argv[3];
 const stateFile = process.argv[4];
 const cfgFile = process.env.CMUX_DASH_PROJECTS_FILE;
 const ctl = require(path.join(repo, "cmuxctl.js"));
+const previousProcessCwdMap = process.env.CMUX_DASH_PROCESS_CWD_MAP;
 
 let failed = 0;
 function check(label, ok) {
@@ -1821,11 +1858,151 @@ async function runSprint4GridPersistenceRegressions() {
         r2Results.every((item) => item.ok === true)
       ));
     }
+
+    {
+      const projects = writeSprint4Config(2);
+      writeCmuxState(blankCmuxState());
+      const gridStateFile = path.join(phaseDir, "grid-sprint4-legacy-cwd-process-state.json");
+      let legacyCtl = freshCtlWithGridState(gridStateFile);
+      for (const project of projects) await legacyCtl.addProjectColumn(project.id);
+      const before = await legacyCtl.getGridState();
+      const refsBefore = gridColumnRefs(before);
+      const liveBefore = liveGridSurfaceRefs();
+      const legacyProcessCwdMap = {};
+      const legacySurfaceMeta = new Map();
+      before.columns.forEach((column, idx) => {
+        const project = projects.find((item) => item.id === column.projectId);
+        if (!project) return;
+        const ccPid = String(910000 + (idx * 2) + 1);
+        const cdxPid = String(910000 + (idx * 2) + 2);
+        if (column.cc && column.cc.surfaceRef) {
+          legacySurfaceMeta.set(column.cc.surfaceRef, { pid: ccPid, topProcess: "claude" });
+          legacyProcessCwdMap[ccPid] = project.path;
+        }
+        if (column.cdx && column.cdx.surfaceRef) {
+          legacySurfaceMeta.set(column.cdx.surfaceRef, { pid: cdxPid, topProcess: "codex" });
+          legacyProcessCwdMap[cdxPid] = project.path;
+        }
+      });
+      {
+        const raw = rawCmuxState();
+        raw.surfaces = (raw.surfaces || []).map((surface) => {
+          if (!surface || !legacySurfaceMeta.has(surface.ref)) return surface;
+          const { cwd: _cwd, process: _process, processName: _processName, command: _command, processes: _processes, ...rest } = surface;
+          return { ...rest, title: "terminal", sendText: null, ...legacySurfaceMeta.get(surface.ref) };
+        });
+        writeCmuxState(raw);
+      }
+      fs.rmSync(gridStateFile, { force: true });
+      process.env.CMUX_DASH_PROCESS_CWD_MAP = JSON.stringify(legacyProcessCwdMap);
+      const ctlPath = require.resolve(path.join(repo, "cmuxctl.js"));
+      delete require.cache[ctlPath];
+      legacyCtl = require(ctlPath);
+      const restarted = await legacyCtl.getGridState();
+      const persisted = JSON.parse(fs.readFileSync(gridStateFile, "utf8"));
+      const liveAfter = liveGridSurfaceRefs();
+      check("grid issue #11: legacy markerless cwd+process pair re-adopts all configured project columns", (
+        before &&
+        before.columns.length === projects.length &&
+        restarted &&
+        restarted.wsRef === before.wsRef &&
+        gridProjectIds(restarted).join(",") === projects.map((project) => project.id).join(",") &&
+        gridColumnRefs(restarted).join(",") === refsBefore.join(",") &&
+        Array.isArray(restarted.orphans) &&
+        restarted.orphans.length === 0
+      ));
+      check("grid issue #11: legacy cwd+process adoption preserves live refs and persists canonical grid state", (
+        liveBefore.size > 0 &&
+        liveAfter.size === liveBefore.size &&
+        refsBefore.every((ref) => liveAfter.has(ref)) &&
+        persisted &&
+        persisted.wsRef === before.wsRef &&
+        Array.isArray(persisted.columns) &&
+        gridColumnRefs(persisted).join(",") === refsBefore.join(",")
+      ));
+    }
+
+    {
+      const projects = writeSprint4Config(4);
+      const gridStateFile = path.join(phaseDir, "grid-sprint4-legacy-cwd-process-negative-state.json");
+      process.env.CMUX_DASH_GRID_STATE_FILE = gridStateFile;
+      const gridMarker = (projectId, slot) => "cmuxdash:grid:__grid__:column:" + projectId + ":slot:" + slot;
+      const surface = (ref, pane, pid, processName, extra = {}) => ({
+        ref,
+        workspace: "workspace:legacy-negative",
+        pane,
+        title: "terminal",
+        type: "terminal",
+        pid,
+        topProcess: processName,
+        sendText: null,
+        ...extra,
+      });
+      const runLegacyNegative = async (label, surfaces, cwdMap = {}, persistedState = null) => {
+        fs.rmSync(gridStateFile, { force: true });
+        if (persistedState) fs.writeFileSync(gridStateFile, JSON.stringify(persistedState, null, 2) + "\n");
+        process.env.CMUX_DASH_PROCESS_CWD_MAP = JSON.stringify(cwdMap);
+        writeCmuxState({
+          workspaces: [{ ref: "workspace:legacy-negative", description: "cmuxdash:__grid__", selected: true }],
+          panes: surfaces.map((item, idx) => ({ ref: item.pane, workspace: "workspace:legacy-negative", index: idx })),
+          surfaces,
+          nextWorkspace: 2,
+          nextPane: surfaces.length + 1,
+          nextSurface: surfaces.length + 1,
+        });
+        const ctlPath = require.resolve(path.join(repo, "cmuxctl.js"));
+        delete require.cache[ctlPath];
+        const testCtl = require(ctlPath);
+        return { label, state: await testCtl.getGridState() };
+      };
+      const mismatch = await runLegacyNegative("cwd mismatch", [
+        surface("surface:neg-mismatch-cc", "pane:neg-mismatch-cc", "920001", "claude"),
+        surface("surface:neg-mismatch-cdx", "pane:neg-mismatch-cdx", "920002", "codex"),
+      ], { "920001": path.join(phaseDir, "elsewhere"), "920002": path.join(phaseDir, "elsewhere") });
+      const half = await runLegacyNegative("half pair", [
+        surface("surface:neg-half-cc", "pane:neg-half-cc", "920003", "claude"),
+      ], { "920003": projects[0].path });
+      const duplicate = await runLegacyNegative("duplicate slot", [
+        surface("surface:neg-dupe-cc-1", "pane:neg-dupe-cc-1", "920004", "claude"),
+        surface("surface:neg-dupe-cc-2", "pane:neg-dupe-cc-2", "920005", "claude"),
+        surface("surface:neg-dupe-cdx", "pane:neg-dupe-cdx", "920006", "codex"),
+      ], { "920004": projects[1].path, "920005": projects[1].path, "920006": projects[1].path });
+      const excluded = await runLegacyNegative("excluded surfaces", [
+        surface("surface:neg-browser-cc", "pane:neg-browser-cc", "920007", "claude", { type: "browser", url: "http://127.0.0.1:7799" }),
+        surface("surface:neg-concierge-cdx", "pane:neg-concierge-cdx", "920008", "codex", { title: "cmuxdash:grid:__grid__:concierge" }),
+        surface("surface:neg-anchor-cc", "pane:neg-anchor-cc", "920009", "claude", { title: "cmuxdash:grid:__grid__:right-anchor" }),
+        surface("surface:neg-anchor-cdx", "pane:neg-anchor-cdx", "920010", "codex", { title: "cmuxdash:grid:__grid__:right-anchor" }),
+      ], { "920007": projects[2].path, "920008": projects[2].path, "920009": projects[3].path, "920010": projects[3].path });
+      const claimed = await runLegacyNegative("claimed marker refs", [
+        surface("surface:neg-claimed-marker-cc", "pane:neg-claimed-marker-cc", "920011", "zsh", { title: gridMarker(projects[0].id, "cc") }),
+        surface("surface:neg-claimed-marker-cdx", "pane:neg-claimed-marker-cdx", "920012", "zsh", { title: gridMarker(projects[0].id, "cdx") }),
+        surface("surface:neg-claimed-extra-cc", "pane:neg-claimed-extra-cc", "920013", "claude"),
+        surface("surface:neg-claimed-extra-cdx", "pane:neg-claimed-extra-cdx", "920014", "codex"),
+      ], { "920011": projects[0].path, "920012": projects[0].path, "920013": projects[0].path, "920014": projects[0].path });
+      check("grid issue #11: cwd+process fallback rejects cwd mismatch, half pair, duplicate slot, and excluded surfaces", (
+        [mismatch, half, duplicate, excluded].every((item) => (
+          item &&
+          item.state &&
+          Array.isArray(item.state.columns) &&
+          item.state.columns.length === 0
+        ))
+      ));
+      check("grid issue #11: cwd+process fallback does not create a second column for already claimed marker refs", (
+        claimed &&
+        claimed.state &&
+        claimed.state.columns.length === 1 &&
+        claimed.state.columns[0].projectId === projects[0].id &&
+        claimed.state.columns[0].cc.surfaceRef === "surface:neg-claimed-marker-cc" &&
+        claimed.state.columns[0].cdx.surfaceRef === "surface:neg-claimed-marker-cdx"
+      ));
+    }
   } finally {
     if (previousOverwrite == null) delete process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE;
     else process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE = previousOverwrite;
     if (previousResize == null) delete process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT;
     else process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT = previousResize;
+    if (previousProcessCwdMap == null) delete process.env.CMUX_DASH_PROCESS_CWD_MAP;
+    else process.env.CMUX_DASH_PROCESS_CWD_MAP = previousProcessCwdMap;
   }
 }
 async function exerciseSlotCycle(id, slot, expectedCwd, label, expectAutoOpen) {

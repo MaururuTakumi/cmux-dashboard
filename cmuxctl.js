@@ -4,7 +4,7 @@
 // R1 rebuild: workspace 内の terminal surface を slot として扱う。
 //   cc=claude, cdx=codex, yazi=yazi, term=shell
 // workspace.description タグ "cmuxdash:<id>" で識別する。
-const { execFile } = require('child_process');
+const { execFile, execFileSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -304,6 +304,7 @@ const CMUX_HEALTH_FAILURE_THRESHOLD = intEnv('CMUX_DASH_HEALTH_FAILURE_THRESHOLD
 const AWAITING_SCREEN_LINES = intEnv('CMUX_DASH_AWAITING_SCREEN_LINES', 40);
 const AWAITING_READ_TIMEOUT_MS = intEnv('CMUX_DASH_AWAITING_READ_TIMEOUT_MS', 900);
 const AWAITING_READ_TTL_MS = intEnv('CMUX_DASH_AWAITING_READ_TTL_MS', 1800);
+const PROCESS_CWD_TTL_MS = intEnv('CMUX_DASH_PROCESS_CWD_TTL_MS', 5000);
 const GRID_CONCIERGE_READY_TIMEOUT_MAX_MS = 20000;
 const GRID_CONCIERGE_READY_TIMEOUT_DEFAULT_MS = 20000;
 const GRID_CONCIERGE_READY_POLL_DEFAULT_MS = 1000;
@@ -1836,13 +1837,72 @@ async function surfaceProcessMap(wsRef) {
       if (!line.trim()) continue;
       const cols = line.split('\t');
       if (cols.length < 7 || cols[3] !== 'process') continue;
+      const processRef = cleanRef(cols[4]);
       const surfaceRef = cols[5];
       if (!surfaceRef) continue;
       if (!bySurface[surfaceRef]) bySurface[surfaceRef] = [];
-      bySurface[surfaceRef].push(cols.slice(6).join('\t'));
+      bySurface[surfaceRef].push({
+        pid: pidFromProcessRef(processRef),
+        processRef,
+        command: cols.slice(6).join('\t'),
+      });
     }
   } catch (_) {}
   return bySurface;
+}
+
+function pidFromProcessRef(ref) {
+  const match = String(ref || '').match(/(?:^|:)pid:(\d+)$|(?:^|:)process:(\d+)$|^(\d+)$/i);
+  return match ? (match[1] || match[2] || match[3]) : null;
+}
+
+const processCwdCache = new Map();
+let processCwdResolverOverride = null;
+
+function processCwdMapOverride() {
+  const raw = process.env.CMUX_DASH_PROCESS_CWD_MAP;
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function resolveProcessCwdUncached(pid) {
+  const cleanPid = String(pid || '').trim();
+  if (!/^\d+$/.test(cleanPid)) return null;
+  if (processCwdResolverOverride) return processCwdResolverOverride(cleanPid);
+  const map = processCwdMapOverride();
+  if (map && hasOwn(map, cleanPid)) return map[cleanPid];
+  try {
+    const out = execFileSync('lsof', ['-a', '-p', cleanPid, '-d', 'cwd', '-Fn'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: Math.max(250, Math.min(CMUX_READ_TIMEOUT, 2500)),
+    });
+    for (const line of String(out || '').split(/\r?\n/)) {
+      if (line.startsWith('n')) return line.slice(1).trim() || null;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function resolveProcessCwd(pid) {
+  const cleanPid = String(pid || '').trim();
+  if (!/^\d+$/.test(cleanPid)) return null;
+  const now = Date.now();
+  const cached = processCwdCache.get(cleanPid);
+  if (cached && now - cached.at <= PROCESS_CWD_TTL_MS) return cached.cwd;
+  const cwd = cleanRef(resolveProcessCwdUncached(cleanPid));
+  processCwdCache.set(cleanPid, { cwd: cwd || null, at: now });
+  return cwd || null;
+}
+
+function setProcessCwdResolverForTest(fn) {
+  processCwdResolverOverride = typeof fn === 'function' ? fn : null;
+  processCwdCache.clear();
 }
 
 function emptyTypeBreakdown() {
@@ -2202,6 +2262,37 @@ function surfaceMatchesProjectCwd(surface, project) {
   const cwd = normalizedPath(surfaceCwd(surface));
   const expected = normalizedPath(rowCwd(project));
   return !!(cwd && expected && cwd === expected);
+}
+
+function processEntryCommand(entry) {
+  if (entry && typeof entry === 'object') {
+    return String(entry.command || entry.fullCommand || entry.title || '').trim();
+  }
+  return String(entry || '').trim();
+}
+
+function surfaceProcessEntries(surface, processMap = {}) {
+  const entries = [];
+  if (!surface) return entries;
+  for (const key of ['process', 'processName', 'command']) {
+    if (surface[key]) entries.push({ command: surface[key], pid: null, source: 'surface' });
+  }
+  if (Array.isArray(surface.processes)) {
+    for (const value of surface.processes) entries.push(value);
+  }
+  if (surface.ref && Array.isArray(processMap[surface.ref])) entries.push(...processMap[surface.ref]);
+  return entries;
+}
+
+function surfaceProcessEntriesMatchingProjectCwd(surface, processMap = {}, project) {
+  const expected = normalizedPath(rowCwd(project));
+  if (!expected) return [];
+  return surfaceProcessEntries(surface, processMap).filter((entry) => {
+    const pid = entry && typeof entry === 'object' ? entry.pid : null;
+    if (!pid) return false;
+    const cwd = normalizedPath(resolveProcessCwd(pid));
+    return !!(cwd && cwd === expected);
+  });
 }
 
 function firstPaneRef(panes) {
@@ -3036,7 +3127,24 @@ function validExistingGridColumn(column, byRef, wsRef) {
   };
 }
 
-function buildAdoptedGridColumns(wsRef, surfaces, cfg, now = new Date().toISOString()) {
+function classifyGridColumnProcessSlot(surface, processMap = {}) {
+  const matches = new Set();
+  for (const value of surfaceProcessValues(surface, processMap)) {
+    if (SLOT_DEFS.cc.processRe.test(value) || classifyProcess(value) === 'C') matches.add('cc');
+    if (SLOT_DEFS.cdx.processRe.test(value) || classifyProcess(value) === 'X') matches.add('cdx');
+  }
+  return matches.size === 1 ? Array.from(matches)[0] : null;
+}
+
+function addGridColumnSurfaceRefs(set, column) {
+  for (const slot of ['cc', 'cdx']) {
+    const ref = cleanRef(column && column[slot] && column[slot].surfaceRef);
+    if (ref) set.add(ref);
+  }
+}
+
+function buildAdoptedGridColumns(wsRef, surfaces, cfg, now = new Date().toISOString(), opts = {}) {
+  const processMap = opts && opts.processMap || {};
   const byRef = liveSurfaceIndex(surfaces);
   const records = new Map();
   const markerOrphans = [];
@@ -3129,6 +3237,74 @@ function buildAdoptedGridColumns(wsRef, surfaces, cfg, now = new Date().toISOStr
       updatedAt: now,
       adopted: !existing,
     });
+  }
+
+  const claimedSurfaceRefs = new Set();
+  for (const column of merged.values()) addGridColumnSurfaceRefs(claimedSurfaceRefs, column);
+  for (const record of records.values()) {
+    for (const slot of ['cc', 'cdx']) {
+      const ref = cleanRef(record[slot] && record[slot].ref);
+      if (ref) claimedSurfaceRefs.add(ref);
+    }
+    for (const duplicate of record.duplicateSurfaces) {
+      const ref = cleanRef(duplicate && duplicate.surface && duplicate.surface.ref);
+      if (ref) claimedSurfaceRefs.add(ref);
+    }
+  }
+  for (const surface of [
+    gridBrowserAnchorSurface(surfaces),
+    markedOrKnownGridConciergeSurface(surfaces),
+    markedGridRightAnchorSurface(surfaces),
+    gridRuntimeState.anchorSurfaceRef ? { ref: gridRuntimeState.anchorSurfaceRef } : null,
+  ]) {
+    const ref = cleanRef(surface && surface.ref);
+    if (ref) claimedSurfaceRefs.add(ref);
+  }
+
+  for (const project of configuredProjectRows(cfg)) {
+    const projectId = cleanRef(project && project.id);
+    if (!projectId || merged.has(projectId)) continue;
+    const candidates = { cc: [], cdx: [] };
+    for (const surface of Array.isArray(surfaces) ? surfaces : []) {
+      if (!isGridTerminalSurface(surface)) continue;
+      const ref = cleanRef(surface && surface.ref);
+      if (!ref || claimedSurfaceRefs.has(ref)) continue;
+      if (parseGridColumnMarker(surface) || hasUnrecognizedGridMarker(surface)) continue;
+      const cwdProcesses = surfaceProcessEntriesMatchingProjectCwd(surface, processMap, project);
+      if (!cwdProcesses.length) continue;
+      const scopedProcessMap = {};
+      scopedProcessMap[ref] = cwdProcesses;
+      const slot = classifyGridColumnProcessSlot({ ref }, scopedProcessMap);
+      if (slot === 'cc' || slot === 'cdx') candidates[slot].push(surface);
+    }
+    if (candidates.cc.length !== 1 || candidates.cdx.length !== 1) continue;
+    const cc = candidates.cc[0];
+    const cdx = candidates.cdx[0];
+    const columnId = gridColumnId(projectId);
+    merged.set(projectId, {
+      columnId,
+      projectId,
+      wsRef,
+      firstIndex: Math.min(
+        surfaceOrder.get(cc.ref) ?? Number.MAX_SAFE_INTEGER,
+        surfaceOrder.get(cdx.ref) ?? Number.MAX_SAFE_INTEGER,
+      ),
+      cc: {
+        surfaceRef: cc.ref,
+        paneRef: cc.paneRef || null,
+        marker: gridSlotMarker(columnId, 'cc'),
+      },
+      cdx: {
+        surfaceRef: cdx.ref,
+        paneRef: cdx.paneRef || null,
+        marker: gridSlotMarker(columnId, 'cdx'),
+      },
+      createdAt: now,
+      updatedAt: now,
+      adopted: true,
+    });
+    claimedSurfaceRefs.add(cc.ref);
+    claimedSurfaceRefs.add(cdx.ref);
   }
 
   const order = gridProjectOrderIndex(cfg);
@@ -4113,7 +4289,7 @@ function surfaceProcessValues(surface, processMap = {}) {
     if (Array.isArray(surface.processes)) values.push(...surface.processes);
     if (surface.ref && Array.isArray(processMap[surface.ref])) values.push(...processMap[surface.ref]);
   }
-  return values.map((value) => String(value || '').trim()).filter(Boolean);
+  return values.map((value) => processEntryCommand(value)).filter(Boolean);
 }
 
 function conciergeSurfaceHasClaudeProcess(surface, processMap = {}) {
@@ -4532,7 +4708,8 @@ async function validateGridRuntimeState() {
   } else {
     resetGridConcierge();
   }
-  const resync = buildAdoptedGridColumns(ws.ref, surfaces, cfg);
+  const processMap = await surfaceProcessMap(ws.ref);
+  const resync = buildAdoptedGridColumns(ws.ref, surfaces, cfg, undefined, { processMap });
   gridRuntimeState.columns = resync.columns;
   const rightAnchor = markedGridRightAnchorSurface(surfaces) || gridRightAnchorSurface(surfaces, gridRuntimeState.columns);
   if (rightAnchor && rightAnchor.ref) {
