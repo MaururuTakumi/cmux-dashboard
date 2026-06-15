@@ -3792,6 +3792,7 @@ async function rebalanceGridColumns(wsRef) {
         operations,
         passes: finalPasses,
         measurements: snapshot.measurements,
+        boundaries: snapshot.boundaries,
         target: snapshot.target,
       };
     }
@@ -3863,6 +3864,7 @@ async function rebalanceGridColumns(wsRef) {
     passes: finalPasses,
     passCount: finalPasses.length,
     measurements: snapshot.measurements,
+    boundaries: snapshot.boundaries,
     target: snapshot.target,
     ...(snapshot.withinTolerance ? {} : { error: `grid rebalance did not converge within ${GRID_REBALANCE_MAX_PASSES} passes` }),
   };
