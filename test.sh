@@ -10,6 +10,7 @@ PORT="${CMUX_DASH_PORT:-$((18000 + ($$ % 1000)))}"
 HOST="${CMUX_DASH_HOST:-127.0.0.1}"
 URL="http://${HOST}:${PORT}"
 TEST_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/cmux-dashboard-test.XXXXXX")"
+export CMUX_DASH_GRID_STATE_FILE="$TEST_TMP_DIR/grid-state.json"
 TEST_PROJECTS_FILE="$TEST_TMP_DIR/projects.json"
 TEST_PROJECT_DIR="$TEST_TMP_DIR/project-${PROJECT_ID}"
 AGMSG_TEST_STORAGE="$TEST_TMP_DIR/agmsg-store"
@@ -1563,6 +1564,214 @@ function shellQuoted(value) {
   const backslash = String.fromCharCode(92);
   return q + String(value || "").split(q).join(q + backslash + q + q) + q;
 }
+function blankCmuxState() {
+  return { workspaces: [], panes: [], surfaces: [], nextWorkspace: 1, nextPane: 1, nextSurface: 1 };
+}
+function freshCtlWithGridState(gridStateFile) {
+  process.env.CMUX_DASH_GRID_STATE_FILE = gridStateFile;
+  fs.rmSync(gridStateFile, { force: true });
+  const ctlPath = require.resolve(path.join(repo, "cmuxctl.js"));
+  delete require.cache[ctlPath];
+  return require(ctlPath);
+}
+function writeSprint4Config(projectCount) {
+  const projects = [];
+  for (let i = 1; i <= projectCount; i += 1) {
+    const id = "grid-p" + i;
+    const dir = path.join(phaseDir, id);
+    fs.mkdirSync(dir, { recursive: true });
+    projects.push({ id, name: "Grid P" + i, path: dir });
+  }
+  fs.writeFileSync(cfgFile, JSON.stringify({
+    _comment: "Sprint4 grid persistence regression config",
+    defaults: {
+      topCmd: "true",
+      bottomCmd: "true",
+      yaziCmd: "true",
+      termCmd: "",
+      agmsg: { enabled: false, brief: false },
+      claudeMd: { mode: "off" },
+      collab: false,
+    },
+    projects,
+  }, null, 2) + "\n");
+  return projects;
+}
+function gridColumnRefs(state) {
+  return (state && Array.isArray(state.columns) ? state.columns : [])
+    .flatMap((column) => [
+      column && column.cc && column.cc.surfaceRef,
+      column && column.cdx && column.cdx.surfaceRef,
+    ])
+    .filter(Boolean);
+}
+function liveGridSurfaceRefs() {
+  return new Set(surfacesFor("__grid__").map((surface) => surface && surface.ref).filter(Boolean));
+}
+function gridProjectIds(state) {
+  return (state && Array.isArray(state.columns) ? state.columns : [])
+    .map((column) => column && column.projectId)
+    .filter(Boolean);
+}
+function gridRebalanceColumnsWithinTolerance(result) {
+  const measurements = result && Array.isArray(result.measurements) ? result.measurements : [];
+  const columnMeasurements = measurements.filter((item) => item && String(item.name || "").startsWith("column:"));
+  return columnMeasurements.length > 0 && columnMeasurements.every((item) => item.withinTolerance === true);
+}
+function gridRebalanceBoundariesWithinTolerance(result) {
+  const boundaries = result && Array.isArray(result.boundaries) ? result.boundaries : [];
+  return boundaries.length > 0 && boundaries.every((item) => item && item.withinTolerance === true);
+}
+async function runSprint4GridPersistenceRegressions() {
+  const previousOverwrite = process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE;
+  const previousResize = process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT;
+  try {
+    process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE = "1";
+    process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT = "0.25";
+
+    {
+      const projects = writeSprint4Config(3);
+      writeCmuxState(blankCmuxState());
+      const gridStateFile = path.join(phaseDir, "grid-sprint4-r1-state.json");
+      let sprintCtl = freshCtlWithGridState(gridStateFile);
+      for (const project of projects) await sprintCtl.addProjectColumn(project.id);
+      const beforeRebalance = await sprintCtl.rebalanceGridColumns((await sprintCtl.getGridState()).wsRef);
+      const before = await sprintCtl.getGridState();
+      const persisted = JSON.parse(fs.readFileSync(gridStateFile, "utf8"));
+      const liveBefore = liveGridSurfaceRefs();
+      const surfaceCountBefore = liveBefore.size;
+      const refsBefore = gridColumnRefs(before);
+      const columnRefsBefore = new Set(refsBefore);
+      {
+        const raw = rawCmuxState();
+        raw.surfaces = (raw.surfaces || []).map((surface) => {
+          if (!surface || !columnRefsBefore.has(surface.ref)) return surface;
+          return {
+            ...surface,
+            title: surface.process === "codex" ? "Codex" : "✳ Claude Code",
+            sendText: null,
+          };
+        });
+        writeCmuxState(raw);
+      }
+      const ctlPath = require.resolve(path.join(repo, "cmuxctl.js"));
+      delete require.cache[ctlPath];
+      sprintCtl = require(ctlPath);
+      const restarted = await sprintCtl.getGridState();
+      const liveAfter = liveGridSurfaceRefs();
+      check("grid Sprint4 R1: persisted state records 3 columns, anchor, and concierge before restart", (
+        persisted &&
+        persisted.version === 1 &&
+        persisted.wsRef === before.wsRef &&
+        persisted.anchorSurfaceRef &&
+        persisted.concierge &&
+        persisted.concierge.surfaceRef &&
+        Array.isArray(persisted.columns) &&
+        persisted.columns.length === 3 &&
+        persisted.columns.every((column, idx) => (
+          column &&
+          column.projectId === projects[idx].id &&
+          column.cc && column.cc.surfaceRef && column.cc.paneRef &&
+          column.cdx && column.cdx.surfaceRef && column.cdx.paneRef
+        ))
+      ));
+      check("grid Sprint4 R1: pre-restart 3-column rebalance is within tolerance", (
+        before &&
+        before.columns.length === 3 &&
+        Array.isArray(before.orphans) &&
+        before.orphans.length === 0 &&
+        beforeRebalance &&
+        gridRebalanceColumnsWithinTolerance(beforeRebalance) &&
+        gridRebalanceBoundariesWithinTolerance(beforeRebalance)
+      ));
+      check("grid Sprint4 R1: fresh runtime re-adopts persisted refs after marker text disappears", (
+        restarted &&
+        restarted.wsRef === before.wsRef &&
+        restarted.anchorSurfaceRef &&
+        restarted.concierge &&
+        restarted.concierge.surfaceRef &&
+        gridProjectIds(restarted).join(",") === projects.map((project) => project.id).join(",") &&
+        gridColumnRefs(restarted).join(",") === refsBefore.join(",") &&
+        Array.isArray(restarted.orphans) &&
+        restarted.orphans.length === 0
+      ));
+      check("grid Sprint4 R1: restart re-adoption preserves all live surfaces", (
+        surfaceCountBefore > 0 &&
+        liveAfter.size === surfaceCountBefore &&
+        refsBefore.every((ref) => liveAfter.has(ref)) &&
+        liveAfter.has(restarted.concierge && restarted.concierge.surfaceRef) &&
+        liveAfter.has(restarted.anchorSurfaceRef)
+      ));
+    }
+
+    {
+      const r2Results = [];
+      for (let n = 2; n <= 6; n += 1) {
+        const projects = writeSprint4Config(n);
+        writeCmuxState(blankCmuxState());
+        const sprintCtl = freshCtlWithGridState(path.join(phaseDir, "grid-sprint4-r2-" + n + "-state.json"));
+        for (const project of projects) await sprintCtl.addProjectColumn(project.id);
+        const state = await sprintCtl.getGridState();
+        const rebalance = await sprintCtl.rebalanceGridColumns(state.wsRef);
+        const liveRefs = liveGridSurfaceRefs();
+        const refs = gridColumnRefs(state);
+        r2Results.push({
+          n,
+          passCount: rebalance && rebalance.passCount,
+          error: rebalance && rebalance.error,
+          boundaries: rebalance && Array.isArray(rebalance.boundaries)
+            ? rebalance.boundaries.map((item) => ({
+              name: item && item.name,
+              actualPx: item && item.actualPx,
+              targetPx: item && (item.targetRightPx != null ? item.targetRightPx : item.targetPx),
+              diffPx: item && item.diffPx,
+              tolerancePx: item && item.tolerancePx,
+              withinTolerance: item && item.withinTolerance,
+            }))
+            : [],
+          columns: rebalance && Array.isArray(rebalance.measurements)
+            ? rebalance.measurements
+              .filter((item) => item && String(item.name || "").startsWith("column:"))
+              .map((item) => ({
+                name: item && item.name,
+                actualPx: item && item.actualPx,
+                targetPx: item && item.targetPx,
+                diffPx: item && item.diffPx,
+                tolerancePx: item && item.tolerancePx,
+                withinTolerance: item && item.withinTolerance,
+              }))
+            : [],
+          ok: (
+            state &&
+            state.columns.length === n &&
+            Array.isArray(state.orphans) &&
+            state.orphans.length === 0 &&
+            state.anchorSurfaceRef &&
+            liveRefs.has(state.anchorSurfaceRef) &&
+            refs.length === n * 2 &&
+            refs.every((ref) => liveRefs.has(ref)) &&
+            rebalance &&
+            gridRebalanceColumnsWithinTolerance(rebalance) &&
+            gridRebalanceBoundariesWithinTolerance(rebalance)
+          ),
+        });
+      }
+      for (const item of r2Results) {
+        if (item.ok === true) continue;
+        console.log("INFO\tgrid Sprint4 R2 detail: " + JSON.stringify(item));
+      }
+      check("grid Sprint4 R2: N=2..6 columns converge to equal widths within tolerance", (
+        r2Results.length === 5 &&
+        r2Results.every((item) => item.ok === true)
+      ));
+    }
+  } finally {
+    if (previousOverwrite == null) delete process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE;
+    else process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE = previousOverwrite;
+    if (previousResize == null) delete process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT;
+    else process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT = previousResize;
+  }
+}
 async function exerciseSlotCycle(id, slot, expectedCwd, label, expectAutoOpen) {
   const beforeState = await ctl.getProjectState(id);
   const beforeCount = surfacesFor(id).length;
@@ -2481,6 +2690,10 @@ async function exerciseAllSlots(id, expectedCwd, label) {
           staleGridState.columns.length === 0
         ));
       }
+      const stateBeforeSprint4 = rawCmuxState();
+      await runSprint4GridPersistenceRegressions();
+      writeCmuxState(stateBeforeSprint4);
+      fs.writeFileSync(cfgFile, JSON.stringify(saved, null, 2) + "\n");
       } finally {
         delete process.env.CMUX_FAKE_OVERWRITE_GRID_TITLE;
         delete process.env.CMUX_FAKE_RESIZE_PX_PER_AMOUNT;
