@@ -47,3 +47,28 @@ Phase 2 は `~/projects/agentboard`(bridge)・launchd・各 project ディレク
 2. cdx ターゲット解決を #11 の cwd+process 再採用と統合する具体ポイント（getGridState 後の column.cdx.surfaceRef を使う／無ければ再解決）。
 3. 「可視 cdx ペインの codex TUI」が headless exec ではなく**対話 TUI として常駐**している必要があるが、現状各カラムの cdx は対話 codex TUI か？（pane-delivery の paste 先が TUI でないと起きない）。Phase2 で裏を落とした後、可視 cdx が確実に対話 codex である保証の作り方。
 4. Phase1 だけで「見えるPID=働くPID」をどこまで実証できるか（裏 A が生きている間は A が先に拾う可能性）。Phase1 の独立検証は fake cmux 上の決定論で良いか、実機は Phase2 とセットか。
+
+---
+
+## Revision 1 (2026-06-16) — AGREED (codex レビュー全反映) → Phase1 実装可
+
+### Phase1 受入の正確な再定義（最重要）
+Phase1 は「**見えるPID=働くPID の実証**」ではなく「**それを可能にする決定論配送＋可視化基盤の実証**」。
+理由: 裏 A が生きている間は A が先に `read_at` を付ける/返信しうるため、PID 一致の最終実証は **Phase2 後の実機受入**に移す。
+Phase1 が証明すること: 「dashboard が `team=<projectId>` の未読を、live grid column の cdx surfaceRef へ**一意に submit** した」「marker/ref 欠損→#11 再採用後も同じ可視 surface へ submit」「front-desk と交差しない」「project-row と二重 wake しない」。
+
+### Phase1 確定設計（codex 反映）
+1. **grid-column primary / 二重配信防止**: grid 列が存在する project では **grid-column target のみ**配送し、`projectDeliveryTarget`(row slot 経路) は出さない（抑制/劣後）。配送 state は **projectId 単位に統合**し、同一 messageId を二度 wake しない。front-desk は `CMUX_DASH_FRONT_DESK_TEAM` opt-in の別 namespace のまま不変。
+2. **canonical 参照（再探索しない）**: 配送は `ctl.getState()/getGridState` の `state.grid.columns` を正とする。#7 永続 ref 再採用・#11 cwd(PID→lsof)+process 再採用は **cmuxctl 側の責務**で完了済み前提。collab-delivery は `column.cdx.surfaceRef + wsRef` を必須にし、無ければ配送せず `lastError` に明示（delivery 内で別ロジック再探索＝二重の真実を作らない）。
+3. **TUI readiness（paste 先が対話 codex か）**: `submitToSurface` は TUI 入力欄へ paste+Enter するだけなので、cdx surface が headless exec / zsh では起きない。配送前に **process=codex を確認**し、zsh/claude/unknown なら配送せず warning。`/api/state`・grid に **`cdxReady`（process=codex かつ awaiting/input readable）** 相当を出して Phase2 手順を安全化。
+4. **PID 可視化（診断用）**: `surfaceProcessMap` の pid を `column.cc/cdx` に付与し UI 表示。ただし**安定 ID は surfaceRef / team+role**、PID は再起動で変わる前提（診断補助）。
+5. **回帰テスト（隔離必須）**: fake cmux＋**隔離 sqlite/agmsg DB** で未読を必ず保持（裏 A の先取りで検証が曖昧化しないように）。検証: 未読 claude→codex を live grid cdx surface へ一意 submit／marker・ref 欠損から #11 再採用後も同じ可視 surface へ submit／front-desk 非交差／project-row と二重 wake 無し／process≠codex では配送しない。
+
+### Phase2 確定（人間立会い・rollback 明記）
+- **unload 対象**: `com.agents.codex-bridge`、per-project `.claude-codex-collab` bridge、agentboard `agmsg-codex-bridge.sh loop`。`deepseek-worker-bridge`/`front-desk-openclaw` は要否判断。
+- **rollback 手順を plan に固定**: ①unload 対象リストと現状 PID 控え ②plist の退避先（例 `~/LaunchAgents-backup/`）③`launchctl unload <plist>` 実行 ④確認コマンド（`pgrep -fl "codex exec"` = 0、claude→可視cdx 往復成立、新規 PJ 成立）⑤**失敗時**: 退避 plist を `launchctl load` で即時復帰し A を戻す条件（pane-delivery が起こせない/沈黙が再発したら revert）。
+- TUI readiness 確認を unload 前の必須チェックにする（全 live cdx が process=codex の対話 TUI であること）。
+
+### 受入の達成区分（最終）
+- Phase1(自走+独立検証, fake cmux): 配送一意性・#11統合・front-desk非交差・二重wake無し・PID/cdxReady 可視化・回帰テスト（受入 4,5,6,7＋2の配送基盤）。
+- Phase2(人間立会い+実機): 裏0(#1)・新規成立(#3)・可視PID自身が反応(#2完成)。
