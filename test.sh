@@ -2590,11 +2590,25 @@ async function exerciseAllSlots(id, expectedCwd, label) {
         awaitingStateA.concierge &&
         awaitingStateA.concierge.awaiting === "approval"
       ));
+      check("grid diagnostics: cc/cdx expose process pid and cdxReady derives from codex input", (
+        awaitingAlpha.cc &&
+        awaitingAlpha.cc.process === "claude" &&
+        awaitingAlpha.cc.pid &&
+        Array.isArray(awaitingAlpha.cc.processes) &&
+        awaitingAlpha.cc.processes.some((entry) => entry && entry.process === "claude") &&
+        awaitingAlpha.cdx &&
+        awaitingAlpha.cdx.process === "codex" &&
+        awaitingAlpha.cdx.pid &&
+        Array.isArray(awaitingAlpha.cdx.processes) &&
+        awaitingAlpha.cdx.processes.some((entry) => entry && entry.process === "codex") &&
+        awaitingAlpha.cdx.cdxReady === true
+      ));
       check("grid awaiting: conservative negatives stay null including cdx approval-like text", (
         awaitingGeneral.cc &&
         awaitingGeneral.cc.awaiting === null &&
         awaitingGeneral.cdx &&
-        awaitingGeneral.cdx.awaiting === null
+        awaitingGeneral.cdx.awaiting === null &&
+        awaitingGeneral.cdx.cdxReady === false
       ));
       check("grid awaiting: input detection covers cc/cdx/concierge and thinking stays null", (
         inputAlpha.cc &&
@@ -4455,11 +4469,13 @@ process.exit(res.status == null ? 1 : res.status);
       !Object.prototype.hasOwnProperty.call(unread[0], "body")
     ));
     const defaultFrontDeskTarget = deliveryModule.frontDeskDeliveryTargetFromEnv({});
+    const optInFrontDeskTarget = deliveryModule.frontDeskDeliveryTargetFromEnv({ CMUX_DASH_FRONT_DESK_TEAM: "front-desk" });
     const offFrontDeskTarget = deliveryModule.frontDeskDeliveryTargetFromEnv({ CMUX_DASH_FRONT_DESK_TEAM: "off" });
-    check("R6 front-desk env defaults to front-desk/concierge and supports off", (
-      defaultFrontDeskTarget &&
-      defaultFrontDeskTarget.team === "front-desk" &&
-      defaultFrontDeskTarget.agent === "concierge" &&
+    check("R6 front-desk env is opt-in and supports off", (
+      defaultFrontDeskTarget === null &&
+      optInFrontDeskTarget &&
+      optInFrontDeskTarget.team === "front-desk" &&
+      optInFrontDeskTarget.agent === "concierge" &&
       offFrontDeskTarget === null
     ));
     const frontDeskUnread = await deliveryModule.readUnreadFrontDeskMessages("front-desk", "concierge", readOpts);
@@ -4572,7 +4588,7 @@ process.exit(res.status == null ? 1 : res.status);
               projectId: "grid/weird",
               team: "wrong-grid-team",
               cc: { surfaceRef: "surface:grid-cc" },
-              cdx: { surfaceRef: "surface:grid-cdx" },
+              cdx: { surfaceRef: "surface:grid-cdx", process: "codex", cdxReady: true },
             }],
           },
         };
@@ -4593,8 +4609,8 @@ process.exit(res.status == null ? 1 : res.status);
     });
     await gridOnlyDelivery.tick();
     const gridSnap = gridOnlyDelivery.snapshot();
-    const gridKey = "grid:grid/weird:workspace:grid:surface:grid-cdx";
-    check("R6 delivery targets grid-column cdx surface using teamName(projectId)", (
+    const gridKey = "grid/weird";
+    check("R6 delivery targets ready grid-column cdx surface using teamName(projectId)", (
       sends.length === 1 &&
       sends[0].wsRef === "workspace:grid" &&
       sends[0].surfaceRef === "surface:grid-cdx" &&
@@ -4602,6 +4618,84 @@ process.exit(res.status == null ? 1 : res.status);
       gridSnap.gridColumns[gridKey] &&
       gridSnap.gridColumns[gridKey].pending.length === 1 &&
       gridSnap.gridColumns[gridKey].pending[0].id === 8
+    ));
+
+    sends = [];
+    now += 60;
+    const notCodexDelivery = deliveryModule.createCollabDelivery({
+      ctl: {
+        teamName(id) { return String(id).replace(/[^A-Za-z0-9_-]/g, "-"); },
+        async getState() {
+          return {
+            projects: [],
+            globalRows: [],
+            grid: {
+              wsRef: "workspace:grid",
+              columns: [{
+                columnId: "grid/weird",
+                projectId: "grid/weird",
+                cc: { surfaceRef: "surface:grid-cc" },
+                cdx: { surfaceRef: "surface:grid-cdx", process: "zsh", cdxReady: false },
+              }],
+            },
+          };
+        },
+        async submitToSurface(wsRef, surfaceRef, text) {
+          sends.push({ wsRef, surfaceRef, text });
+        },
+      },
+      readUnreadWakeMessages: async () => [{ id: 8, createdAt: "now" }],
+      readDeliveryStatus: async () => ({ delivered: false }),
+      intervalMs: 0,
+      retryMs: 50,
+      minWakeIntervalMs: 0,
+      now: () => now,
+    });
+    await notCodexDelivery.tick();
+    const notCodexSnap = notCodexDelivery.snapshot();
+    check("R6 delivery refuses grid cdx when process is not codex and records lastError", (
+      sends.length === 0 &&
+      notCodexSnap.gridColumns[gridKey] &&
+      /process=zsh/.test(notCodexSnap.gridColumns[gridKey].lastError || "")
+    ));
+
+    sends = [];
+    now += 60;
+    const missingCanonicalDelivery = deliveryModule.createCollabDelivery({
+      ctl: {
+        teamName(id) { return String(id).replace(/[^A-Za-z0-9_-]/g, "-"); },
+        async getState() {
+          return {
+            projects: [],
+            globalRows: [],
+            grid: {
+              wsRef: "workspace:grid",
+              columns: [{
+                columnId: "grid/weird",
+                projectId: "grid/weird",
+                cc: { surfaceRef: "surface:grid-cc" },
+                cdx: { process: "codex", cdxReady: true },
+              }],
+            },
+          };
+        },
+        async submitToSurface(wsRef, surfaceRef, text) {
+          sends.push({ wsRef, surfaceRef, text });
+        },
+      },
+      readUnreadWakeMessages: async () => [{ id: 8, createdAt: "now" }],
+      readDeliveryStatus: async () => ({ delivered: false }),
+      intervalMs: 0,
+      retryMs: 50,
+      minWakeIntervalMs: 0,
+      now: () => now,
+    });
+    await missingCanonicalDelivery.tick();
+    const missingCanonicalSnap = missingCanonicalDelivery.snapshot();
+    check("R6 delivery refuses grid cdx with missing canonical surfaceRef/wsRef and records lastError", (
+      sends.length === 0 &&
+      missingCanonicalSnap.gridColumns[gridKey] &&
+      /missing canonical cdx surfaceRef\/wsRef/.test(missingCanonicalSnap.gridColumns[gridKey].lastError || "")
     ));
 
     sends = [];
@@ -4625,7 +4719,7 @@ process.exit(res.status == null ? 1 : res.status);
               columnId: "dual",
               projectId: "dual",
               cc: { surfaceRef: "surface:grid-dual-cc" },
-              cdx: { surfaceRef: "surface:grid-dual-cdx" },
+              cdx: { surfaceRef: "surface:grid-dual-cdx", process: "codex", cdxReady: true },
             }],
           },
         };
@@ -4646,13 +4740,12 @@ process.exit(res.status == null ? 1 : res.status);
     });
     await doubleDelivery.tick();
     const doubleSnap = doubleDelivery.snapshot();
-    const doubleGridKey = "grid:dual:workspace:grid:surface:grid-dual-cdx";
+    const doubleGridKey = "dual";
     const doubleSurfaces = sends.map((send) => send.surfaceRef).sort().join(",");
-    check("R6 delivery double-presence wakes project and grid targets separately", (
-      sends.length === 2 &&
-      doubleSurfaces === "surface:dual-cdx,surface:grid-dual-cdx" &&
-      doubleSnap.projects.dual &&
-      doubleSnap.projects.dual.pending[0].id === 9 &&
+    check("R6 delivery double-presence wakes only the grid-column target and suppresses project-row", (
+      sends.length === 1 &&
+      doubleSurfaces === "surface:grid-dual-cdx" &&
+      !doubleSnap.projects.dual &&
       doubleSnap.gridColumns[doubleGridKey] &&
       doubleSnap.gridColumns[doubleGridKey].pending[0].id === 9
     ));
