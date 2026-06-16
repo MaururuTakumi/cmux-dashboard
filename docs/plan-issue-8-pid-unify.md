@@ -1,6 +1,6 @@
 # Plan — issue #8: 1プロジェクト=可視 cc/cdx 1:1（見えるPID=働くPID）、裏ワーカー全廃
 
-Status: DRAFT (Plan Gate — Opus起点ドラフト、codex レビュー待ち)
+Status: AGREED (Plan Gate 合意 2026-06-16, codex レビュー反映 — Revision 1 参照) → Phase1 実装可 / Phase2 は人間立会い
 Owner(plan): claude(Opus) / Owner(exec): codex(GPT-5)
 Branch: `feat/issue-8-pid-unify`
 
