@@ -2271,6 +2271,69 @@ function processEntryCommand(entry) {
   return String(entry || '').trim();
 }
 
+function processLabelForType(type) {
+  if (type === 'X') return 'codex';
+  if (type === 'C') return 'claude';
+  if (type === 'M') return 'mcp';
+  if (type === 'O') return 'other';
+  return null;
+}
+
+function gridSurfaceProcessSummary(surfaceRef, processMap = {}, role = null) {
+  const ref = cleanRef(surfaceRef);
+  const entries = ref && Array.isArray(processMap[ref]) ? processMap[ref] : [];
+  const processes = entries.map((entry) => {
+    const command = processEntryCommand(entry);
+    const type = classifyProcess(command);
+    return {
+      pid: entry && typeof entry === 'object' ? (entry.pid || null) : null,
+      processRef: entry && typeof entry === 'object' ? (entry.processRef || null) : null,
+      command,
+      type,
+      process: processLabelForType(type),
+    };
+  });
+  const preferredType = role === 'cdx' ? 'X' : (role === 'cc' ? 'C' : null);
+  const primary = (preferredType ? processes.find((entry) => entry.type === preferredType) : null)
+    || processes[0]
+    || null;
+  return {
+    pid: primary && primary.pid || null,
+    processRef: primary && primary.processRef || null,
+    command: primary && primary.command || null,
+    process: primary && primary.process || null,
+    processes,
+  };
+}
+
+function attachGridProcessDiagnosticsToColumns(columns, processMap = {}) {
+  return (Array.isArray(columns) ? columns : []).map((column) => {
+    if (!column) return column;
+    const ccInfo = gridSurfaceProcessSummary(column.cc && column.cc.surfaceRef, processMap, 'cc');
+    const cdxInfo = gridSurfaceProcessSummary(column.cdx && column.cdx.surfaceRef, processMap, 'cdx');
+    return {
+      ...column,
+      cc: {
+        ...(column.cc || {}),
+        pid: ccInfo.pid,
+        processRef: ccInfo.processRef,
+        process: ccInfo.process,
+        command: ccInfo.command,
+        processes: ccInfo.processes,
+      },
+      cdx: {
+        ...(column.cdx || {}),
+        pid: cdxInfo.pid,
+        processRef: cdxInfo.processRef,
+        process: cdxInfo.process,
+        command: cdxInfo.command,
+        processes: cdxInfo.processes,
+        cdxReady: false,
+      },
+    };
+  });
+}
+
 function surfaceProcessEntries(surface, processMap = {}) {
   const entries = [];
   if (!surface) return entries;
@@ -2727,11 +2790,22 @@ function gridColumnSnapshot(column, order = column && column.order) {
       paneRef: column.cc && column.cc.paneRef || null,
       surfaceRef: column.cc && column.cc.surfaceRef || null,
       marker: column.cc && column.cc.marker || null,
+      pid: column.cc && column.cc.pid || null,
+      processRef: column.cc && column.cc.processRef || null,
+      process: column.cc && column.cc.process || null,
+      command: column.cc && column.cc.command || null,
+      processes: Array.isArray(column.cc && column.cc.processes) ? column.cc.processes : [],
     },
     cdx: {
       paneRef: column.cdx && column.cdx.paneRef || null,
       surfaceRef: column.cdx && column.cdx.surfaceRef || null,
       marker: column.cdx && column.cdx.marker || null,
+      pid: column.cdx && column.cdx.pid || null,
+      processRef: column.cdx && column.cdx.processRef || null,
+      process: column.cdx && column.cdx.process || null,
+      command: column.cdx && column.cdx.command || null,
+      processes: Array.isArray(column.cdx && column.cdx.processes) ? column.cdx.processes : [],
+      cdxReady: column.cdx && column.cdx.cdxReady === true,
     },
     createdAt: column.createdAt || null,
     updatedAt: column.updatedAt || null,
@@ -2806,6 +2880,7 @@ async function attachGridAwaiting(state) {
   await Promise.all(targets.map(async (item) => {
     const screen = await readSurfaceScreen(state.wsRef, item.surfaceRef, { lines: AWAITING_SCREEN_LINES });
     item.target.awaiting = classifyAwaiting(screen, item.role);
+    if (item.role === 'cdx') item.target.cdxReady = item.target.process === 'codex' && item.target.awaiting === 'input';
   }));
   return state;
 }
@@ -4710,7 +4785,7 @@ async function validateGridRuntimeState() {
   }
   const processMap = await surfaceProcessMap(ws.ref);
   const resync = buildAdoptedGridColumns(ws.ref, surfaces, cfg, undefined, { processMap });
-  gridRuntimeState.columns = resync.columns;
+  gridRuntimeState.columns = attachGridProcessDiagnosticsToColumns(resync.columns, processMap);
   const rightAnchor = markedGridRightAnchorSurface(surfaces) || gridRightAnchorSurface(surfaces, gridRuntimeState.columns);
   if (rightAnchor && rightAnchor.ref) {
     gridRuntimeState.anchorSurfaceRef = rightAnchor.ref;
