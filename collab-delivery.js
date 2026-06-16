@@ -223,12 +223,12 @@ function gridColumnDeliveryTarget(column, grid, rowsById, ctlRef = ctl) {
   const projectId = String(column.projectId || column.id || '').trim();
   const wsRef = column.wsRef || (grid && grid.wsRef) || null;
   const cdxRef = (column.cdx && column.cdx.surfaceRef) || column.bottomSurfaceRef || null;
-  if (!projectId || !wsRef || !cdxRef) return null;
+  if (!projectId) return null;
   const row = rowsById && rowsById.get(projectId) || null;
   if (!gridProjectDeliveryEnabled(row)) return null;
   const ccRef = (column.cc && column.cc.surfaceRef) || column.topSurfaceRef || null;
   return {
-    key: `grid:${projectId}:${wsRef}:${cdxRef}`,
+    key: projectId,
     id: projectId,
     projectId,
     columnId: column.columnId || projectId,
@@ -236,6 +236,8 @@ function gridColumnDeliveryTarget(column, grid, rowsById, ctlRef = ctl) {
     team: normalizedTeamName(ctlRef, projectId),
     wsRef,
     surfaceRef: cdxRef,
+    process: column.cdx && column.cdx.process || null,
+    cdxReady: column.cdx && column.cdx.cdxReady === true,
     slotRefs: { cc: ccRef, cdx: cdxRef },
   };
 }
@@ -256,11 +258,15 @@ function deliveryTargetsFromState(state, ctlRef = ctl) {
   const rowsById = new Map();
   for (const row of rows) {
     if (row && row.id) rowsById.set(String(row.id), row);
-    pushTarget(targets, seen, projectDeliveryTarget(row, ctlRef));
   }
 
   const grid = state && state.grid || {};
   const columns = Array.isArray(grid.columns) ? grid.columns : [];
+  const gridProjectIds = new Set(columns.map((column) => String(column && (column.projectId || column.id) || '').trim()).filter(Boolean));
+  for (const row of rows) {
+    if (row && row.id && gridProjectIds.has(String(row.id))) continue;
+    pushTarget(targets, seen, projectDeliveryTarget(row, ctlRef));
+  }
   for (const column of columns) {
     pushTarget(targets, seen, gridColumnDeliveryTarget(column, grid, rowsById, ctlRef));
   }
@@ -360,6 +366,9 @@ class CollabDelivery {
   }
 
   stateKeyFor(target) {
+    if (target && typeof target === 'object' && target.type !== 'front-desk') {
+      return String(target.projectId || target.id || target.key || '');
+    }
     if (target && typeof target === 'object') return String(target.key || target.id || '');
     return String(target || '');
   }
@@ -445,6 +454,11 @@ class CollabDelivery {
     const projectState = this.stateFor(target);
     const team = target.team || this.ctl.teamName(target.projectId || target.id);
     try {
+      const targetError = this.targetReadinessError(target);
+      if (targetError) {
+        projectState.lastError = targetError;
+        return { id: target.id, targetKey: target.key, targetType: target.type, sent: false, warning: targetError };
+      }
       const pending = Array.from(projectState.pending.values()).sort((a, b) => a.id - b.id);
       for (const item of pending) {
         const status = await this.readStatusForTarget(target, item);
@@ -527,6 +541,17 @@ class CollabDelivery {
 
   canWake(projectState) {
     return this.now() - (projectState.lastWakeAt || 0) >= this.minWakeIntervalMs;
+  }
+
+  targetReadinessError(target) {
+    if (!target || target.type !== 'grid-column') return null;
+    if (!target.wsRef || !targetSurfaceRef(target)) {
+      return `grid-column delivery target missing canonical cdx surfaceRef/wsRef for project ${target.projectId || target.id || '<unknown>'}`;
+    }
+    if (target.process !== 'codex') {
+      return `grid-column cdx surface is not a codex TUI for project ${target.projectId || target.id || '<unknown>'}: process=${target.process || 'unknown'}`;
+    }
+    return null;
   }
 
   pendingRecord(message, attempts, nextRetryAt) {

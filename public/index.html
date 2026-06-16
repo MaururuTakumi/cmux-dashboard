@@ -847,6 +847,14 @@ function stateRows(s){
 function gridState(s){ return s && s.grid && Array.isArray(s.grid.columns) ? s.grid : { wsRef:null, columns:[] }; }
 function gridColumns(s){ return gridState(s).columns || []; }
 function gridColumnForProject(s,id){ return gridColumns(s).find(c=>c && c.projectId===id) || null; }
+function gridProcessBadges(col){
+  if(!col) return '';
+  const cc = col.cc || {};
+  const cdx = col.cdx || {};
+  const ccTitle = `cc process ${cc.process || 'unknown'}${cc.pid ? ` pid ${cc.pid}` : ''}`;
+  const cdxTitle = `cdx process ${cdx.process || 'unknown'}${cdx.pid ? ` pid ${cdx.pid}` : ''}${cdx.cdxReady ? ' ready' : ' not ready'}`;
+  return `<span class="grid-badge cc ${cc.process==='claude'?'on':''}" title="${esc(ccTitle)}">CC${cc.pid?` #${esc(cc.pid)}`:''}</span><span class="grid-badge cdx ${cdx.cdxReady?'on':''}" title="${esc(cdxTitle)}">Cdx${cdx.pid?` #${esc(cdx.pid)}`:''}</span>`;
+}
 function renderGridSidePanel(s){
   const root = $('#gridPanel');
   if(!root) return;
@@ -872,7 +880,7 @@ function renderGridSidePanel(s){
     const cdxOn = !!(col.cdx && col.cdx.surfaceRef);
     const order = Number.isFinite(Number(col.order)) ? Number(col.order) + 1 : '?';
     const csl = statuslineFor(col.projectId);
-    const clive = livenessBadges(p);
+    const clive = gridProcessBadges(col) || livenessBadges(p);
     return `<div class="grid-column-row" data-grid-column-project="${esc(col.projectId)}">
       <div class="grid-column-name">${order}. ${esc(p.name || col.projectId)}${csl?`<span class="ctxbar ${esc(csl.context.level)}" title="context ${esc(csl.context.pct)}% · session $${esc(csl.cost.session)}"><span class="track"><span class="fill" style="width:${Math.min(100,Number(csl.context.pct)||0)}%"></span></span>${esc(csl.context.pct)}%</span>`:''}</div>
       <div class="grid-badges">
@@ -904,6 +912,7 @@ function renderProjectRow(p, index, s){
   const collabTitle = collab.enabled ? '協業をOFFにする' : '協業をONにする';
   const gridable = !isGlobal;
   const gridOpen = gridable && !!gridColumnForProject(s,p.id);
+  const gridCol = gridColumnForProject(s,p.id);
   const gridBusy = gridable && busy.has(`${p.id}:grid`);
   const primaryClick = gridable
     ? `toggleGridColumn(${jsArg(p.id)},${gridOpen?'false':'true'})`
@@ -937,6 +946,7 @@ function renderProjectRow(p, index, s){
     </details>
     <div class="row-status">
       <span><b>grid</b> ${esc(gridOpen ? 'open' : 'closed')}</span>
+      ${gridCol?`<span><b>cc</b> ${esc((gridCol.cc&&gridCol.cc.process)||'unknown')}${gridCol.cc&&gridCol.cc.pid?` #${esc(gridCol.cc.pid)}`:''}</span><span><b>cdx</b> ${esc((gridCol.cdx&&gridCol.cdx.process)||'unknown')}${gridCol.cdx&&gridCol.cdx.pid?` #${esc(gridCol.cdx.pid)}`:''}${gridCol.cdx&&gridCol.cdx.cdxReady?' ready':' not-ready'}</span>`:''}
       <span><b>action</b> ${esc(action)}</span>
       <span><b>health</b> ${esc(health)}</span>
       <span><b>collab</b> ${esc(collab.enabled ? (collab.active ? 'enabled/active' : 'enabled/pending') : 'disabled')}</span>
